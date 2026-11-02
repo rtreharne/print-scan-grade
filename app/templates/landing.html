@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b2b">
+  <title>Print Scan Grade</title>
+  <link rel="icon" href="{{ url_for('static', filename='logo.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="page">
+    <div class="hero">
+      <img class="logo" src="{{ url_for('static', filename='logo.svg') }}" alt="" width="104" height="104">
+      <p class="eyebrow">Paper exams, connected</p>
+      <h1>Print <span>Scan</span> Grade</h1>
+      <p class="lead">Create MCQ answer sheets, scan completed papers, and send results to your VLE.</p>
+      {% if launched %}
+      <p class="course">Launched from <strong>{{ course }}</strong></p>
+      {% if is_staff %}
+      <p class="course"><a href="{{ url_for('print_workspace') }}">Open course answer sheets</a></p>
+      {% else %}
+      <p class="course">Answer-sheet design is available to course instructors.</p>
+      {% endif %}
+      {% endif %}
+      <section class="registration" aria-labelledby="registration-title">
+        <div class="registration-copy">
+          <p class="registration-label" id="registration-title">Register this tool in MiniVLE</p>
+          <code class="registration-url" id="registration-url">Loading registration URL…</code>
+        </div>
+        <button class="copy-button" id="copy-registration-url" type="button">Copy URL</button>
+        <span class="copy-status" id="copy-status" role="status" aria-live="polite"></span>
+      </section>
+      <div class="steps" aria-label="Workflow">
+        <div><b>01</b><strong>Print</strong><small>Prepare answer sheets</small></div>
+        <div><b>02</b><strong>Scan</strong><small>Capture completed forms</small></div>
+        <div><b>03</b><strong>Grade</strong><small>Return scores to your VLE</small></div>
+      </div>
+      <p class="coming">Coming soon</p>
+    </div>
+  </main>
+  <script>
+    (() => {
+      const registrationUrl = `${window.location.origin}/lti/config.json`;
+      const urlDisplay = document.getElementById("registration-url");
+      const copyButton = document.getElementById("copy-registration-url");
+      const copyStatus = document.getElementById("copy-status");
+
+      urlDisplay.textContent = registrationUrl;
+      copyButton.addEventListener("click", async () => {
+        try {
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(registrationUrl);
+          } else {
+            const input = document.createElement("textarea");
+            input.value = registrationUrl;
+            input.setAttribute("readonly", "");
+            input.style.position = "fixed";
+            input.style.opacity = "0";
+            document.body.appendChild(input);
+            input.select();
+            const copied = document.execCommand("copy");
+            input.remove();
+            if (!copied) throw new Error("Copy command failed");
+          }
+          copyStatus.textContent = "Copied";
+        } catch (error) {
+          copyStatus.textContent = "Copy failed — select the URL to copy it.";
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

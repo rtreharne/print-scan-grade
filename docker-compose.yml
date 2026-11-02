@@ -1,0 +1,19 @@
+services:
+  print-scan-grade:
+    build: .
+    ports:
+      - "8004:8004"
+    env_file:
+      - .env
+    environment:
+      TOOL_BASE_URL: ${TOOL_BASE_URL:-http://localhost:8004}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      LTI_INTERNAL_PLATFORM_BASE_URL: http://host.docker.internal:8001
+      LTI_PLATFORM_REGISTRATIONS: >-
+        [{"issuer":"https://demo.minivle.com","authorization_endpoint":"https://demo.minivle.com/lti/authorize/","jwks_url":"http://host.docker.internal:8001/lti/jwks/","token_endpoint":"http://host.docker.internal:8001/lti/token/","dynamic_deployments":true}]
+    volumes:
+      - ./data:/data
+      - ./app:/app/app
+    command: ["gunicorn", "--bind", "0.0.0.0:8004", "--workers", "1", "--threads", "4", "--reload", "app.main:app"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

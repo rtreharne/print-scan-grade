@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 104 104" role="img" aria-label="Print Scan Grade logo">
+  <rect width="104" height="104" rx="24" fill="#101b2b"/>
+  <path d="M28 20h36l13 13v51H28z" fill="#f7f6f2"/>
+  <path d="M64 20v13h13" fill="#dce7e4"/>
+  <circle cx="43" cy="49" r="5" fill="#22c4aa"/>
+  <circle cx="60" cy="49" r="5" fill="#22c4aa"/>
+  <circle cx="43" cy="66" r="5" fill="#22c4aa"/>
+  <path d="m55 66 4 4 9-10" fill="none" stroke="#eb8d55" stroke-linecap="round" stroke-linejoin="round" stroke-width="5"/>
+</svg>

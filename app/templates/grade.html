@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b2b">
+  <title>Grades · Print Scan Grade</title>
+  <link rel="icon" href="{{ url_for('static', filename='logo.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='print.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='scan.css') }}">
+</head>
+<body>
+  <main class="workspace">
+    <header class="workspace-header">
+      <a class="brand" href="/"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="42" height="42"><span>Print Scan Grade</span></a>
+      <span class="course-badge">{{ context.course_title }}</span>
+    </header>
+    <nav class="phase-nav" aria-label="Workspace phases">
+      <a href="{{ url_for('print_workspace') }}">1 · Print</a>
+      <a href="{{ url_for('scan_workspace') }}">2 · Scan</a>
+      <a class="active" href="{{ url_for('grade_workspace') }}" aria-current="page">3 · Grade</a>
+    </nav>
+    <section class="intro">
+      <p class="eyebrow">Phase 03 · Grade</p>
+      <h1>Grades by answer sheet</h1>
+      <p>Choose a saved answer sheet to view its scans. Scan results are saved in this browser for this course; completing a scan takes you directly to the matching grade list.</p>
+    </section>
+    <section class="saved-sheet-dashboard" aria-labelledby="saved-sheet-title">
+      <div><h2 id="saved-sheet-title">Saved answer sheets</h2><p>Each saved sheet has its own scans and grade detail.</p></div>
+      {% for form in grade_forms %}
+      <article class="saved-sheet-card">
+        <div><strong>{{ form.title }}</strong><small>{{ form.question_count }} questions · {{ form.choice_count }} choices</small></div>
+        <div class="saved-sheet-links">
+          <a href="{{ url_for('download_exam_design', form_id=form.form_id) }}">Download PDF</a>
+          <a href="{{ url_for('scan_workspace') }}">Scan sheets</a>
+        </div>
+      </article>
+      {% else %}
+      <p class="field-help">No saved answer sheets yet. Create a sheet in Print first.</p>
+      {% endfor %}
+    </section>
+    <footer>printscangrade.com</footer>
+  </main>
+</body>
+</html>

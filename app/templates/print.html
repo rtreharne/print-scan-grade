@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b2b">
+  <title>Print answer sheets · Print Scan Grade</title>
+  <link rel="icon" href="{{ url_for('static', filename='logo.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='print.css') }}">
+</head>
+<body>
+  <main class="workspace">
+    <header class="workspace-header">
+      <a class="brand" href="/"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="42" height="42"><span>Print Scan Grade</span></a>
+      <span class="course-badge">{{ context.course_title }}</span>
+    </header>
+    <nav class="phase-nav" aria-label="Workspace phases">
+      <a class="active" href="{{ url_for('print_workspace') }}" aria-current="page">1 · Print</a>
+      <a href="{{ url_for('scan_workspace') }}">2 · Scan</a>
+      <a href="{{ url_for('grade_workspace') }}">3 · Grade</a>
+    </nav>
+
+    <section class="intro">
+      <p class="eyebrow">Phase 01 · Print</p>
+      <h1>Answer sheets</h1>
+      <p>Create a printable answer sheet for <strong>{{ context.course_title }}</strong>. Set the question and choice counts, save the design, then download its PDF.</p>
+      <ol class="steps" aria-label="How to create answer sheets">
+        <li><span>1</span> Set up</li><li><span>2</span> Save</li><li><span>3</span> Download and print</li>
+      </ol>
+    </section>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}<div class="messages">{% for category, message in messages %}<p class="message {{ category }}" role="status">{{ message }}</p>{% endfor %}</div>{% endif %}
+    {% endwith %}
+
+    <div class="content-grid">
+      <section class="panel design-panel" aria-labelledby="design-title">
+        <p class="eyebrow">Step 1 · Set up</p>
+        <h2 id="design-title">New answer sheet</h2>
+        <p class="muted">Each design creates an A4 portrait PDF with an answer sheet and student guide. You can download or delete saved sheets below.</p>
+
+        {% if errors %}
+        <div class="errors" role="alert"><strong>Check these details:</strong><ul>{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul></div>
+        {% endif %}
+
+        <form method="post" action="{{ url_for('create_exam_design') }}" class="design-form">
+          <input type="hidden" name="csrf_token" value="{{ session['print_csrf'] }}">
+          <label for="title">Name this answer sheet</label>
+          <input id="title" name="title" type="text" maxlength="120" required placeholder="e.g. Biology midterm" value="{{ form_values.title }}" aria-describedby="title-help">
+          <small id="title-help">Use a name that will help you find it later. It appears at the top of the PDF.</small>
+
+          <div class="field-row">
+            <div>
+              <label for="question_count">Questions</label>
+              <input id="question_count" name="question_count" type="number" min="1" max="80" required value="{{ form_values.question_count }}" aria-describedby="question-help">
+              <small id="question-help">Enter a number from 1 to 80.</small>
+            </div>
+            <div>
+              <label for="choice_count">Answer choices per question</label>
+              <select id="choice_count" name="choice_count" aria-describedby="choice-help">
+                {% for count in range(2, 9) %}
+                <option value="{{ count }}" {% if form_values.choice_count|int == count %}selected{% endif %}>{{ count }} choices (A–{{ "ABCDEFGH"[count - 1] }})</option>
+                {% endfor %}
+              </select>
+              <small id="choice-help">The bubbles will be labelled A through the selected letter.</small>
+            </div>
+          </div>
+          <div class="sheet-preview" aria-live="polite">
+            <span class="preview-icon" aria-hidden="true">▦</span>
+            <span id="sheet-summary">20 questions · choices A–D · answer sheet plus student guide</span>
+          </div>
+          <button class="primary-button" type="submit">Save answer sheet</button>
+        </form>
+
+        <aside class="sheet-details">
+          <h3>Included on each sheet</h3>
+          <ul>
+            <li>Student name field and a 9-digit ID with bubble and handwritten entry</li>
+            <li>Clear instructions for marking and correcting answers</li>
+            <li>Annotated student guide on page 2</li>
+            <li>Form code and registration marks for future scanning</li>
+          </ul>
+        </aside>
+      </section>
+
+      <section class="panel logo-panel" aria-labelledby="logo-title">
+        <p class="eyebrow">Optional · Course branding</p>
+        <h2 id="logo-title">University logo</h2>
+        <p class="muted">Add a university logo to all answer sheets in this course. You can replace or remove it at any time.</p>
+        {% if branding %}<p class="logo-status"><span aria-hidden="true">✓</span> Course logo is set · {{ branding.logo_type|replace('image/', '')|upper }}</p>{% else %}<p class="logo-status logo-status-empty">No course logo added. This is optional.</p>{% endif %}
+        <form method="post" action="{{ url_for('update_course_logo') }}" class="design-form" enctype="multipart/form-data">
+          <input type="hidden" name="csrf_token" value="{{ session['print_csrf'] }}">
+          <label for="logo">{{ "Choose a replacement logo" if branding else "Choose a logo" }}</label>
+          <input id="logo" name="logo" type="file" accept="image/png,image/jpeg" {% if not branding %}required{% endif %} aria-describedby="logo-help">
+          <small id="logo-help">PNG or JPEG, up to 3 MB. The image is resized to fit without stretching.</small>
+          <button class="primary-button" type="submit">{{ "Update logo for this course" if branding else "Add logo to this course" }}</button>
+          {% if branding %}<button class="secondary-button" type="submit" name="action" value="remove">Remove course logo</button>{% endif %}
+        </form>
+      </section>
+
+      <section class="panel saved-panel" aria-labelledby="saved-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">Step 3 · Download</p><h2 id="saved-title">Your saved sheets</h2></div>
+          <span class="count-badge">{{ designs|length }}</span>
+        </div>
+        {% if designs %}
+        <div class="design-list">
+          {% for design in designs %}
+          <article class="design-card">
+            <div class="design-info">
+              <h3>{{ design.title }}</h3>
+              <p>{{ design.question_count }} questions · choices A–{{ "ABCDEFGH"[design.choice_count - 1] }}</p>
+              <small>Saved {{ design.created_label }} · form {{ design.form_id[:8] }}</small>
+            </div>
+            <div class="design-actions">
+              <a class="download-button" href="{{ url_for('download_exam_design', form_id=design.form_id) }}" aria-label="Download {{ design.title }} as a printable PDF">Download printable PDF <span aria-hidden="true">↓</span></a>
+              <form method="post" action="{{ url_for('delete_exam_design', form_id=design.form_id) }}" onsubmit="return confirm('Delete this saved sheet? Existing printed copies will no longer be recognized by Scan.');">
+                <input type="hidden" name="csrf_token" value="{{ session['print_csrf'] }}">
+                <button class="delete-button" type="submit" aria-label="Delete {{ design.title }}">Delete sheet</button>
+              </form>
+            </div>
+          </article>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state">
+          <div class="empty-icon" aria-hidden="true">○</div>
+          <h3>No answer sheets yet</h3>
+          <p>Once you save a sheet, it will appear here. You can download it again whenever you need another copy.</p>
+        </div>
+        {% endif %}
+      </section>
+    </div>
+    <footer>Print at 100% scale · <a href="https://printscangrade.com">printscangrade.com</a></footer>
+  </main>
+  <script>
+    const questionInput = document.getElementById("question_count");
+    const choiceInput = document.getElementById("choice_count");
+    const summary = document.getElementById("sheet-summary");
+    function updateSheetSummary() {
+      const questions = questionInput.value || "0";
+      const lastChoice = "ABCDEFGH"[Number(choiceInput.value) - 1] || "D";
+      summary.textContent = `${questions} ${questions === "1" ? "question" : "questions"} · choices A–${lastChoice} · answer sheet plus student guide`;
+    }
+    questionInput.addEventListener("input", updateSheetSummary);
+    choiceInput.addEventListener("change", updateSheetSummary);
+    updateSheetSummary();
+  </script>
+</body>
+</html>
