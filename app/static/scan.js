@@ -52,15 +52,13 @@ let previewedSheetId = "";
 const A4 = { width: 595.2756, height: 841.8898 };
 const MARK_MARGIN = 16;
 const CURRENT_MARK_MARGIN = 21;
-const IDENTITY_OCR_VERSION = 6;
-const ANSWER_READER_VERSION = 4;
+const ANSWER_READER_VERSION = 5;
 const CURRENT_SHEET_LAYOUT_VERSION = 4;
 const PREVIEW_CONTRAST_VERSION = 2;
 const REGISTRATION_MARK_THRESHOLD = 160;
 const MAX_PDF_BYTES = 64 * 1024 * 1024;
 const MAX_ZIP_BYTES = 256 * 1024 * 1024;
 const formsById = new Map();
-let ocrWorkerPromise = null;
 
 async function initializeDummyZipForm() {
   if (!dummyZipForm) return;
@@ -127,12 +125,11 @@ let selectedScanSetId = "";
 let rescanTargetScanSetId = "";
 let scanInProgress = false;
 let formsManifestLoaded = false;
-let ocrUnavailableReason = "";
 let persistenceReady = false;
 let persistenceWarning = "";
 let persistenceLoadPromise = null;
 let formsManifestPromise = null;
-let identityRefreshPromise = null;
+let bubbleRefreshPromise = null;
 
 async function loadFormsManifest() {
   if (formsManifestLoaded) return;
@@ -314,11 +311,11 @@ async function showGradeDashboard(pushHistory) {
 }
 
 function refreshSavedBubbleIdsInBackground() {
-  if (identityRefreshPromise) return identityRefreshPromise;
-  identityRefreshPromise = refreshSavedBubbleIds()
+  if (bubbleRefreshPromise) return bubbleRefreshPromise;
+  bubbleRefreshPromise = refreshSavedBubbleIds()
     .catch((error) => console.warn("Saved scan readings could not be refreshed", error))
-    .finally(() => { identityRefreshPromise = null; });
-  return identityRefreshPromise;
+    .finally(() => { bubbleRefreshPromise = null; });
+  return bubbleRefreshPromise;
 }
 
 function showScanDashboard(pushHistory) {
@@ -560,7 +557,6 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
     guidePagesSkipped = 0;
   }
   scanInProgress = true;
-  ocrUnavailableReason = "";
   sourceInput.value = "";
   const isRescan = Boolean(targetScanSet);
   if (isRescan) {
@@ -578,9 +574,9 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
   setProgress(fileType === "pdf" ? "Opening PDF locally…" : fileType === "zip" ? "Opening ZIP locally…" : "Checking file…");
 
   try {
-    if (identityRefreshPromise) {
+    if (bubbleRefreshPromise) {
       setProgress("Finishing saved scan refresh…");
-      await identityRefreshPromise;
+      await bubbleRefreshPromise;
     }
     if (!fileType) throw new Error("Select a PDF or ZIP file to scan.");
     await loadFormsManifest();
@@ -709,7 +705,6 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
       rescanResultMessage.hidden = false;
     }
     await persistScanState();
-    await releaseOcrWorker();
     return;
   }
   fileName.textContent = "Processing finished. Select another PDF or ZIP to start a new scan.";
@@ -717,7 +712,6 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
   scanButton.disabled = true;
   finishScan();
   await persistScanState();
-  await releaseOcrWorker();
   await showGradeDashboard(true).catch(showGradeLoadError);
 }
 
@@ -749,7 +743,7 @@ async function scanPage(pdf, pageNo, sourceFile) {
 
   // Scanner apps often produce a pale gray page. Use a maximally contrasted
   // black/white copy for structural detection, while retaining the original
-  // grayscale page for answer shading, OCR and the saved preview.
+  // grayscale page for bubble analysis and the saved preview.
   const detectionCanvas = createBinarizedCanvas(sourceCanvas);
   const marks = findRegistrationMarks(detectionCanvas);
   detectionCanvas.width = 0;
@@ -830,16 +824,10 @@ async function scanPage(pdf, pageNo, sourceFile) {
     } catch (error) {
       console.warn("Could not create a locally saved original-page preview", error);
     }
+    setProgress(`Reading answer and student-number bubbles - ${sourceFile} - page ${pageNo}`);
     const answers = readAnswers(alignedCanvas, form.design, form.layoutVersion);
     const bubbleId = readStudentId(alignedCanvas, form.layoutVersion);
-    let identity = { printedName: "", writtenStudentId: "", digitOCR: "", ocrError: "" };
-    try {
-      setProgress(`Reading printed name and student ID · ${sourceFile} · page ${pageNo}`);
-      identity = await readWrittenIdentity(alignedCanvas, form.layoutVersion);
-    } catch (error) {
-      identity.ocrError = error.message || "Printed name and ID boxes could not be read.";
-    }
-    const idMatch = resolveStudentId(bubbleId, identity);
+    const idMatch = resolveStudentId(bubbleId);
     return {
       sourceFile,
       pageNo,
@@ -853,13 +841,12 @@ async function scanPage(pdf, pageNo, sourceFile) {
       bubbleStudentId: bubbleId.studentId,
       bubbleIdRaw: bubbleId.raw,
       bubbleIdUncertainColumns: bubbleId.uncertainColumns,
-      writtenStudentId: identity.writtenStudentId,
-      digitOCR: identity.digitOCR,
-      printedName: identity.printedName,
-      identityOcrVersion: IDENTITY_OCR_VERSION,
+      writtenStudentId: "",
+      digitOCR: "",
+      printedName: "",
       answerReaderVersion: ANSWER_READER_VERSION,
       idMatchStatus: idMatch.status,
-      ocrError: identity.ocrError,
+      ocrError: "",
       sampleExpectedAnswers: form.sampleSeed
         ? Array.from({ length: form.design.question_count }, (_, index) =>
           String.fromCharCode(65 + ((index + 1 + form.sampleSeed) % form.design.choice_count)))
@@ -1360,7 +1347,7 @@ function readAnswers(canvas, design, layoutVersion) {
       for (let choice = 0; choice < choiceCount; choice += 1) {
         bubbles.push(sampleBubble(image, canvas.width, canvas.height,
           (x + choice * answerPitch) * scale, (A4.height - y) * scale,
-          (currentLayout ? 5.2 : Math.min(5, Math.max(3.6, rowPitch * 0.28))) * scale,
+          (currentLayout ? 6.8 : Math.min(5, Math.max(3.6, rowPitch * 0.28))) * scale,
           String.fromCharCode(65 + choice)));
       }
       answers.push(resolveQuestion(question, bubbles));
@@ -1380,92 +1367,61 @@ function readStudentId(canvas, layoutVersion) {
   let digits = "";
   const uncertainColumns = [];
   for (let column = 0; column < 9; column += 1) {
-    const marked = [];
-    let uncertain = false;
+    const bubbles = [];
     for (let digit = 0; digit < 10; digit += 1) {
       const bubble = sampleIdBubble(
         image, canvas.width, canvas.height,
         (firstBubbleX + column * 20.5) * scale,
         (firstRowY + digit * rowPitch) * scale,
-        ([3, 4].includes(layoutVersion) ? 5 : 3.9) * scale, String(digit),
+        ([3, 4].includes(layoutVersion) ? 6.8 : 3.9) * scale, String(digit),
       );
-      if (bubble.mark === "shaded") marked.push(digit);
-      if (bubble.mark === "uncertain") uncertain = true;
+      bubbles.push(bubble);
     }
-    if (marked.length !== 1) digits += "?";
-    else digits += String(marked[0]);
-    if (uncertain) uncertainColumns.push(column + 1);
+    const ranked = [...bubbles].sort((a, b) => b.signal - a.signal);
+    const top = ranked[0];
+    const second = ranked[1];
+    const signalGap = top.signal - second.signal;
+    const clearWinner = top.signal >= 0.28 && signalGap >= 0.07;
+    if (clearWinner) digits += top.label;
+    else digits += "?";
+    const ambiguous = !clearWinner || second.signal >= top.signal * 0.88;
+    if (ambiguous) uncertainColumns.push(column + 1);
   }
   return { studentId: /^\d{9}$/.test(digits) ? digits : "", raw: digits, uncertainColumns };
 }
 
 function sampleIdBubble(image, width, height, centerX, centerY, radius, label) {
-  // The ID bubbles are close together vertically and have no printed letters.
-  // Read the center of each small circle, keeping its outline and neighboring
-  // rows out of the sample. The answer-bubble classifier samples a wider area
-  // to detect X marks and is too sensitive to the dense ID grid's outlines.
-  const cx = Math.round(centerX);
-  const cy = Math.round(centerY);
-  const coreRadius = Math.max(2, radius * 0.52);
-  let total = 0;
-  let samples = 0;
-  let dark = 0;
-  let ink = 0;
-  for (let dy = -Math.ceil(coreRadius); dy <= Math.ceil(coreRadius); dy += 1) {
-    for (let dx = -Math.ceil(coreRadius); dx <= Math.ceil(coreRadius); dx += 1) {
-      if (dx * dx + dy * dy > coreRadius * coreRadius) continue;
-      const px = cx + dx;
-      const py = cy + dy;
-      if (px < 0 || px >= width || py < 0 || py >= height) continue;
-      const gray = grayAt(image.data, py * width + px);
-      total += gray;
-      samples += 1;
-      if (gray < 220) dark += 1;
-      if (gray < 190) ink += 1;
-    }
-  }
-  const mean = total / Math.max(1, samples);
-  const darkRatio = dark / Math.max(1, Math.PI * coreRadius * coreRadius);
-  const inkRatio = ink / Math.max(1, Math.PI * coreRadius * coreRadius);
+  const analysis = analyzeCircle(image, width, height, centerX, centerY, radius, 0.12);
   let mark = "blank";
   let confidence = 0.92;
-  if (darkRatio >= 0.32 || inkRatio >= 0.22 || mean < 218) {
+  if (analysis.fillRatio >= 0.3 && analysis.normalizedContrast >= 0.22) {
     mark = "shaded";
-    confidence = Math.min(0.99, 0.62 + Math.max(darkRatio, inkRatio) * 0.35);
-  } else if (darkRatio >= 0.1 || mean < 239) {
+    confidence = Math.min(0.99, 0.62 + analysis.signal * 0.35);
+  } else if (analysis.fillRatio >= 0.14 && analysis.normalizedContrast >= 0.1) {
     mark = "uncertain";
     confidence = 0.48;
   }
-  return { label, mark, confidence, fillRatio: darkRatio, crossScore: 0 };
+  return { label, mark, confidence, fillRatio: analysis.fillRatio, crossScore: 0,
+    signal: analysis.signal, centerX: analysis.cx, centerY: analysis.cy };
 }
 
-function resolveStudentId(bubbleId, identity) {
+function resolveStudentId(bubbleId) {
   const bubbled = bubbleId.studentId;
-  const written = identity.writtenStudentId;
-  if (bubbled && written) {
-    if (bubbled !== written) {
-      return { studentId: bubbled, status: `ID mismatch: boxes show ${written}, bubbles show ${bubbled}; verify before grading.` };
-    }
-    return {
-      studentId: bubbled,
-      status: bubbleId.uncertainColumns.length
-        ? `The ID boxes and bubbles agree, but column(s) ${bubbleId.uncertainColumns.join(", ")} have additional uncertain marks.`
-        : "The ID boxes and bubbles agree.",
-    };
-  }
   if (bubbled) {
     return {
       studentId: bubbled,
       status: bubbleId.uncertainColumns.length
-        ? `Bubble ID read; uncertain marks in column(s) ${bubbleId.uncertainColumns.join(", ")}. Written ID could not be confirmed.`
-        : "Bubble ID read; written ID could not be confirmed.",
+        ? `Bubble ID read; check column(s) ${bubbleId.uncertainColumns.join(", ")} because another faint mark was detected.`
+        : "Student number read from the ID bubbles.",
     };
   }
-  if (written) return { studentId: written, status: "ID read from boxes; bubble ID could not be confirmed." };
-  return { studentId: "", status: "Student number could not be read from the boxes or bubbles." };
+  return { studentId: "", status: "Student number could not be read from the ID bubbles." };
 }
 
 async function readWrittenIdentity(canvas, layoutVersion) {
+  // Retained only so older persisted callers fail safe. Runtime identity now
+  // comes exclusively from the student-number bubble grid.
+  return { printedName: "", writtenStudentId: "", digitOCR: "" };
   if (![2, 3, 4].includes(layoutVersion)) return { printedName: "", writtenStudentId: "", digitOCR: "" };
   const worker = await getOcrWorker();
   const scale = canvas.width / A4.width;
@@ -1790,6 +1746,124 @@ async function releaseOcrWorker() {
 }
 
 function sampleBubble(image, width, height, centerX, centerY, radius, label) {
+  const analysis = analyzeCircle(image, width, height, centerX, centerY, radius);
+  const crossScore = relativeDiagonalCoverage(
+    image, width, height, analysis.cx, analysis.cy, radius,
+    analysis.darkThreshold,
+  );
+  const denseFill = analysis.fillRatio >= 0.5 || analysis.normalizedContrast >= 0.72;
+  const crossed = crossScore >= 0.52 && !denseFill;
+  let mark = "blank";
+  let confidence = 0.9;
+  if (crossed) {
+    mark = "crossed";
+    confidence = Math.min(0.99, 0.55 + crossScore * 0.4);
+  } else if (analysis.fillRatio >= 0.28 && analysis.normalizedContrast >= 0.2) {
+    mark = "shaded";
+    confidence = Math.min(0.99, 0.58 + analysis.signal * 0.42);
+  } else if (analysis.fillRatio >= 0.14 && analysis.normalizedContrast >= 0.1) {
+    mark = "uncertain";
+    confidence = 0.45;
+  }
+  return {
+    label, mark, confidence, fillRatio: analysis.fillRatio, crossScore,
+    signal: analysis.signal, centerX: analysis.cx, centerY: analysis.cy,
+  };
+}
+
+function analyzeCircle(image, width, height, expectedX, expectedY, radius, searchScale = 0.32) {
+  const r = Math.max(4, radius);
+  const search = Math.max(1, Math.round(r * searchScale));
+  const offsets = [-search, 0, search];
+  let best = null;
+  for (const dy of offsets) {
+    for (const dx of offsets) {
+      const cx = Math.round(expectedX + dx);
+      const cy = Math.round(expectedY + dy);
+      const ring = radialGraySamples(image, width, height, cx, cy, r, 0.78, 1.12);
+      const outside = radialGraySamples(image, width, height, cx, cy, r, 1.3, 1.62);
+      if (!ring.length || !outside.length) continue;
+      const paper = percentile(outside, 0.75);
+      const outline = percentile(ring, 0.2);
+      const offsetPenalty = Math.hypot(dx, dy) / r * 0.35;
+      const score = paper - outline - offsetPenalty;
+      if (!best || score > best.score) best = { cx, cy, score, ring, outside };
+    }
+  }
+  if (!best) {
+    best = {
+      cx: Math.round(expectedX), cy: Math.round(expectedY), score: 0,
+      ring: [], outside: [],
+    };
+  }
+  const inside = radialGraySamples(image, width, height, best.cx, best.cy, r, 0, 0.62);
+  const paper = percentile(best.outside, 0.75) || 255;
+  const outline = percentile(best.ring, 0.2) || Math.max(0, paper - 16);
+  const outlineSpan = Math.max(2, paper - outline);
+  const darkThreshold = paper - Math.max(1.5, outlineSpan * 0.28);
+  const darkPixels = inside.filter((gray) => gray < darkThreshold).length;
+  const fillRatio = darkPixels / Math.max(1, inside.length);
+  const insideMean = inside.reduce((total, gray) => total + gray, 0) / Math.max(1, inside.length);
+  const normalizedContrast = Math.max(0, Math.min(1.5, (paper - insideMean) / outlineSpan));
+  const signal = Math.min(1, fillRatio * 0.72 + Math.min(1, normalizedContrast) * 0.28);
+  return {
+    cx: best.cx, cy: best.cy, fillRatio, normalizedContrast, signal,
+    darkThreshold, paper, outline,
+  };
+}
+
+function radialGraySamples(image, width, height, cx, cy, radius, innerScale, outerScale) {
+  const samples = [];
+  const inner = radius * innerScale;
+  const outer = radius * outerScale;
+  const limit = Math.ceil(outer);
+  for (let dy = -limit; dy <= limit; dy += 1) {
+    for (let dx = -limit; dx <= limit; dx += 1) {
+      const distance = Math.hypot(dx, dy);
+      if (distance < inner || distance > outer) continue;
+      const px = cx + dx;
+      const py = cy + dy;
+      if (px < 0 || px >= width || py < 0 || py >= height) continue;
+      samples.push(grayAt(image.data, py * width + px));
+    }
+  }
+  return samples;
+}
+
+function percentile(values, fraction) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * fraction)))];
+}
+
+function relativeDiagonalCoverage(image, width, height, cx, cy, radius, darkThreshold) {
+  const start = Math.max(2, Math.round(radius * 0.5));
+  const end = Math.round(radius * 1.5);
+  let weakerDiagonal = 1;
+  for (const direction of [1, -1]) {
+    let hits = 0;
+    let samples = 0;
+    for (const sign of [-1, 1]) {
+      for (let distance = start; distance <= end; distance += 1) {
+        const dx = Math.round(distance / Math.sqrt(2)) * sign;
+        const dy = Math.round(distance / Math.sqrt(2)) * sign * direction;
+        let dark = false;
+        for (let offset = -1; offset <= 1; offset += 1) {
+          const px = cx + dx + offset;
+          const py = cy + dy - offset * direction;
+          if (px < 0 || px >= width || py < 0 || py >= height) continue;
+          if (grayAt(image.data, py * width + px) < darkThreshold) dark = true;
+        }
+        if (dark) hits += 1;
+        samples += 1;
+      }
+    }
+    weakerDiagonal = Math.min(weakerDiagonal, samples ? hits / samples : 0);
+  }
+  return weakerDiagonal;
+}
+
+function sampleBubbleLegacy(image, width, height, centerX, centerY, radius, label) {
   const cx = Math.round(centerX);
   const cy = Math.round(centerY);
   const r = Math.max(4, Math.round(radius));
@@ -1892,9 +1966,14 @@ function median(values) {
 }
 
 function resolveQuestion(question, bubbles) {
-  const active = bubbles.filter((bubble) => bubble.mark === "shaded");
+  const ranked = [...bubbles].sort((a, b) => (b.signal || 0) - (a.signal || 0));
+  const top = ranked[0];
+  const second = ranked[1] || { signal: 0 };
+  const clearWinner = top.mark !== "crossed" && top.signal >= 0.28 &&
+    top.signal - second.signal >= 0.09;
+  const active = clearWinner ? [top] : bubbles.filter((bubble) => bubble.mark === "shaded");
   const crossed = bubbles.filter((bubble) => bubble.mark === "crossed");
-  const uncertain = bubbles.filter((bubble) => bubble.mark === "uncertain");
+  const uncertain = clearWinner ? [] : bubbles.filter((bubble) => bubble.mark === "uncertain");
   let response = "";
   let status = "incorrect_blank";
   let reason = "No answer bubble was shaded.";
@@ -1973,18 +2052,12 @@ function isDummyAnswerKey(sheet) {
     sheet?.writtenStudentId === "000000000";
 }
 
-function normalizedName(value) {
-  return String(value || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z]/g, "");
-}
-
 function identitySummary(sheet) {
   const learner = matchedLearner(sheet);
   if (learner && sheet.bubbleStudentId === learner.student_id) {
     const parts = [
       `Roster identity confirmed: ${learner.name}`,
       `Nine-digit bubble ID matches SIS login: ${learner.student_id}`,
-      `ID boxes OCR: ${sheet.digitOCR || "not read"}`,
-      `Printed-name OCR: ${sheet.printedName || "not read"}`,
     ];
     if (sheet.bubbleIdUncertainColumns?.length) {
       parts.push(`The scan flagged faint marks in ${sheet.bubbleIdUncertainColumns.length} digit column(s), but its decoded nine-digit ID matches this roster entry`);
@@ -1992,16 +2065,11 @@ function identitySummary(sheet) {
     return parts.join(" · ");
   }
   const parts = [
-    `Printed name: ${sheet.printedName || "not read"}`,
-    `ID boxes: ${sheet.digitOCR || "not read"}`,
     `ID bubbles: ${sheet.bubbleIdRaw || "not read"}`,
     sheet.idMatchStatus || "",
   ];
   if (learner) parts.push(`Matched SIS number: ${learner.student_id}`);
-  if (learner && sheet.printedName && normalizedName(learner.name) !== normalizedName(sheet.printedName)) {
-    parts.push(`OCR name differs from roster name (${learner.name})`);
-  }
-  if (sheet.ocrError) parts.push(`Name/box OCR: ${sheet.ocrError}`);
+  if (!learner) parts.push("Use the enhanced scan to check the handwritten name if manual identification is needed");
   return parts.filter(Boolean).join(" · ");
 }
 
@@ -2081,7 +2149,7 @@ function renderRosterTable() {
       : !courseRoster.length ? "Course roster unavailable for cross-reference"
         : sheet.studentId ? `ID ${sheet.studentId} not on course roster` : "No confirmed roster ID";
     const idNote = [sheet.idMatchStatus, sheet.bubbleStudentId ? `Bubble ID ${sheet.bubbleStudentId}` : "Bubble ID unreadable",
-      sheet.digitOCR ? `Box OCR ${sheet.digitOCR}` : "Box ID unreadable", rosterNote]
+      rosterNote]
       .filter(Boolean).join(" · ");
     appendRosterRow("Student not identified", idNote,
       gradeLabelForScan(sheet), [sheet]);
@@ -2313,7 +2381,7 @@ function statusPill(status) {
 
 function downloadCsv() {
   const formSheets = sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId);
-  const rows = [["student_name", "printed_name_ocr", "sis_login_id", "student_number", "id_boxes_ocr", "id_bubbles", "id_match_status", "source_pdf", "page", "form_id", "form_title", "answer_key_scan", "answer_key_page", "question", "answer", "correct_answer", "grade", "sample_expected_answer", "sample_pattern_check", "status", "note"]];
+  const rows = [["student_name", "sis_login_id", "student_number", "id_bubbles", "id_match_status", "source_pdf", "page", "form_id", "form_title", "answer_key_scan", "answer_key_page", "question", "answer", "correct_answer", "grade", "sample_expected_answer", "sample_pattern_check", "status", "note"]];
   for (const sheet of formSheets) {
     const learner = matchedLearner(sheet);
     const key = getGradeKeyForScan(sheet);
@@ -2324,8 +2392,8 @@ function downloadCsv() {
       const sampleCheck = expectedSampleAnswer
         ? (answer.status !== "review" && answer.response === expectedSampleAnswer ? "match" : "mismatch")
         : "";
-      rows.push([studentNameFor(sheet), sheet.printedName || "", learner?.sis_login_id || "", learner?.student_id || sheet.studentId,
-        sheet.digitOCR || "", sheet.bubbleIdRaw || "", sheet.idMatchStatus || "", sheet.sourceFile, sheet.pageNo, sheet.formId, sheet.formTitle,
+      rows.push([studentNameFor(sheet), learner?.sis_login_id || "", learner?.student_id || sheet.studentId,
+        sheet.bubbleIdRaw || "", sheet.idMatchStatus || "", sheet.sourceFile, sheet.pageNo, sheet.formId, sheet.formTitle,
         key ? `${studentNameFor(key)} · ${key.sourceFile}` : "", key?.pageNo || "", answer.question,
         answer.response, item?.correctAnswer?.response || "", item?.status || "not_graded",
         expectedSampleAnswer, sampleCheck, answer.status, answer.reason]);
@@ -2392,36 +2460,24 @@ async function refreshSavedBubbleIds() {
         const answers = sheet.answerReaderVersion === ANSWER_READER_VERSION
           ? sheet.answers
           : readAnswers(candidate, form.design, form.layoutVersion);
-        let identity = {
-          writtenStudentId: sheet.writtenStudentId || "",
-          digitOCR: sheet.digitOCR || "",
-          printedName: sheet.printedName || "",
-        };
-        if (sheet.identityOcrVersion !== IDENTITY_OCR_VERSION) {
-          try {
-            identity = await readWrittenIdentity(candidate, form.layoutVersion);
-          } catch (error) {
-            console.warn("Could not refresh OCR from the locally saved page", error);
-          }
-        }
         candidate.width = 0;
         candidate.height = 0;
-        const idMatch = resolveStudentId(bubbleId, identity);
+        const idMatch = resolveStudentId(bubbleId);
         if (sheet.bubbleStudentId !== bubbleId.studentId ||
             sheet.bubbleIdRaw !== bubbleId.raw ||
             JSON.stringify(sheet.bubbleIdUncertainColumns || []) !== JSON.stringify(bubbleId.uncertainColumns) ||
             sheet.studentId !== idMatch.studentId || sheet.idMatchStatus !== idMatch.status ||
-            sheet.digitOCR !== identity.digitOCR || sheet.writtenStudentId !== identity.writtenStudentId ||
-            sheet.printedName !== identity.printedName || sheet.identityOcrVersion !== IDENTITY_OCR_VERSION ||
+            sheet.digitOCR || sheet.writtenStudentId || sheet.printedName || sheet.ocrError ||
             sheet.answerReaderVersion !== ANSWER_READER_VERSION ||
             JSON.stringify(sheet.answers) !== JSON.stringify(answers)) {
           sheet.bubbleStudentId = bubbleId.studentId;
           sheet.bubbleIdRaw = bubbleId.raw;
           sheet.bubbleIdUncertainColumns = bubbleId.uncertainColumns;
-          sheet.writtenStudentId = identity.writtenStudentId;
-          sheet.digitOCR = identity.digitOCR;
-          sheet.printedName = identity.printedName;
-          sheet.identityOcrVersion = IDENTITY_OCR_VERSION;
+          sheet.writtenStudentId = "";
+          sheet.digitOCR = "";
+          sheet.printedName = "";
+          sheet.ocrError = "";
+          delete sheet.identityOcrVersion;
           sheet.answerReaderVersion = ANSWER_READER_VERSION;
           sheet.answers = answers;
           sheet.studentId = idMatch.studentId;
