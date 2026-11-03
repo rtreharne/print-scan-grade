@@ -51,8 +51,12 @@ let originalScanObjectUrl = "";
 let previewedSheetId = "";
 const A4 = { width: 595.2756, height: 841.8898 };
 const MARK_MARGIN = 16;
-const IDENTITY_OCR_VERSION = 5;
-const ANSWER_READER_VERSION = 3;
+const CURRENT_MARK_MARGIN = 21;
+const IDENTITY_OCR_VERSION = 6;
+const ANSWER_READER_VERSION = 4;
+const CURRENT_SHEET_LAYOUT_VERSION = 4;
+const PREVIEW_CONTRAST_VERSION = 2;
+const REGISTRATION_MARK_THRESHOLD = 160;
 const MAX_PDF_BYTES = 64 * 1024 * 1024;
 const MAX_ZIP_BYTES = 256 * 1024 * 1024;
 const formsById = new Map();
@@ -106,7 +110,8 @@ dummyZipForm?.addEventListener("submit", (event) => {
     return;
   }
   dummyZipError.hidden = true;
-  window.location.assign(`/scan/${encodeURIComponent(formId)}/dummy.zip?count=${count}`);
+  window.location.assign(`/scan/${encodeURIComponent(formId)}/dummy.zip?count=${count}` +
+    `&scanner_layout_version=${CURRENT_SHEET_LAYOUT_VERSION}`);
 });
 
 initializeDummyZipForm();
@@ -347,11 +352,22 @@ function renderGradeDashboardSheets(forms) {
   gradeFormList.replaceChildren();
   const scannedForms = forms.filter((form) => scanSets.some((scanSet) => scanSet.formId === form.form_id));
   if (!scannedForms.length) {
-    const empty = document.createElement("p");
-    empty.className = "field-help";
-    empty.textContent = pageIssues.length
+    const empty = document.createElement("div");
+    empty.className = pageIssues.length ? "scan-errors" : "field-help";
+    const message = document.createElement("p");
+    message.textContent = pageIssues.length
       ? `No answer sheets were identified in saved scan data. ${pageIssues.length} file or page issue(s) need attention.`
       : "No scanned answer sheets saved for this course yet. Scan completed sheets to start grading.";
+    empty.append(message);
+    if (pageIssues.length) {
+      const list = document.createElement("ul");
+      for (const issue of pageIssues) {
+        const item = document.createElement("li");
+        item.textContent = `${issue.file}${issue.page === "—" ? "" : ` · page ${issue.page}`}: ${issue.reason}`;
+        list.append(item);
+      }
+      empty.append(list);
+    }
     gradeFormList.append(empty);
     return;
   }
@@ -491,7 +507,7 @@ async function deleteScanSet(scanSetId) {
 $("#scan-preview-close").addEventListener("click", () => scanPreviewDialog.close());
 originalScanToggle.addEventListener("click", () => {
   originalScanPanel.hidden = !originalScanPanel.hidden;
-  originalScanToggle.textContent = originalScanPanel.hidden ? "View original scan" : "Hide original scan";
+  originalScanToggle.textContent = originalScanPanel.hidden ? "View enhanced scan" : "Hide enhanced scan";
 });
 scanPreviewDialog.addEventListener("close", resetOriginalScanPreview);
 scanPreviewDialog.addEventListener("click", (event) => {
@@ -537,6 +553,12 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
   const issueCountBefore = pageIssues.length;
   const targetScanSet = targetScanSetId ? scanSets.find((item) => item.id === targetScanSetId) : null;
   if (targetScanSetId && !targetScanSet) return;
+  if (!targetScanSet) {
+    // Page issues describe the upload currently being processed. Keeping old
+    // failures here made a successful retry continue to report stale errors.
+    pageIssues = [];
+    guidePagesSkipped = 0;
+  }
   scanInProgress = true;
   ocrUnavailableReason = "";
   sourceInput.value = "";
@@ -725,28 +747,67 @@ async function scanPage(pdf, pageNo, sourceFile) {
   await page.render({ canvasContext: sourceContext, viewport, background: "#ffffff" }).promise;
   page.cleanup();
 
-  const marks = findRegistrationMarks(sourceCanvas);
+  // Scanner apps often produce a pale gray page. Use a maximally contrasted
+  // black/white copy for structural detection, while retaining the original
+  // grayscale page for answer shading, OCR and the saved preview.
+  const detectionCanvas = createBinarizedCanvas(sourceCanvas);
+  const marks = findRegistrationMarks(detectionCanvas);
+  detectionCanvas.width = 0;
+  detectionCanvas.height = 0;
   if (!marks) {
     sourceCanvas.width = 0;
     sourceCanvas.height = 0;
     throw new Error("The four page-registration marks could not be found. Check that the page is not cropped.");
   }
   let alignedCanvas = null;
+  let singleFormFallbackCanvas = null;
   let qr = null;
   // Registration marks are symmetric, so try each physical page orientation.
   // A valid form QR in the expected top-right area identifies the upright one.
   for (let rotation = 0; rotation < 4; rotation += 1) {
     const points = marks.map((_, index) => marks[(index + rotation) % marks.length]);
-    const candidate = rectifyPage(sourceCanvas, points);
+    let candidate = rectifyPage(sourceCanvas, points);
     if (!candidate) continue;
-    const decoded = decodeFormQr(candidate);
+    let qrCanvas = createBinarizedCanvas(candidate);
+    let decoded = decodeFormQr(qrCanvas) || decodeFormQr(candidate);
+    qrCanvas.width = 0;
+    qrCanvas.height = 0;
+    const preliminaryForm = decoded && !decoded.data.startsWith("PSGGUIDE|")
+      ? identifyScannedForm(decoded) : null;
+    if (preliminaryForm?.ok && preliminaryForm.layoutVersion === 4) {
+      candidate.width = 0;
+      candidate = rectifyPage(sourceCanvas, points, CURRENT_MARK_MARGIN);
+      if (!candidate) continue;
+      qrCanvas = createBinarizedCanvas(candidate);
+      decoded = decodeFormQr(qrCanvas) || decodeFormQr(candidate);
+      qrCanvas.width = 0;
+      qrCanvas.height = 0;
+    }
     if (decoded) {
       alignedCanvas = candidate;
       qr = decoded;
       break;
     }
-    candidate.width = 0;
-    candidate.height = 0;
+    if (rotation === 0 && formsById.size === 1) {
+      singleFormFallbackCanvas = candidate;
+    } else {
+      candidate.width = 0;
+      candidate.height = 0;
+    }
+  }
+  if (alignedCanvas && singleFormFallbackCanvas && singleFormFallbackCanvas !== alignedCanvas) {
+    singleFormFallbackCanvas.width = 0;
+    singleFormFallbackCanvas.height = 0;
+  }
+  if (!alignedCanvas && singleFormFallbackCanvas) {
+    const design = formsById.values().next().value;
+    alignedCanvas = singleFormFallbackCanvas;
+    // Layout 3 and 4 share answer and ID geometry. Existing pale sheets use
+    // layout 3; clean layout-4 sheets remain identified from their QR above.
+    qr = {
+      data: `PSG1|${design.form_id}|${design.question_count}|${design.choice_count}|3`,
+      pageTopRatio: 0.28,
+    };
   }
   if (!alignedCanvas) {
     sourceCanvas.width = 0;
@@ -761,11 +822,11 @@ async function scanPage(pdf, pageNo, sourceFile) {
       }
       return { guidePage: true };
     }
-    const form = identifyForm(qr.data);
+    const form = identifyScannedForm(qr);
     if (!form.ok) throw new Error(form.reason);
     let originalPage = null;
     try {
-      originalPage = await createLocalPagePreview(sourceCanvas);
+      originalPage = await createLocalPagePreview(sourceCanvas, true);
     } catch (error) {
       console.warn("Could not create a locally saved original-page preview", error);
     }
@@ -783,8 +844,10 @@ async function scanPage(pdf, pageNo, sourceFile) {
       sourceFile,
       pageNo,
       originalPage,
+      previewContrastVersion: PREVIEW_CONTRAST_VERSION,
       formId: form.design.form_id,
       formTitle: form.design.title,
+      layoutVersion: form.layoutVersion,
       questionCount: form.design.question_count,
       studentId: idMatch.studentId,
       bubbleStudentId: bubbleId.studentId,
@@ -811,7 +874,92 @@ async function scanPage(pdf, pageNo, sourceFile) {
   }
 }
 
-async function createLocalPagePreview(sourceCanvas) {
+function createBinarizedCanvas(sourceCanvas) {
+  const sourceContext = sourceCanvas.getContext("2d", { willReadFrequently: true });
+  const image = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+  const histogram = new Uint32Array(256);
+  const grayscale = new Uint8Array(sourceCanvas.width * sourceCanvas.height);
+  for (let pixel = 0; pixel < grayscale.length; pixel += 1) {
+    const offset = pixel * 4;
+    const gray = Math.round((image.data[offset] * 299 + image.data[offset + 1] * 587 +
+      image.data[offset + 2] * 114) / 1000);
+    grayscale[pixel] = gray;
+    histogram[gray] += 1;
+  }
+  // Otsu's method selects the split that maximizes separation between paper
+  // and ink, adapting automatically to gray or low-contrast scans.
+  const total = grayscale.length;
+  let weightedTotal = 0;
+  for (let value = 0; value < 256; value += 1) weightedTotal += value * histogram[value];
+  let backgroundWeight = 0;
+  let backgroundTotal = 0;
+  let bestVariance = -1;
+  let threshold = 180;
+  for (let value = 0; value < 256; value += 1) {
+    backgroundWeight += histogram[value];
+    if (!backgroundWeight) continue;
+    const foregroundWeight = total - backgroundWeight;
+    if (!foregroundWeight) break;
+    backgroundTotal += value * histogram[value];
+    const backgroundMean = backgroundTotal / backgroundWeight;
+    const foregroundMean = (weightedTotal - backgroundTotal) / foregroundWeight;
+    const variance = backgroundWeight * foregroundWeight * (backgroundMean - foregroundMean) ** 2;
+    if (variance > bestVariance) {
+      bestVariance = variance;
+      threshold = value;
+    }
+  }
+  const output = document.createElement("canvas");
+  output.width = sourceCanvas.width;
+  output.height = sourceCanvas.height;
+  const outputContext = output.getContext("2d", { willReadFrequently: true });
+  const contrasted = outputContext.createImageData(output.width, output.height);
+  // PDF.js can render pale scanner ink around 240/255 even when desktop PDF
+  // viewers show it as dark gray. Keep a high structural floor so those marks
+  // become black; this copy is never used to judge student answer shading.
+  const structuralThreshold = Math.max(threshold, 250);
+  for (let pixel = 0; pixel < grayscale.length; pixel += 1) {
+    const tone = grayscale[pixel] <= structuralThreshold ? 0 : 255;
+    const offset = pixel * 4;
+    contrasted.data[offset] = tone;
+    contrasted.data[offset + 1] = tone;
+    contrasted.data[offset + 2] = tone;
+    contrasted.data[offset + 3] = 255;
+  }
+  outputContext.putImageData(contrasted, 0, 0);
+  return output;
+}
+
+function restorePaleScanContrast(image) {
+  let darkPixels = 0;
+  let paleInkPixels = 0;
+  let sampledPixels = 0;
+  // Sampling is sufficient to classify the page and avoids another complete
+  // pass before enhancement. Normal PDFs contain substantially more genuinely
+  // dark ink than mixed-raster scans whose foreground mask PDF.js has lost.
+  for (let offset = 0; offset < image.data.length; offset += 16) {
+    const gray = Math.round((image.data[offset] * 299 + image.data[offset + 1] * 587 +
+      image.data[offset + 2] * 114) / 1000);
+    if (gray < 170) darkPixels += 1;
+    else if (gray < 254) paleInkPixels += 1;
+    sampledPixels += 1;
+  }
+  const darkRatio = darkPixels / Math.max(1, sampledPixels);
+  const paleInkRatio = paleInkPixels / Math.max(1, sampledPixels);
+  if (darkRatio >= 0.025 || paleInkRatio < 0.01) return false;
+
+  for (let offset = 0; offset < image.data.length; offset += 4) {
+    const gray = Math.round((image.data[offset] * 299 + image.data[offset + 1] * 587 +
+      image.data[offset + 2] * 114) / 1000);
+    const value = gray >= 254 ? 255 : Math.max(0, 255 - (254 - gray) * 10);
+    image.data[offset] = value;
+    image.data[offset + 1] = value;
+    image.data[offset + 2] = value;
+  }
+  return true;
+}
+
+async function createLocalPagePreview(sourceCanvas, restoreContrast = false) {
   const maxWidth = 1200;
   const scale = Math.min(1, maxWidth / sourceCanvas.width);
   const preview = document.createElement("canvas");
@@ -821,8 +969,12 @@ async function createLocalPagePreview(sourceCanvas) {
   context.fillStyle = "white";
   context.fillRect(0, 0, preview.width, preview.height);
   context.drawImage(sourceCanvas, 0, 0, preview.width, preview.height);
+  if (restoreContrast) {
+    const image = context.getImageData(0, 0, preview.width, preview.height);
+    if (restorePaleScanContrast(image)) context.putImageData(image, 0, 0);
+  }
   const blob = await new Promise((resolve, reject) => {
-    preview.toBlob((imageBlob) => imageBlob ? resolve(imageBlob) : reject(new Error("The local scan preview could not be saved.")), "image/jpeg", 0.78);
+    preview.toBlob((imageBlob) => imageBlob ? resolve(imageBlob) : reject(new Error("The local scan preview could not be saved.")), "image/jpeg", 0.88);
   });
   preview.width = 0;
   preview.height = 0;
@@ -835,16 +987,30 @@ function findRegistrationMarks(canvas) {
   const visited = new Uint8Array(canvas.width * canvas.height);
   const expectedSize = canvas.width * 8 / A4.width;
   const corners = [
-    { name: "topLeft", x0: 0, y0: 0, x1: 0.13, y1: 0.13, expectedX: 16 / A4.width, expectedY: 16 / A4.height },
-    { name: "topRight", x0: 0.87, y0: 0, x1: 1, y1: 0.13, expectedX: (A4.width - 16) / A4.width, expectedY: 16 / A4.height },
-    { name: "bottomRight", x0: 0.87, y0: 0.87, x1: 1, y1: 1, expectedX: (A4.width - 16) / A4.width, expectedY: (A4.height - 16) / A4.height },
-    { name: "bottomLeft", x0: 0, y0: 0.87, x1: 0.13, y1: 1, expectedX: 16 / A4.width, expectedY: (A4.height - 16) / A4.height },
+    { name: "topLeft", x0: 0, y0: 0, x1: 0.06, y1: 0.06, expectedX: 16 / A4.width, expectedY: 16 / A4.height },
+    { name: "topRight", x0: 0.94, y0: 0, x1: 1, y1: 0.06, expectedX: (A4.width - 16) / A4.width, expectedY: 16 / A4.height },
+    { name: "bottomRight", x0: 0.94, y0: 0.94, x1: 1, y1: 1, expectedX: (A4.width - 16) / A4.width, expectedY: (A4.height - 16) / A4.height },
+    { name: "bottomLeft", x0: 0, y0: 0.94, x1: 0.06, y1: 1, expectedX: 16 / A4.width, expectedY: (A4.height - 16) / A4.height },
   ];
   const result = {};
   for (const corner of corners) {
-    const found = findCornerSquare(data, visited, canvas.width, canvas.height, corner, expectedSize);
-    if (!found) return null;
-    result[corner.name] = found;
+    let found = findCornerSquare(data, visited, canvas.width, canvas.height, corner, expectedSize) ||
+      findCornerDarkPatch(data, canvas.width, canvas.height, corner, expectedSize);
+    if (found) {
+      const distance = Math.hypot(
+        found.x - corner.expectedX * canvas.width,
+        found.y - corner.expectedY * canvas.height,
+      );
+      if (distance > expectedSize * 1.85) found = null;
+    }
+    // If scanner contrast has erased a mark completely, a full A4 page still
+    // has a reliable nominal corner. QR validation later prevents an unrelated
+    // PDF from being accepted on the strength of these inferred points.
+    result[corner.name] = found || {
+      x: corner.expectedX * canvas.width,
+      y: corner.expectedY * canvas.height,
+      inferred: true,
+    };
   }
   return [result.topLeft, result.topRight, result.bottomRight, result.bottomLeft];
 }
@@ -854,13 +1020,13 @@ function findCornerSquare(image, visited, width, height, corner, expectedSize) {
   const maxX = Math.ceil(corner.x1 * width);
   const minY = Math.floor(corner.y0 * height);
   const maxY = Math.ceil(corner.y1 * height);
-  const lowSize = Math.max(5, expectedSize * 0.5);
+  const lowSize = Math.max(4, expectedSize * 0.4);
   const highSize = Math.max(lowSize + 2, expectedSize * 1.8);
   let best = null;
   for (let y = minY; y < maxY; y += 1) {
     for (let x = minX; x < maxX; x += 1) {
       const index = y * width + x;
-      if (visited[index] || grayAt(image.data, index) >= 100) continue;
+      if (visited[index] || grayAt(image.data, index) >= REGISTRATION_MARK_THRESHOLD) continue;
       const stack = [index];
       visited[index] = 1;
       let count = 0;
@@ -881,7 +1047,7 @@ function findCornerSquare(image, visited, width, height, corner, expectedSize) {
         for (const [nx, ny] of [[cx - 1, cy], [cx + 1, cy], [cx, cy - 1], [cx, cy + 1]]) {
           if (nx < minX || nx >= maxX || ny < minY || ny >= maxY) continue;
           const next = ny * width + nx;
-          if (!visited[next] && grayAt(image.data, next) < 100) {
+          if (!visited[next] && grayAt(image.data, next) < REGISTRATION_MARK_THRESHOLD) {
             visited[next] = 1;
             stack.push(next);
           }
@@ -892,7 +1058,7 @@ function findCornerSquare(image, visited, width, height, corner, expectedSize) {
       const ratio = boxWidth / boxHeight;
       const fill = count / (boxWidth * boxHeight);
       if (boxWidth < lowSize || boxWidth > highSize || boxHeight < lowSize || boxHeight > highSize ||
-          ratio < 0.65 || ratio > 1.45 || fill < 0.55) continue;
+          ratio < 0.5 || ratio > 1.8 || fill < 0.45) continue;
       const expectedX = corner.expectedX * width;
       const expectedY = corner.expectedY * height;
       const centerX = (left + right + 1) / 2;
@@ -906,16 +1072,63 @@ function findCornerSquare(image, visited, width, height, corner, expectedSize) {
   return best;
 }
 
+function findCornerDarkPatch(image, width, height, corner, expectedSize) {
+  const minX = Math.floor(corner.x0 * width);
+  const maxX = Math.ceil(corner.x1 * width);
+  const minY = Math.floor(corner.y0 * height);
+  const maxY = Math.ceil(corner.y1 * height);
+  const regionWidth = maxX - minX;
+  const regionHeight = maxY - minY;
+  const stride = regionWidth + 1;
+  const integral = new Uint32Array((regionWidth + 1) * (regionHeight + 1));
+  // Build an integral image of dark pixels. A high threshold deliberately
+  // reconnects scanner-antialiased registration ink without changing answer
+  // bubble thresholds elsewhere.
+  for (let y = 0; y < regionHeight; y += 1) {
+    let rowTotal = 0;
+    for (let x = 0; x < regionWidth; x += 1) {
+      const dark = grayAt(image.data, (minY + y) * width + minX + x) < 220 ? 1 : 0;
+      rowTotal += dark;
+      integral[(y + 1) * stride + x + 1] = integral[y * stride + x + 1] + rowTotal;
+    }
+  }
+  const expectedX = corner.expectedX * width;
+  const expectedY = corner.expectedY * height;
+  const minSize = Math.max(4, Math.floor(expectedSize * 0.4));
+  const maxSize = Math.max(minSize, Math.ceil(expectedSize * 1.35));
+  const regionDiagonal = Math.hypot(regionWidth, regionHeight);
+  let best = null;
+  for (let size = minSize; size <= maxSize; size += 2) {
+    for (let y = 0; y <= regionHeight - size; y += 2) {
+      for (let x = 0; x <= regionWidth - size; x += 2) {
+        const x2 = x + size;
+        const y2 = y + size;
+        const darkPixels = integral[y2 * stride + x2] - integral[y * stride + x2] -
+          integral[y2 * stride + x] + integral[y * stride + x];
+        const fill = darkPixels / (size * size);
+        if (fill < 0.42) continue;
+        const centerX = minX + x + size / 2;
+        const centerY = minY + y + size / 2;
+        const distance = Math.hypot(centerX - expectedX, centerY - expectedY);
+        const sizeError = Math.abs(size - expectedSize) / expectedSize;
+        const score = fill - distance / regionDiagonal * 0.4 - sizeError * 0.12;
+        if (!best || score > best.score) best = { x: centerX, y: centerY, score };
+      }
+    }
+  }
+  return best;
+}
+
 function grayAt(rgba, pixelIndex) {
   const offset = pixelIndex * 4;
   return (rgba[offset] * 299 + rgba[offset + 1] * 587 + rgba[offset + 2] * 114) / 1000;
 }
 
-function rectifyPage(sourceCanvas, registrationPoints) {
+function rectifyPage(sourceCanvas, registrationPoints, markMargin = MARK_MARGIN) {
   const outputWidth = 1500;
   const outputHeight = Math.round(outputWidth * A4.height / A4.width);
   const scale = outputWidth / A4.width;
-  const inset = MARK_MARGIN * scale;
+  const inset = markMargin * scale;
   const source = registrationPoints.map((point) => [point.x, point.y]);
   const destination = [
     [inset, inset],
@@ -1004,12 +1217,81 @@ function invertHomography(m) {
 
 function decodeFormQr(canvas) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  const left = Math.floor(canvas.width * 0.62);
-  const top = Math.floor(canvas.height * 0.02);
+  // Layout 3 places a relatively small QR beneath the name box. Scanner
+  // antialiasing can make it disappear inside the broad fallback crop, so try
+  // a focused 2x nearest-neighbour crop first.
+  const focusedLeft = Math.floor(canvas.width * 0.8);
+  const focusedTop = Math.floor(canvas.height * 0.23);
+  const focusedWidth = Math.ceil(canvas.width * 0.19);
+  const focusedHeight = Math.ceil(canvas.height * 0.15);
+  const focused = document.createElement("canvas");
+  focused.width = focusedWidth * 3;
+  focused.height = focusedHeight * 3;
+  const focusedContext = focused.getContext("2d", { willReadFrequently: true });
+  focusedContext.imageSmoothingEnabled = false;
+  focusedContext.drawImage(canvas, focusedLeft, focusedTop, focusedWidth, focusedHeight,
+    0, 0, focused.width, focused.height);
+  const focusedData = focusedContext.getImageData(0, 0, focused.width, focused.height);
+  let focusedDecoded = window.jsQR(focusedData.data, focused.width, focused.height,
+    { inversionAttempts: "attemptBoth" });
+  if (!focusedDecoded) {
+    const grayscale = new Uint8Array(focused.width * focused.height);
+    for (let pixel = 0; pixel < grayscale.length; pixel += 1) {
+      const offset = pixel * 4;
+      grayscale[pixel] = Math.round((focusedData.data[offset] * 299 +
+        focusedData.data[offset + 1] * 587 + focusedData.data[offset + 2] * 114) / 1000);
+    }
+    // Scanner PDFs can contain very pale QR ink. Try a short set of high local
+    // thresholds against this crop rather than applying one threshold to the
+    // entire answer sheet and amplifying paper texture everywhere.
+    for (const threshold of [240, 245, 248, 250, 252]) {
+      const contrasted = new Uint8ClampedArray(focusedData.data.length);
+      for (let pixel = 0; pixel < grayscale.length; pixel += 1) {
+        const offset = pixel * 4;
+        const tone = grayscale[pixel] <= threshold ? 0 : 255;
+        contrasted[offset] = tone;
+        contrasted[offset + 1] = tone;
+        contrasted[offset + 2] = tone;
+        contrasted[offset + 3] = 255;
+      }
+      focusedDecoded = window.jsQR(contrasted, focused.width, focused.height,
+        { inversionAttempts: "attemptBoth" });
+      if (focusedDecoded) break;
+    }
+  }
+  focused.width = 0;
+  focused.height = 0;
+  if (focusedDecoded) {
+    const focusedCorners = ["topLeftCorner", "topRightCorner", "bottomLeftCorner", "bottomRightCorner"]
+      .map((name) => focusedDecoded.location?.[name]).filter(Boolean);
+    if (focusedCorners.length) {
+      focusedDecoded.pageTopRatio = (focusedTop +
+        Math.min(...focusedCorners.map((point) => point.y)) / 3) / canvas.height;
+    }
+    return focusedDecoded;
+  }
+  const left = Math.floor(canvas.width * 0.5);
+  const top = Math.floor(canvas.height * 0.01);
   const width = canvas.width - left;
-  const height = Math.floor(canvas.height * 0.3);
+  const height = Math.floor(canvas.height * 0.42);
   const data = ctx.getImageData(left, top, width, height);
-  return window.jsQR(data.data, width, height, { inversionAttempts: "attemptBoth" });
+  const decoded = window.jsQR(data.data, width, height, { inversionAttempts: "attemptBoth" });
+  if (decoded?.location) {
+    const corners = ["topLeftCorner", "topRightCorner", "bottomLeftCorner", "bottomRightCorner"]
+      .map((name) => decoded.location[name]).filter(Boolean);
+    decoded.pageTopRatio = (top + Math.min(...corners.map((point) => point.y))) / canvas.height;
+  }
+  return decoded;
+}
+
+function identifyScannedForm(qr) {
+  const form = identifyForm(qr.data);
+  // The redesigned sheet was briefly emitted with a v2 QR before its layout
+  // number was bumped. Its QR sits beneath the name box, unlike true v2 sheets.
+  if (form.ok && form.layoutVersion === 2 && qr.pageTopRatio > 0.22) {
+    return { ...form, layoutVersion: 3 };
+  }
+  return form;
 }
 
 function identifyForm(payload) {
@@ -1043,30 +1325,33 @@ function identifyForm(payload) {
     return { ok: false, reason: "The QR code settings don’t match the saved form. Re-download the sheet from Print." };
   }
   if (layoutVersion === null) layoutVersion = design.legacy_layout_version;
-  if (![1, 2].includes(layoutVersion)) return { ok: false, reason: "This answer-sheet layout version is not supported." };
+  if (![1, 2, 3, 4].includes(layoutVersion)) return { ok: false, reason: "This answer-sheet layout version is not supported." };
   return { ok: true, design, layoutVersion, sampleSeed };
 }
 
 function readAnswers(canvas, design, layoutVersion) {
-  const questionTop = layoutVersion === 1 ? 589 : 507;
   const questionBottom = 38;
   const questionCount = Number(design.question_count);
   const choiceCount = Number(design.choice_count);
-  const columns = Math.min(4, Math.max(1, Math.ceil(questionCount / 20)));
-  const rowsPerColumn = Math.ceil(questionCount / columns);
+  const currentLayout = [3, 4].includes(layoutVersion);
+  const questionTop = layoutVersion === 1 ? 589 : currentLayout ? 460 : 507;
+  const columns = Math.min(4, Math.max(1, Math.ceil(questionCount / (currentLayout ? 15 : 20))));
+  const rowsPerColumn = currentLayout ? 15 : Math.ceil(questionCount / columns);
   const columnWidth = (A4.width - 54) / columns;
-  const rowPitch = Math.min(28.5, Math.max(12, (questionTop - questionBottom) / rowsPerColumn));
+  const rowPitch = currentLayout
+    ? Math.min(31, Math.max(12, (questionTop - questionBottom) / Math.max(1, rowsPerColumn - 1)))
+    : Math.min(28.5, Math.max(12, (questionTop - questionBottom) / rowsPerColumn));
   const rowOffset = (questionTop - questionBottom - (rowsPerColumn - 1) * rowPitch) / 2;
-  const answerPitch = Math.min(20.5, (columnWidth - 37) / Math.max(1, choiceCount - 1));
+  const answerPitch = Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, choiceCount - 1));
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const scale = canvas.width / A4.width;
   const answers = [];
   for (let column = 0; column < columns; column += 1) {
-    // The PDF places each bubble 33 pt from the column's left edge.
+    // Sample the bubble interior, clear of its outline and faint guide letter.
     // Keep sampling centered on the printed bubble so its outline does not
     // leak into the interior sample and look like a faint student mark.
-    const x = 27 + column * columnWidth + 33;
+    const x = 27 + column * columnWidth + (currentLayout ? 30 : 33);
     for (let row = 0; row < rowsPerColumn; row += 1) {
       const question = column * rowsPerColumn + row + 1;
       if (question > questionCount) break;
@@ -1075,7 +1360,8 @@ function readAnswers(canvas, design, layoutVersion) {
       for (let choice = 0; choice < choiceCount; choice += 1) {
         bubbles.push(sampleBubble(image, canvas.width, canvas.height,
           (x + choice * answerPitch) * scale, (A4.height - y) * scale,
-          Math.min(5, Math.max(3.6, rowPitch * 0.28)) * scale, String.fromCharCode(65 + choice)));
+          (currentLayout ? 5.2 : Math.min(5, Math.max(3.6, rowPitch * 0.28))) * scale,
+          String.fromCharCode(65 + choice)));
       }
       answers.push(resolveQuestion(question, bubbles));
     }
@@ -1084,13 +1370,13 @@ function readAnswers(canvas, design, layoutVersion) {
 }
 
 function readStudentId(canvas, layoutVersion) {
-  if (layoutVersion !== 2) return { studentId: "", raw: "", uncertainColumns: [] };
+  if (![2, 3, 4].includes(layoutVersion)) return { studentId: "", raw: "", uncertainColumns: [] };
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const scale = canvas.width / A4.width;
   const firstBubbleX = 27 + 2 + 34;
   const firstRowY = A4.height - (A4.height - 145 - 13);
-  const rowPitch = 9.1;
+  const rowPitch = [3, 4].includes(layoutVersion) ? 14.5 : 9.1;
   let digits = "";
   const uncertainColumns = [];
   for (let column = 0; column < 9; column += 1) {
@@ -1101,7 +1387,7 @@ function readStudentId(canvas, layoutVersion) {
         image, canvas.width, canvas.height,
         (firstBubbleX + column * 20.5) * scale,
         (firstRowY + digit * rowPitch) * scale,
-        3.9 * scale, String(digit),
+        ([3, 4].includes(layoutVersion) ? 5 : 3.9) * scale, String(digit),
       );
       if (bubble.mark === "shaded") marked.push(digit);
       if (bubble.mark === "uncertain") uncertain = true;
@@ -1180,7 +1466,7 @@ function resolveStudentId(bubbleId, identity) {
 }
 
 async function readWrittenIdentity(canvas, layoutVersion) {
-  if (layoutVersion !== 2) return { printedName: "", writtenStudentId: "", digitOCR: "" };
+  if (![2, 3, 4].includes(layoutVersion)) return { printedName: "", writtenStudentId: "", digitOCR: "" };
   const worker = await getOcrWorker();
   const scale = canvas.width / A4.width;
   const firstBubbleX = 27 + 2 + 34;
@@ -1270,9 +1556,10 @@ function cropForOcr(source, x, y, width, height, upscale, threshold = null) {
   const image = context.getImageData(0, 0, crop.width, crop.height);
   for (let index = 0; index < image.data.length; index += 4) {
     const gray = Math.round(image.data[index] * 0.299 + image.data[index + 1] * 0.587 + image.data[index + 2] * 0.114);
-    // Expand the useful handwriting range while preserving grayscale edges for
-    // Tesseract. The optional binary pass is generated separately below.
-    const enhanced = Math.max(0, Math.min(255, Math.round((gray - 75) * 255 / 180)));
+    // Mixed-raster scanner PDFs can reach this point with handwriting around
+    // 235â€“250 gray because PDF.js lost their masked foreground layer. Expand
+    // darkness from the paper white point while retaining grayscale edges.
+    const enhanced = gray >= 254 ? 255 : Math.max(0, 255 - (254 - gray) * 8);
     const value = threshold === null ? enhanced : enhanced < threshold ? 0 : 255;
     image.data[index] = value;
     image.data[index + 1] = value;
@@ -1550,8 +1837,12 @@ function sampleBubble(image, width, height, centerX, centerY, radius, label) {
   const diagonalB = diagonalCoverage(image, width, height, cx, cy, r, -1);
   const crossScore = Math.min(diagonalA, diagonalB);
   const interiorContrast = background - interiorGray / Math.max(1, interiorPixels);
-  const crossed = crossScore >= 0.55;
   const shaded = fillRatio >= 0.28 || (lightAdjustedFill >= 0.34 && interiorContrast >= 35);
+  // A dense fill is dark along both diagonals too. Only classify an X when
+  // diagonal strokes are present without the heavily filled centre of a
+  // deliberately shaded bubble.
+  const denseFill = fillRatio >= 0.5 || lightAdjustedFill >= 0.58;
+  const crossed = crossScore >= 0.55 && !denseFill;
   let mark = "blank";
   let confidence = 0.9;
   if (crossed) {
@@ -1858,17 +2149,19 @@ function openScanPreview(sheet) {
   scanPreviewTitle.textContent = `${studentNameFor(sheet)} · ${sheet.formTitle}`;
   scanPreviewMeta.textContent = `${sheet.sourceFile} · page ${sheet.pageNo} · ${identitySummary(sheet)}`;
   originalScanToggle.hidden = false;
-  originalScanToggle.disabled = !(sheet.originalPage instanceof Blob);
+  originalScanToggle.disabled = true;
   originalScanToggle.textContent = sheet.originalPage instanceof Blob
-    ? "View original scan"
+    ? "Preparing enhanced scan..."
     : "Original scan unavailable · rescan required";
   originalScanToggle.title = sheet.originalPage instanceof Blob
-    ? "Show the locally saved rendering of the uploaded PDF page."
+    ? "Show a contrast-restored rendering of the uploaded PDF page."
     : "This scan was saved before original-page previews were added. Scan the PDF again to save its page image.";
   if (sheet.originalPage instanceof Blob) {
-    originalScanObjectUrl = URL.createObjectURL(sheet.originalPage);
-    originalScanImage.src = originalScanObjectUrl;
-    originalScanImage.alt = `Original scanned page from ${sheet.sourceFile}, page ${sheet.pageNo}`;
+    prepareReadableScanPreview(sheet).catch((error) => {
+      console.warn("Could not restore stored scan contrast", error);
+      if (previewedSheetId !== sheet.id) return;
+      showOriginalScanBlob(sheet, sheet.originalPage);
+    });
   }
   scanPreviewContent.replaceChildren();
   const answerKey = getGradeKeyForScan(sheet);
@@ -1917,12 +2210,44 @@ function openScanPreview(sheet) {
   if (!scanPreviewDialog.open) scanPreviewDialog.showModal();
 }
 
+function showOriginalScanBlob(sheet, blob) {
+  if (previewedSheetId !== sheet.id) return;
+  releaseOriginalScanUrl();
+  originalScanObjectUrl = URL.createObjectURL(blob);
+  originalScanImage.src = originalScanObjectUrl;
+  originalScanImage.alt = `Enhanced scanned page from ${sheet.sourceFile}, page ${sheet.pageNo}`;
+  originalScanToggle.disabled = false;
+  originalScanToggle.textContent = "View enhanced scan";
+}
+
+async function prepareReadableScanPreview(sheet) {
+  if (sheet.previewContrastVersion === PREVIEW_CONTRAST_VERSION) {
+    showOriginalScanBlob(sheet, sheet.originalPage);
+    return;
+  }
+  const bitmap = await createImageBitmap(sheet.originalPage);
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  canvas.getContext("2d", { willReadFrequently: true }).drawImage(bitmap, 0, 0);
+  bitmap.close();
+  try {
+    sheet.originalPage = await createLocalPagePreview(canvas, true);
+    sheet.previewContrastVersion = PREVIEW_CONTRAST_VERSION;
+    await persistScanState();
+    showOriginalScanBlob(sheet, sheet.originalPage);
+  } finally {
+    canvas.width = 0;
+    canvas.height = 0;
+  }
+}
+
 function resetOriginalScanPreview() {
   releaseOriginalScanUrl();
   originalScanToggle.hidden = true;
   originalScanToggle.disabled = false;
   originalScanPanel.hidden = true;
-  originalScanToggle.textContent = "View original scan";
+  originalScanToggle.textContent = "View enhanced scan";
   originalScanImage.removeAttribute("src");
 }
 
@@ -2042,14 +2367,26 @@ async function refreshSavedBubbleIds() {
       if (!marks) continue;
       for (let rotation = 0; rotation < 4; rotation += 1) {
         const points = marks.map((_, index) => marks[(index + rotation) % marks.length]);
-        const candidate = rectifyPage(sourceCanvas, points);
+        let candidate = rectifyPage(sourceCanvas, points);
         if (!candidate) continue;
         const qr = decodeFormQr(candidate);
-        const form = qr ? identifyForm(qr.data) : null;
-        if (!form?.ok || form.design.form_id !== sheet.formId || form.layoutVersion !== 2) {
+        let form = qr ? identifyScannedForm(qr) : null;
+        if ((!form || !form.ok) && rotation === 0) {
+          const design = formsById.get(sheet.formId);
+          if (design) {
+            form = { ok: true, design, layoutVersion: sheet.layoutVersion || 3 };
+          }
+        }
+        if (!form?.ok || form.design.form_id !== sheet.formId || ![2, 3, 4].includes(form.layoutVersion)) {
           candidate.width = 0;
           candidate.height = 0;
           continue;
+        }
+        if (form.layoutVersion === 4) {
+          candidate.width = 0;
+          candidate.height = 0;
+          candidate = rectifyPage(sourceCanvas, points, CURRENT_MARK_MARGIN);
+          if (!candidate) continue;
         }
         const bubbleId = readStudentId(candidate, form.layoutVersion);
         const answers = sheet.answerReaderVersion === ANSWER_READER_VERSION

@@ -1,6 +1,4 @@
 """Print Scan Grade: a small LTI 1.3 launch app."""
-import hashlib
-import hmac
 import json
 import os
 import random
@@ -11,6 +9,7 @@ import time
 import uuid
 import zipfile
 from datetime import datetime, timezone
+from functools import wraps
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlparse
@@ -38,7 +37,7 @@ DATABASE = DATA_DIR / "print-scan-grade.sqlite3"
 KEY_FILE = DATA_DIR / "tool-private.pem"
 LTI = "https://purl.imsglobal.org/spec/lti/claim/"
 LTI_DEEP_LINKING = "https://purl.imsglobal.org/spec/lti-dl/claim/"
-SHEET_LAYOUT_VERSION = 2
+SHEET_LAYOUT_VERSION = 4
 LEGACY_SHEET_LAYOUT_VERSION = 1
 NRPS_SCOPE = "https://purl.imsglobal.org/spec/lti-nrps/scope/contextmembership.readonly"
 NRPS_CLAIM = "https://purl.imsglobal.org/spec/lti-nrps/claim/namesroleservice"
@@ -48,6 +47,33 @@ SAMPLE_FONTS = (
     ("SamplePatrickHand", "PatrickHand-Regular.ttf"),
 )
 FONT_DIR = Path(__file__).resolve().parent / "fonts"
+MIN_PRINT_FONT_SIZE = 12
+MAX_QUESTIONS = 60
+QUESTIONS_PER_COLUMN = 15
+FORM_BUBBLE_RADIUS = 6.8
+REGISTRATION_MARK_EDGE = 16
+REGISTRATION_MARK_SIZE = 10
+
+
+class MinimumFontCanvas(canvas.Canvas):
+    """Canvas that enforces the minimum size on the answer-sheet page only."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._enforce_minimum_font = True
+
+    def setFont(self, fontName, fontSize, leading=None):
+        if self._enforce_minimum_font:
+            fontSize = max(MIN_PRINT_FONT_SIZE, fontSize)
+        return super().setFont(fontName, fontSize, leading)
+
+    def setFontExact(self, fontName, fontSize, leading=None):
+        """Set an intentional exception font without changing page enforcement."""
+        return canvas.Canvas.setFont(self, fontName, fontSize, leading)
+
+    def showPage(self):
+        super().showPage()
+        self._enforce_minimum_font = False
 
 
 def base_url():
@@ -64,6 +90,19 @@ def connect():
             created_at INTEGER NOT NULL,
             PRIMARY KEY (issuer, client_id, deployment_id)
         );
+        CREATE TABLE IF NOT EXISTS lti_clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            issuer TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            authorization_endpoint TEXT NOT NULL,
+            jwks_url TEXT NOT NULL,
+            token_endpoint TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE (issuer, client_id)
+        );
         CREATE TABLE IF NOT EXISTS exam_designs (
             form_id TEXT PRIMARY KEY,
             issuer TEXT NOT NULL,
@@ -72,7 +111,7 @@ def connect():
             course_title TEXT NOT NULL,
             created_by TEXT NOT NULL,
             title TEXT NOT NULL,
-            question_count INTEGER NOT NULL CHECK(question_count BETWEEN 1 AND 80),
+            question_count INTEGER NOT NULL CHECK(question_count BETWEEN 1 AND 60),
             choice_count INTEGER NOT NULL CHECK(choice_count BETWEEN 2 AND 8),
             created_at INTEGER NOT NULL
         );
@@ -91,10 +130,52 @@ def connect():
 
 
 def platforms():
-    raw = json.loads(os.getenv("LTI_PLATFORM_REGISTRATIONS", "[]"))
-    if not isinstance(raw, list):
-        raise ValueError("LTI_PLATFORM_REGISTRATIONS must be a JSON array")
-    return {item["issuer"].rstrip("/"): item for item in raw}
+    with connect() as db:
+        rows = db.execute(
+            "SELECT issuer, client_id, authorization_endpoint, jwks_url, token_endpoint "
+            "FROM lti_clients WHERE enabled=1 ORDER BY id"
+        ).fetchall()
+    result = {}
+    configured_issuer = os.getenv("LTI_PLATFORM_ISSUER", "").strip().rstrip("/")
+    if configured_issuer:
+        result[configured_issuer] = {
+            "issuer": configured_issuer,
+            "authorization_endpoint": os.getenv("LTI_PLATFORM_AUTHORIZATION_ENDPOINT", "").strip(),
+            "jwks_url": os.getenv("LTI_PLATFORM_JWKS_URL", "").strip(),
+            "token_endpoint": os.getenv("LTI_PLATFORM_TOKEN_ENDPOINT", "").strip(),
+            "deployment_ids": [], "client_ids": [],
+        }
+    for row in rows:
+        platform = result.setdefault(row["issuer"].rstrip("/"), {
+            "issuer": row["issuer"].rstrip("/"),
+            "authorization_endpoint": row["authorization_endpoint"],
+            "jwks_url": row["jwks_url"],
+            "token_endpoint": row["token_endpoint"],
+            "deployment_ids": [],
+        })
+        if row["client_id"] not in platform.get("client_ids", []):
+            platform.setdefault("client_ids", []).append(row["client_id"])
+    with connect() as db:
+        for row in db.execute("SELECT issuer, client_id, deployment_id FROM deployments"):
+            platform = result.get(row["issuer"])
+            if platform and row["deployment_id"] not in platform["deployment_ids"]:
+                platform["deployment_ids"].append(row["deployment_id"])
+    return result
+
+
+def platform_client(issuer, client_id=None):
+    with connect() as db:
+        if client_id:
+            row = db.execute(
+                "SELECT * FROM lti_clients WHERE issuer=? AND client_id=? AND enabled=1",
+                (issuer, client_id),
+            ).fetchone()
+        else:
+            row = db.execute(
+                "SELECT * FROM lti_clients WHERE issuer=? AND enabled=1 ORDER BY id LIMIT 1",
+                (issuer,),
+            ).fetchone()
+    return dict(row) if row else None
 
 
 def private_key():
@@ -118,8 +199,11 @@ def public_jwk():
 def known_client(db, issuer, client_id):
     row = db.execute("SELECT 1 FROM deployments WHERE issuer=? AND client_id=? LIMIT 1",
                      (issuer, client_id)).fetchone()
-    platform = platforms().get(issuer)
-    return bool(platform and (row or (platform.get("client_id") == client_id and platform.get("deployment_ids"))))
+    client = db.execute(
+        "SELECT 1 FROM lti_clients WHERE issuer=? AND client_id=? AND enabled=1",
+        (issuer, client_id),
+    ).fetchone()
+    return bool(platforms().get(issuer) and (row or client))
 
 
 def is_course_staff(roles):
@@ -258,10 +342,25 @@ def fetch_active_learners(context):
         raise ValueError("MiniVLE's course roster could not be read. Check the NRPS tool scope and try again.") from error
 
 
-def draw_registration_marks(pdf, width, height):
+def draw_registration_marks(pdf, width, height, layout_version=SHEET_LAYOUT_VERSION):
+    if layout_version < 4:
+        pdf.setFillColorRGB(0, 0, 0)
+        for x, y in ((12, 12), (width - 20, 12), (12, height - 20), (width - 20, height - 20)):
+            pdf.rect(x, y, 8, 8, fill=1, stroke=0)
+        return
+    # Keep the marks inside the printable area. The previous 8pt squares began
+    # only 12pt from the paper edge, so ordinary printers clipped the lower
+    # pair into visibly different shapes.
+    edge = REGISTRATION_MARK_EDGE
+    size = REGISTRATION_MARK_SIZE
     pdf.setFillColorRGB(0, 0, 0)
-    for x, y in ((12, 12), (width - 20, 12), (12, height - 20), (width - 20, height - 20)):
-        pdf.rect(x, y, 8, 8, fill=1, stroke=0)
+    for x, y in (
+        (edge, edge),
+        (width - edge - size, edge),
+        (edge, height - edge - size),
+        (width - edge - size, height - edge - size),
+    ):
+        pdf.rect(x, y, size, size, fill=1, stroke=0)
 
 
 def draw_qr(pdf, value, x, y, size):
@@ -296,6 +395,9 @@ def wrapped_lines(text, font_name, font_size, max_width):
 
 def guide_text(pdf, text, x, top_y, max_width, font_name="Helvetica", font_size=8,
                leading=10, color=(0.15, 0.17, 0.2), max_lines=None):
+    # Guide body copy is intentionally larger and more open than diagram labels.
+    font_size = max(12, font_size)
+    leading = max(14, leading)
     pdf.setFillColorRGB(*color)
     pdf.setFont(font_name, font_size)
     lines = wrapped_lines(text, font_name, font_size, max_width)
@@ -353,15 +455,16 @@ def draw_guide_page(pdf, design, logo=None):
     pdf.setFont("Helvetica", 5)
     pdf.drawCentredString(guide_qr_x + guide_qr_size / 2, guide_qr_y - 7, "INSTRUCTIONS ONLY")
 
-    card_width, card_height, gap = 249, 210, 16
+    card_width, gap = 249, 16
+    top_card_height, lower_card_height = 260, 220
     left_x, right_x = left, left + card_width + gap
-    top_y, lower_y = 480, 254
+    top_y, lower_y = 430, 190
 
     # 1. Name must stay inside its field.
-    guide_card(pdf, left_x, top_y, card_width, card_height, 1, "Print your name inside the box")
-    guide_text(pdf, "Print your full name in clear, separate letters. Do not join the letters.", left_x + 13, top_y + 164,
+    guide_card(pdf, left_x, top_y, card_width, top_card_height, 1, "Print your name inside the box")
+    guide_text(pdf, "Print your full name in clear, separate letters. Do not join the letters.", left_x + 13, top_y + 214,
                card_width - 26, font_size=7.8, leading=10)
-    sample_y = top_y + 95
+    sample_y = top_y + 145
     sample_width, sample_height = 96, 29
     safe_x, outside_x = left_x + 13, left_x + 139
     for box_x in (safe_x, outside_x):
@@ -382,50 +485,50 @@ def draw_guide_page(pdf, design, logo=None):
     pdf.setFillColorRGB(0.68, 0.16, 0.13)
     pdf.drawCentredString(outside_x + sample_width / 2, sample_y - 13, "CROSSES BORDER")
     guide_text(pdf, "If any part of your name sits outside the box, your script may not be marked.",
-               left_x + 13, top_y + 55, card_width - 26, font_name="Helvetica-Bold",
+               left_x + 13, top_y + 105, card_width - 26, font_name="Helvetica-Bold",
                font_size=7.7, leading=10, color=(0.58, 0.13, 0.12), max_lines=3)
 
     # 2. The written ID and bubble ID must agree digit for digit.
-    guide_card(pdf, right_x, top_y, card_width, card_height, 2, "Make both ID entries match")
+    guide_card(pdf, right_x, top_y, card_width, top_card_height, 2, "Make both ID entries match")
     guide_text(pdf, "Write one digit in each box. In that same column, shade the row with that digit.", right_x + 13,
-               top_y + 164, card_width - 26, font_size=7.6, leading=9)
+               top_y + 200, card_width - 26, font_size=7.6, leading=9)
     example_id = "207418365"
-    grid_x, column_pitch = right_x + 42, 21.5
-    box_width = 19.5
+    grid_x, column_pitch = right_x + 42, 22.5
+    box_width = 21
     pdf.setFillColorRGB(0.25, 0.28, 0.3)
     pdf.setFont("Helvetica-Bold", 6)
-    pdf.drawString(right_x + 13, top_y + 144, "ID BOXES")
+    pdf.drawString(right_x + 13, top_y + 176, "ID BOXES")
     for index, digit in enumerate(example_id):
         bx = grid_x + index * column_pitch - box_width / 2
         pdf.setStrokeColorRGB(0.38, 0.41, 0.43)
         pdf.setLineWidth(0.65)
-        pdf.rect(bx, top_y + 120, box_width, 20, fill=0, stroke=1)
+        pdf.rect(bx, top_y + 150, box_width, 25, fill=0, stroke=1)
         pdf.setFillColorRGB(0.1, 0.12, 0.14)
-        pdf.setFont("Helvetica-Bold", 9)
-        pdf.drawCentredString(bx + box_width / 2, top_y + 126, digit)
+        pdf.setFont("Helvetica-Bold", 10)
+        pdf.drawCentredString(bx + box_width / 2, top_y + 157, digit)
 
-    grid_top, row_pitch = top_y + 101, 5.2
+    grid_top, row_pitch = top_y + 138, 7
     pdf.setFillColorRGB(0.25, 0.28, 0.3)
-    pdf.setFont("Helvetica-Bold", 5.3)
+    pdf.setFont("Helvetica-Bold", 8)
     pdf.drawString(right_x + 13, grid_top, "SHADE THE ROW THAT MATCHES EACH BOX")
-    pdf.setFont("Helvetica", 5.5)
+    pdf.setFont("Helvetica", 8)
     pdf.setStrokeColorRGB(0.35, 0.38, 0.4)
     for digit in range(10):
         cy = grid_top - 8 - digit * row_pitch
         pdf.setFillColorRGB(0.2, 0.22, 0.24)
-        pdf.drawRightString(grid_x - 7, cy - 1.8, str(digit))
+        pdf.drawRightString(grid_x - 7, cy - 2.5, str(digit))
         for column, student_digit in enumerate(example_id):
             cx = grid_x + column * column_pitch
             pdf.setFillColorRGB(0, 0, 0)
-            pdf.circle(cx, cy, 2.05, fill=0, stroke=1)
+            pdf.circle(cx, cy, 3.2, fill=0, stroke=1)
             if int(student_digit) == digit:
-                pdf.circle(cx, cy, 1.35, fill=1, stroke=0)
+                pdf.circle(cx, cy, 2.1, fill=1, stroke=0)
     guide_text(pdf, "The bubbles must match every digit in the boxes. A mismatch may mean your work is not marked.",
-               right_x + 13, top_y + 29, card_width - 26, font_name="Helvetica-Bold",
+               right_x + 13, top_y + 40, card_width - 26, font_name="Helvetica-Bold",
                font_size=7.2, leading=9, color=(0.58, 0.13, 0.12), max_lines=3)
 
     # 3. One active answer per question; show the correction method.
-    guide_card(pdf, left_x, lower_y, card_width, card_height, 3, "Choose one answer per question")
+    guide_card(pdf, left_x, lower_y, card_width, lower_card_height, 3, "Choose one answer per question")
     guide_text(pdf, "More than one active bubble makes that question incorrect.", left_x + 13,
                lower_y + 164, card_width - 26, font_size=7.8, leading=10)
     labels_x = left_x + 87
@@ -461,7 +564,7 @@ def draw_guide_page(pdf, design, logo=None):
                left_x + 13, lower_y + 42, card_width - 26, font_size=7.5, leading=9, max_lines=3)
 
     # 4. Faint marks can disappear in scanning or photocopying.
-    guide_card(pdf, right_x, lower_y, card_width, card_height, 4, "Shade firmly and darkly")
+    guide_card(pdf, right_x, lower_y, card_width, lower_card_height, 4, "Shade firmly and darkly")
     guide_text(pdf, "A faintly shaded bubble may be read as blank and marked incorrect.", right_x + 13,
                lower_y + 164, card_width - 26, font_size=7.8, leading=10)
     faint_x, dark_x, example_y = right_x + 76, right_x + 174, lower_y + 111
@@ -479,7 +582,7 @@ def draw_guide_page(pdf, design, logo=None):
     guide_text(pdf, "Fill the bubble inside its border using a dark pencil or pen. Do not make a light mark.",
                right_x + 13, lower_y + 56, card_width - 26, font_size=7.6, leading=10, max_lines=3)
 
-    checklist_y, checklist_height = 126, 116
+    checklist_y, checklist_height = 40, 130
     pdf.setFillColorRGB(0.92, 0.95, 0.96)
     pdf.setStrokeColorRGB(0.72, 0.79, 0.81)
     pdf.roundRect(left, checklist_y, right - left, checklist_height, 11, fill=1, stroke=1)
@@ -492,12 +595,12 @@ def draw_guide_page(pdf, design, logo=None):
         "Choose one answer per question",
         "Shade bubbles firmly",
     )
-    checklist_x, checklist_y_text = left + 18, checklist_y + checklist_height - 46
-    pdf.setFont("Helvetica-Bold", 8)
+    checklist_x, checklist_y_text = left + 18, checklist_y + checklist_height - 52
+    pdf.setFont("Helvetica-Bold", 12)
     pdf.setFillColorRGB(0.12, 0.18, 0.21)
     pdf.setStrokeColorRGB(0.12, 0.18, 0.21)
     for index, item in enumerate(checklist_items):
-        item_y = checklist_y_text - index * 12
+        item_y = checklist_y_text - index * 15
         pdf.circle(checklist_x + 2, item_y + 2.5, 1.5, fill=1, stroke=0)
         pdf.drawString(checklist_x + 10, item_y, item)
     guide_text(pdf, "This page is a guide only. Submit the answer sheet on page 1.",
@@ -507,15 +610,25 @@ def draw_guide_page(pdf, design, logo=None):
     pdf.setFont("Helvetica", 7)
     pdf.drawCentredString(width / 2, 27, "printscangrade.com  |  student instructions")
 
+    # Fade instructional artwork for printing, but keep the guide QR readable.
+    pdf.saveState()
+    pdf.setFillAlpha(0.22)
+    pdf.setFillColorRGB(1, 1, 1)
+    pdf.rect(30, 35, width - 60, 665, fill=1, stroke=0)
+    pdf.restoreState()
 
-def make_answer_sheet(design, logo=None, sample_response=None, include_guide=True):
+
+def make_answer_sheet(design, logo=None, sample_response=None, include_guide=True,
+                      layout_version=SHEET_LAYOUT_VERSION):
+    if not 1 <= int(design["question_count"]) <= MAX_QUESTIONS:
+        raise ValueError(f"Answer sheets support 1–{MAX_QUESTIONS} questions.")
     buffer = BytesIO()
     width, height = A4
-    pdf = canvas.Canvas(buffer, pagesize=(width, height), pageCompression=1)
+    pdf = MinimumFontCanvas(buffer, pagesize=(width, height), pageCompression=1)
     title_text = pdf_text(design["title"])
     pdf.setTitle(f"{title_text} - Print Scan Grade answer sheet" + (" - sample response" if sample_response else ""))
     pdf.setAuthor("Print Scan Grade")
-    draw_registration_marks(pdf, width, height)
+    draw_registration_marks(pdf, width, height, layout_version)
 
     left, right = 27, width - 27
     pdf.setFillColorRGB(0, 0, 0)
@@ -545,27 +658,25 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
             image_width, image_height = image.getSize()
             scale = min(110 / image_width, 42 / image_height)
             shown_width, shown_height = image_width * scale, image_height * scale
-            pdf.drawImage(image, right - shown_width, height - 28 - shown_height,
+            title_y = height - 51
+            logo_y = title_y + title_size / 2 - shown_height / 2 - 50
+            pdf.drawImage(image, right - shown_width, logo_y,
                           width=shown_width, height=shown_height, preserveAspectRatio=True,
                           mask="auto")
         except (ValueError, OSError):
             pass
 
     qr_size = 48
-    qr_x, qr_y = right - qr_size, height - 123
     if sample_response:
         qr_payload = (
             f"PSGSAMPLE|{design['form_id']}|{design['question_count']}|"
-            f"{design['choice_count']}|{SHEET_LAYOUT_VERSION}|{sample_response['seed']}"
+            f"{design['choice_count']}|{layout_version}|{sample_response['seed']}"
         )
     else:
         qr_payload = (
             f"PSG1|{design['form_id']}|{design['question_count']}|"
-            f"{design['choice_count']}|{SHEET_LAYOUT_VERSION}"
+            f"{design['choice_count']}|{layout_version}"
         )
-    draw_qr(pdf, qr_payload, qr_x, qr_y, qr_size)
-    pdf.setFont("Helvetica", 5.5)
-    pdf.drawCentredString(qr_x + qr_size / 2, qr_y - 7, f"FORM {design['form_id'][:12]}")
 
     # ID boxes sit directly above their bubble columns; row labels are digits 0–9.
     grid_x = left + 2
@@ -586,7 +697,9 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
             pdf.setFont(sample_response["font"], 15)
             pdf.drawCentredString(center_x, box_y + 8, sample_response["student_id"][index])
             pdf.setFillColorRGB(0, 0, 0)
-    first_row_y, row_pitch = box_y - 13, 9.1
+    # Match the answer bubbles and give the ten digit rows enough vertical room
+    # that their outlines and 12pt guide letters never touch.
+    first_row_y, row_pitch = box_y - 13, 14.5
     pdf.setFillColorRGB(0, 0, 0)
     pdf.setFont("Helvetica", 6)
     for digit in range(10):
@@ -597,7 +710,7 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
             pdf.circle(
                 first_bubble_x + column * col_pitch,
                 y,
-                3.9,
+                FORM_BUBBLE_RADIUS,
                 fill=1 if selected_digit else 0,
                 stroke=1,
             )
@@ -611,43 +724,44 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
         sample_font = sample_response["font"]
         draw_sample_handwriting(pdf, sample_response["name"], name_x + 9, name_y + 11,
                                 name_w - 18, sample_font)
-
-    instruction_x, instruction_y = left, 574
-    pdf.setFont("Helvetica", 8.5)
-    instructions = [
-        "1. Write one ID digit in each box. Shade that digit's row in the same column.",
-        "2. Shade one answer per question over its faint letter using a pencil or dark pen.",
-        "3. To change an answer, draw a clear X through the old bubble, then shade the new one.",
-    ]
-    for index, line in enumerate(instructions):
-        pdf.drawString(instruction_x, instruction_y - 3 - index * 11, line)
+    # Center the form QR and its identifier beneath the student-name box.
+    qr_x = name_x + name_w - qr_size
+    qr_y = name_y - qr_size - 18
+    draw_qr(pdf, qr_payload, qr_x, qr_y, qr_size)
+    pdf.setFillColorRGB(0.28, 0.3, 0.32)
+    pdf.setFontExact("Helvetica", 10)
+    pdf.drawRightString(name_x + name_w, qr_y - 16, f"FORM {design['form_id'][:12]}")
 
     # Balanced columns make the answer area span the available portrait page height.
-    columns = min(4, max(1, (design["question_count"] + 19) // 20))
-    rows_per_column = (design["question_count"] + columns - 1) // columns
-    question_top, question_bottom = instruction_y - 67, 38
+    columns = min(4, max(1, (design["question_count"] + QUESTIONS_PER_COLUMN - 1) // QUESTIONS_PER_COLUMN))
+    rows_per_column = QUESTIONS_PER_COLUMN
+    question_top, question_bottom = 510, 38
+    pdf.setStrokeColorRGB(0.65, 0.68, 0.7)
+    pdf.setLineWidth(0.7)
+    pdf.line(left, question_top, right, question_top)
+    question_grid_top = question_top - 50
     column_width = (right - left) / columns
-    row_pitch = min(28.5, max(12, (question_top - question_bottom) / max(1, rows_per_column)))
-    bubble_radius = min(5, max(3.6, row_pitch * 0.28))
-    row_offset = (question_top - question_bottom - (rows_per_column - 1) * row_pitch) / 2
+    row_pitch = min(31, max(12, (question_grid_top - question_bottom) / max(1, rows_per_column - 1)))
+    bubble_radius = FORM_BUBBLE_RADIUS
+    row_offset = (question_grid_top - question_bottom - (rows_per_column - 1) * row_pitch) / 2
     for column in range(columns):
         x = left + column * column_width
         pdf.setFillColorRGB(0, 0, 0)
         pdf.setFont("Helvetica-Bold", 6)
-        answer_start = x + 33
-        answer_pitch = min(20.5, (column_width - 37) / max(1, design["choice_count"] - 1))
+        answer_start = x + 30
+        answer_pitch = min(20.5, (column_width - 34) / max(1, design["choice_count"] - 1))
         for choice in range(design["choice_count"]):
-            pdf.drawCentredString(answer_start + choice * answer_pitch, question_top + 2,
+            pdf.drawCentredString(answer_start + choice * answer_pitch, question_top - 16,
                                   chr(ord("A") + choice))
 
         for row in range(rows_per_column):
             question_number = column * rows_per_column + row + 1
             if question_number > design["question_count"]:
                 break
-            y = question_top - row_offset - row * row_pitch
+            y = question_grid_top - row_offset - row * row_pitch
             pdf.setFillColorRGB(0, 0, 0)
             pdf.setFont("Helvetica-Bold", 7)
-            pdf.drawRightString(x + 24, y - 2.2, f"{question_number}.")
+            pdf.drawRightString(x + 18, y - 3.5, f"{question_number}.")
             pdf.setLineWidth(0.75)
             pdf.setStrokeColorRGB(0, 0, 0)
             for choice in range(design["choice_count"]):
@@ -663,13 +777,13 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
                 pdf.circle(bubble_x, y, bubble_radius, fill=0, stroke=1)
                 pdf.setFillColorRGB(0.74, 0.74, 0.74)
                 pdf.setFont("Helvetica-Bold", 5)
-                pdf.drawCentredString(bubble_x, y - 1.7, chr(ord("A") + choice))
+                pdf.drawCentredString(bubble_x, y - 3.5, chr(ord("A") + choice))
                 if selected:
                     # Sample marks cover the printed guide just as a student's mark should.
                     pdf.setFillColorRGB(0, 0, 0)
                     pdf.circle(bubble_x, y, bubble_radius * 0.76, fill=1, stroke=0)
 
-    pdf.setFont("Helvetica", 7)
+    pdf.setFontExact("Helvetica", 10)
     pdf.setFillColorRGB(0.28, 0.28, 0.28)
     pdf.drawCentredString(width / 2, 16, "printscangrade.com")
     pdf.showPage()
@@ -705,7 +819,8 @@ def draw_sample_handwriting(pdf, text, x, y, max_width, font_name):
     pdf.restoreState()
 
 
-def make_sample_response_pdf(design, learner, logo=None, sample_index=0, seed=None, answers=None):
+def make_sample_response_pdf(design, learner, logo=None, sample_index=0, seed=None, answers=None,
+                             layout_version=SHEET_LAYOUT_VERSION):
     student = {
         "name": learner["name"],
         "student_id": learner["student_id"],
@@ -717,7 +832,8 @@ def make_sample_response_pdf(design, learner, logo=None, sample_index=0, seed=No
     if answers is not None:
         student["answers"] = answers
     return make_answer_sheet(
-        design, logo, sample_response=student, include_guide=False
+        design, logo, sample_response=student, include_guide=False,
+        layout_version=layout_version,
     )
 
 
@@ -738,6 +854,76 @@ def create_app():
     @app.get("/")
     def home():
         return render_template("landing.html", course=None, launched=False)
+
+    def admin_required(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            if not session.get("lti_admin_authenticated"):
+                return redirect(url_for("admin_login", next=request.path))
+            return view(*args, **kwargs)
+        return wrapped
+
+    @app.route("/admin/login", methods=["GET", "POST"])
+    def admin_login():
+        if request.method == "POST":
+            username = os.getenv("ADMIN_USERNAME", "").strip()
+            password = os.getenv("ADMIN_PASSWORD", "")
+            if (secrets.compare_digest(request.form.get("username", ""), username) and
+                    secrets.compare_digest(request.form.get("password", ""), password) and username and password):
+                session["lti_admin_authenticated"] = True
+                target = request.args.get("next") or request.form.get("next") or url_for("lti_admin")
+                return redirect(target if target.startswith("/") else url_for("lti_admin"))
+            return render_template("admin_login.html", error="Incorrect username or password.", next=request.form.get("next", "")), 401
+        return render_template("admin_login.html", error="", next=request.args.get("next", ""))
+
+    @app.post("/admin/logout")
+    @admin_required
+    def admin_logout():
+        session.pop("lti_admin_authenticated", None)
+        return redirect(url_for("home"))
+
+    @app.route("/admin/lti", methods=["GET", "POST"])
+    @admin_required
+    def lti_admin():
+        if request.method == "POST":
+            client_id = request.form.get("client_id", "").strip()
+            issuer = request.form.get("issuer", "").strip().rstrip("/")
+            name = request.form.get("name", "").strip() or f"{issuer} / {client_id}"
+            values = (
+                name, issuer, client_id,
+                request.form.get("authorization_endpoint", "").strip(),
+                request.form.get("jwks_url", "").strip(),
+                request.form.get("token_endpoint", "").strip(),
+            )
+            if not all(values[1:]):
+                abort(400, "Name, issuer, client ID, and all platform endpoints are required.")
+            now = int(time.time())
+            with connect() as db:
+                client_pk = request.form.get("id", "").strip()
+                if client_pk:
+                    db.execute(
+                        "UPDATE lti_clients SET name=?, issuer=?, client_id=?, authorization_endpoint=?, "
+                        "jwks_url=?, token_endpoint=?, enabled=?, updated_at=? WHERE id=?",
+                        (*values, 1 if request.form.get("enabled") == "on" else 0, now, client_pk),
+                    )
+                else:
+                    db.execute(
+                        "INSERT INTO lti_clients "
+                        "(name, issuer, client_id, authorization_endpoint, jwks_url, token_endpoint, created_at, updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (*values, now, now),
+                    )
+            return redirect(url_for("lti_admin"))
+        with connect() as db:
+            clients = [dict(row) for row in db.execute("SELECT * FROM lti_clients ORDER BY issuer, name")]
+        return render_template("lti_admin.html", clients=clients)
+
+    @app.post("/admin/lti/<int:client_pk>/delete")
+    @admin_required
+    def delete_lti_client(client_pk):
+        with connect() as db:
+            db.execute("DELETE FROM lti_clients WHERE id=?", (client_pk,))
+        return redirect(url_for("lti_admin"))
 
     def render_print_workspace(context, form_values=None, errors=None, status=200):
         with connect() as db:
@@ -881,6 +1067,14 @@ def create_app():
             count = int(request.args.get("count", ""))
         except (TypeError, ValueError):
             abort(400, "Choose how many student sheets to generate.")
+        try:
+            scanner_layout_version = int(request.args.get("scanner_layout_version", "3"))
+        except (TypeError, ValueError):
+            scanner_layout_version = 3
+        # Old open tabs do not send a scanner version. Generate the latest
+        # layout they can read instead of handing them a newly introduced QR
+        # version that the already-loaded JavaScript will reject.
+        dummy_layout_version = 4 if scanner_layout_version >= 4 else 3
         with connect() as db:
             design = db.execute(
                 "SELECT * FROM exam_designs WHERE form_id=? AND issuer=? AND context_id=?",
@@ -919,6 +1113,7 @@ def create_app():
             answer_pdf = make_sample_response_pdf(
                 design, answer_sheet, branding["logo"] if branding else None,
                 sample_index=0, seed=answer_seed, answers=correct_answers,
+                layout_version=dummy_layout_version,
             )
             archive.writestr("000-Answer_Sheet.pdf", answer_pdf.getvalue())
 
@@ -939,6 +1134,7 @@ def create_app():
                 pdf_data = make_sample_response_pdf(
                     design, learner, branding["logo"] if branding else None,
                     sample_index=index + 1, seed=answer_seed, answers=student_answers,
+                    layout_version=dummy_layout_version,
                 )
                 archive.writestr(
                     f"{index + 1:03d}-{student_name}.pdf", pdf_data.getvalue()
@@ -1006,10 +1202,10 @@ def create_app():
             errors.append("The answer-sheet name must be 120 characters or fewer.")
         try:
             question_count = int(raw_questions)
-            if not 1 <= question_count <= 80:
+            if not 1 <= question_count <= MAX_QUESTIONS:
                 raise ValueError
         except (TypeError, ValueError):
-            errors.append("Choose between 1 and 80 questions.")
+            errors.append(f"Choose between 1 and {MAX_QUESTIONS} questions.")
             question_count = 20
         try:
             choice_count = int(raw_choices)
@@ -1099,12 +1295,7 @@ def create_app():
 
     @app.post("/api/lti/deployments")
     def deployment_sync():
-        secret = os.getenv("LTI_DEPLOYMENT_SYNC_SECRET", "")
         payload = request.get_data()
-        signature = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
-        if not secret or not hmac.compare_digest(
-                request.headers.get("X-MiniVLE-Deployment-Signature", ""), signature):
-            abort(401, "Invalid deployment registration signature.")
         try:
             data = json.loads(payload)
             issuer = data["issuer"].rstrip("/")
@@ -1116,6 +1307,21 @@ def create_app():
         if issuer not in platforms():
             abort(400, "Unknown platform issuer.")
         with connect() as db:
+            platform = db.execute(
+                "SELECT 1 FROM lti_clients WHERE issuer=? AND client_id=?",
+                (issuer, client_id),
+            ).fetchone()
+            if not platform:
+                configured = platforms()[issuer]
+                now = int(time.time())
+                db.execute(
+                    "INSERT OR IGNORE INTO lti_clients "
+                    "(name, issuer, client_id, authorization_endpoint, jwks_url, token_endpoint, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (f"{issuer} / {client_id}", issuer, client_id,
+                     configured["authorization_endpoint"], configured["jwks_url"],
+                     configured["token_endpoint"], now, now),
+                )
             db.execute("INSERT OR IGNORE INTO deployments VALUES (?,?,?,?)",
                        (issuer, client_id, deployment_id, int(time.time())))
         return jsonify({"status": "registered"}), 201
@@ -1140,7 +1346,8 @@ def create_app():
             "lti_message_hint": request.args.get("lti_message_hint", ""),
             "state": state, "nonce": nonce, "prompt": "none",
         }
-        return redirect(platforms()[issuer]["authorization_endpoint"] + "?" + urlencode(params))
+        platform = platform_client(issuer, client_id) or platforms()[issuer]
+        return redirect(platform["authorization_endpoint"] + "?" + urlencode(params))
 
     @app.post("/lti/launch")
     def lti_launch():
@@ -1162,6 +1369,7 @@ def create_app():
                 client_id = next((a for a in audiences if known_client(db, issuer, a)), None)
                 if not client_id:
                     raise ValueError("Unknown LTI client ID")
+                platform = platform_client(issuer, client_id) or platform
                 with urlopen(Request(platform["jwks_url"], headers={"Accept": "application/json"}), timeout=8) as response:
                     keys = json.load(response)["keys"]
                 jwk = next(k for k in keys if k.get("kid") == header.get("kid"))

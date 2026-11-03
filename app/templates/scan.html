@@ -108,8 +108,8 @@
         </div>
         <dialog id="scan-preview-dialog" class="scan-preview-dialog" aria-labelledby="scan-preview-title">
           <div class="scan-preview-heading"><div><p class="eyebrow">Saved scan results</p><h2 id="scan-preview-title">Scanned answer sheet</h2><p id="scan-preview-meta" class="muted"></p></div><div class="scan-preview-actions"><button id="scan-preview-close" class="download-button" type="button">Close</button></div></div>
-          <button id="original-scan-toggle" class="download-button original-scan-toggle" type="button" hidden>View original scan</button>
-          <section id="original-scan-panel" class="original-scan-panel" hidden><p class="field-help">Original uploaded PDFs are not retained. This page image was saved locally in this browser for comparison.</p><img id="original-scan-image" alt="Original scanned answer sheet page"></section>
+          <button id="original-scan-toggle" class="download-button original-scan-toggle" type="button" hidden>View enhanced scan</button>
+          <section id="original-scan-panel" class="original-scan-panel" hidden><p class="field-help">Uploaded PDFs are not retained. This locally saved page rendering has its contrast restored for comparison.</p><img id="original-scan-image" alt="Contrast-restored scanned answer sheet page"></section>
           <div id="scan-preview-content" class="scan-preview-content"></div>
         </dialog>
       </section>
@@ -118,6 +118,6 @@
     <footer>printscangrade.com</footer>
   </main>
 
-  <script type="module" src="{{ url_for('static', filename='scan.js') }}"></script>
+  <script type="module" src="{{ url_for('static', filename='scan.js', v=10) }}"></script>
 </body>
 </html>
