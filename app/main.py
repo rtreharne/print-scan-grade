@@ -16,6 +16,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 import jwt
+import pymupdf
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, send_file, session, url_for
@@ -960,6 +961,35 @@ def create_app():
     def scan_workspace():
         context = active_course_context()
         return render_template("scan.html", context=context)
+
+    @app.post("/scan/render-page")
+    def render_scan_page():
+        active_course_context()
+        request.max_content_length = 64 * 1024 * 1024
+        if request.mimetype != "application/pdf" or request.headers.get("X-Scan-Render") != "1":
+            abort(415, "A PDF scan is required.")
+        page_number = request.args.get("page", type=int)
+        if page_number is None or page_number < 1:
+            abort(400, "A valid page number is required.")
+        pdf_bytes = request.get_data()
+        if not pdf_bytes.startswith(b"%PDF-"):
+            abort(400, "The uploaded file is not a PDF.")
+        try:
+            with pymupdf.open(stream=pdf_bytes, filetype="pdf") as document:
+                if page_number > len(document):
+                    abort(400, "The requested page does not exist.")
+                page = document[page_number - 1]
+                scale = min(2.8, 1600 / max(page.rect.width, page.rect.height))
+                # Render the PDF layers as the viewer shows them. No tone or
+                # contrast operation is applied to the resulting RGB pixels.
+                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale),
+                                         colorspace=pymupdf.csRGB, alpha=False)
+                png = pixmap.tobytes("png")
+        except (pymupdf.FileDataError, pymupdf.EmptyFileError, ValueError):
+            abort(400, "The PDF page could not be rendered.")
+        response = send_file(BytesIO(png), mimetype="image/png", download_name="scan-page.png")
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/scan/forms.json")
     def scan_forms_manifest():

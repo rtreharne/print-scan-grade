@@ -10,6 +10,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='scan.css') }}">
   <script src="{{ url_for('static', filename='vendor/jszip.min.js') }}"></script>
   <script src="{{ url_for('static', filename='vendor/jsQR.js') }}"></script>
+  <script src="{{ url_for('static', filename='vendor/tesseract/tesseract.min.js') }}"></script>
 </head>
 <body>
   <main class="workspace">
@@ -21,7 +22,7 @@
     <nav class="phase-nav" aria-label="Workspace phases">
       <a href="{{ url_for('print_workspace') }}">1 · Print</a>
       <a class="{{ 'active' if initial_phase|default('scan') == 'scan' else '' }}" href="{{ url_for('scan_workspace') }}" {% if initial_phase|default('scan') == 'scan' %}aria-current="page"{% endif %} data-scan-link>2 · Scan</a>
-      <a class="{{ 'active' if initial_phase|default('scan') == 'grade' else '' }}" href="{{ url_for('grade_workspace') }}" {% if initial_phase|default('scan') == 'grade' %}aria-current="page"{% endif %} data-grade-link>3 · Grade</a>
+      <a class="{{ 'active' if initial_phase|default('scan') == 'grade' else '' }}" href="{{ url_for('grade_workspace') }}" {% if initial_phase|default('scan') == 'grade' %}aria-current="page"{% endif %} data-grade-link>3 · Review</a>
     </nav>
 
     <div id="scan-dashboard">
@@ -34,15 +35,15 @@
     <section class="panel scan-panel" aria-labelledby="scan-title">
       <div class="scan-heading">
         <div><p class="eyebrow">This course</p><h2 id="scan-title">Choose PDF or ZIP files</h2></div>
-        <span class="privacy-mark" aria-label="Processed in this browser">Private on this device</span>
+        <span class="privacy-mark" aria-label="Saved on this device">Scans saved on this device</span>
       </div>
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}<div class="messages">{% for category, message in messages %}<p class="message {{ category }}" role="status">{{ message }}</p>{% endfor %}</div>{% endif %}
       {% endwith %}
-      <p class="muted">Select a completed answer-sheet PDF or a ZIP of PDFs. Student guide pages are skipped automatically. PDFs stay local; detected results and compressed page previews are saved in this browser for this course.</p>
+      <p class="muted">Select a completed answer-sheet PDF or a ZIP of PDFs. Student guide pages are skipped automatically. Pages are rendered temporarily by this app, then the original page image and annotations are saved in this browser for this course.</p>
       <label class="file-drop" for="scan-file">
         <span class="upload-symbol" aria-hidden="true">↑</span>
-        <span><strong>Select completed sheets (.pdf or .zip)</strong><small id="file-name">PDFs and ZIPs are processed locally and are not uploaded.</small></span>
+        <span><strong>Select completed sheets (.pdf or .zip)</strong><small id="file-name">PDF pages are rendered by this app; scan images are saved in this browser.</small></span>
         <input id="scan-file" type="file" accept=".pdf,application/pdf,.zip,application/zip" aria-describedby="zip-help">
       </label>
       <p id="zip-help" class="field-help">A PDF may contain multiple pages. ZIPs can contain multiple PDFs; non-PDF files are skipped. PDF limit: 64 MB each; ZIP limit: 256 MB.</p>
@@ -75,7 +76,7 @@
 
     <section id="grade-dashboard" class="results-section grade-workspace" aria-labelledby="grade-title" hidden>
       <div class="results-heading">
-        <div><p class="eyebrow">Phase 03 · Grade</p><h2 id="grade-title">Grades by answer sheet</h2><p id="grade-summary" class="muted"></p></div>
+        <div><p class="eyebrow">Phase 03 · Review</p><h2 id="grade-title">Raw scan annotations</h2><p id="grade-summary" class="muted"></p></div>
       </div>
       <div id="grade-form-list" class="grade-form-list"></div>
       <section id="grade-set-list" class="grade-set-list" hidden aria-labelledby="grade-set-title">
@@ -94,21 +95,21 @@
         <div class="grade-detail-actions">
           <button id="grade-back" class="download-button" type="button">← All scan sets</button>
           <button id="delete-scan-set-button" class="delete-scan-button" type="button">Delete scan set</button>
-          <button id="download-csv" class="download-button" type="button" disabled>Download CSV</button>
+          <button id="download-csv" class="download-button" type="button" disabled hidden>Download CSV</button>
         </div>
         <div id="grade-roster-message" class="scan-errors roster-error" hidden></div>
-        <label id="set-key-field" class="scan-key-field" for="set-key-select"><span>Answer sheet for this scan set</span><select id="set-key-select" class="review-select"></select></label>
-        <p class="scan-key-help">This answer sheet is used to grade every student scan in this set. Open a student’s name to compare their scan with its original page.</p>
+        <label id="set-key-field" class="scan-key-field" for="set-key-select" hidden><span>Answer sheet for this scan set</span><select id="set-key-select" class="review-select"></select></label>
+        <p class="scan-key-help">Open a student to review the original scan with circle annotations. Answer grading is paused while this reader is validated.</p>
         <div class="roster-table-wrap">
           <table class="roster-table">
-            <thead><tr><th scope="col">Student</th><th scope="col">SIS login ID</th><th scope="col">Grade</th></tr></thead>
+            <thead><tr><th scope="col">Student</th><th scope="col">SIS login ID</th><th scope="col">Raw scan review</th></tr></thead>
             <tbody id="roster-rows"><tr><td colspan="3">No sheets scanned yet.</td></tr></tbody>
           </table>
         </div>
         <dialog id="scan-preview-dialog" class="scan-preview-dialog" aria-labelledby="scan-preview-title">
           <div class="scan-preview-heading"><div><p class="eyebrow">Saved scan results</p><h2 id="scan-preview-title">Scanned answer sheet</h2><p id="scan-preview-meta" class="muted"></p></div><div class="scan-preview-actions"><button id="scan-preview-close" class="download-button" type="button">Close</button></div></div>
-          <button id="original-scan-toggle" class="download-button original-scan-toggle" type="button" hidden>View enhanced scan</button>
-          <section id="original-scan-panel" class="original-scan-panel" hidden><p class="field-help">Uploaded PDFs are not retained. This locally saved page rendering has its contrast restored for comparison.</p><img id="original-scan-image" alt="Contrast-restored scanned answer sheet page"></section>
+          <button id="original-scan-toggle" class="download-button original-scan-toggle" type="button" hidden>View raw annotated scan</button>
+          <section id="original-scan-panel" class="original-scan-panel" hidden><p class="field-help">This is the original scan with diagnostic circle overlays only. Green indicates filled, blue indicates blank, and amber indicates uncertain.</p><img id="original-scan-image" alt="Raw annotated scanned answer sheet page"></section>
           <div id="scan-preview-content" class="scan-preview-content"></div>
         </dialog>
       </section>
@@ -117,6 +118,6 @@
     <footer>printscangrade.com</footer>
   </main>
 
-  <script type="module" src="{{ url_for('static', filename='scan.js', v=11) }}"></script>
+<script type="module" src="{{ url_for('static', filename='scan.js', v=23) }}"></script>
 </body>
 </html>

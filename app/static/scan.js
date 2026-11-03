@@ -53,12 +53,15 @@ const A4 = { width: 595.2756, height: 841.8898 };
 const MARK_MARGIN = 16;
 const CURRENT_MARK_MARGIN = 21;
 const ANSWER_READER_VERSION = 5;
+const RAW_SCAN_VERSION = 2;
+const ANNOTATION_VERSION = 2;
 const CURRENT_SHEET_LAYOUT_VERSION = 4;
-const PREVIEW_CONTRAST_VERSION = 2;
 const REGISTRATION_MARK_THRESHOLD = 160;
 const MAX_PDF_BYTES = 64 * 1024 * 1024;
 const MAX_ZIP_BYTES = 256 * 1024 * 1024;
 const formsById = new Map();
+let ocrWorkerPromise = null;
+let ocrUnavailableReason = "";
 
 async function initializeDummyZipForm() {
   if (!dummyZipForm) return;
@@ -129,7 +132,7 @@ let persistenceReady = false;
 let persistenceWarning = "";
 let persistenceLoadPromise = null;
 let formsManifestPromise = null;
-let bubbleRefreshPromise = null;
+let annotationRefreshPromise = null;
 
 async function loadFormsManifest() {
   if (formsManifestLoaded) return;
@@ -302,7 +305,7 @@ async function showGradeDashboard(pushHistory) {
   updatePhaseNavigation("grade");
   if (pushHistory && window.location.pathname !== "/grade") window.history.pushState({}, "", "/grade");
   window.scrollTo(0, 0);
-  refreshSavedBubbleIdsInBackground().then(() => {
+  refreshSavedAnnotationsInBackground().then(() => {
     if (window.location.pathname.replace(/\/$/, "").endsWith("/grade")) {
       renderGradeDashboardSheets(gradeDashboardData?.forms || []);
       renderGradeWorkspace();
@@ -310,12 +313,12 @@ async function showGradeDashboard(pushHistory) {
   });
 }
 
-function refreshSavedBubbleIdsInBackground() {
-  if (bubbleRefreshPromise) return bubbleRefreshPromise;
-  bubbleRefreshPromise = refreshSavedBubbleIds()
-    .catch((error) => console.warn("Saved scan readings could not be refreshed", error))
-    .finally(() => { bubbleRefreshPromise = null; });
-  return bubbleRefreshPromise;
+function refreshSavedAnnotationsInBackground() {
+  if (annotationRefreshPromise) return annotationRefreshPromise;
+  annotationRefreshPromise = refreshSavedAnnotations()
+    .catch((error) => console.warn("Saved raw scan annotations could not be refreshed", error))
+    .finally(() => { annotationRefreshPromise = null; });
+  return annotationRefreshPromise;
 }
 
 function showScanDashboard(pushHistory) {
@@ -354,7 +357,7 @@ function renderGradeDashboardSheets(forms) {
     const message = document.createElement("p");
     message.textContent = pageIssues.length
       ? `No answer sheets were identified in saved scan data. ${pageIssues.length} file or page issue(s) need attention.`
-      : "No scanned answer sheets saved for this course yet. Scan completed sheets to start grading.";
+      : "No scanned answer sheets saved for this course yet. Scan completed sheets to review their circles.";
     empty.append(message);
     if (pageIssues.length) {
       const list = document.createElement("ul");
@@ -468,7 +471,6 @@ function openScanSet(scanSetId) {
   selectedScanSetId = scanSetId;
   gradeSetList.hidden = true;
   gradeDetail.hidden = false;
-  renderSetAnswerKeyOptions();
   renderGradeWorkspace();
   window.scrollTo(0, 0);
 }
@@ -504,7 +506,7 @@ async function deleteScanSet(scanSetId) {
 $("#scan-preview-close").addEventListener("click", () => scanPreviewDialog.close());
 originalScanToggle.addEventListener("click", () => {
   originalScanPanel.hidden = !originalScanPanel.hidden;
-  originalScanToggle.textContent = originalScanPanel.hidden ? "View enhanced scan" : "Hide enhanced scan";
+  originalScanToggle.textContent = originalScanPanel.hidden ? "View raw annotated scan" : "Hide raw annotated scan";
 });
 scanPreviewDialog.addEventListener("close", resetOriginalScanPreview);
 scanPreviewDialog.addEventListener("click", (event) => {
@@ -571,12 +573,12 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
     progressBar.value = 0;
     progressBar.max = 1;
   }
-  setProgress(fileType === "pdf" ? "Opening PDF locally…" : fileType === "zip" ? "Opening ZIP locally…" : "Checking file…");
+  setProgress(fileType === "pdf" ? "Preparing PDF…" : fileType === "zip" ? "Opening ZIP…" : "Checking file…");
 
   try {
-    if (bubbleRefreshPromise) {
+    if (annotationRefreshPromise) {
       setProgress("Finishing saved scan refresh…");
-      await bubbleRefreshPromise;
+      await annotationRefreshPromise;
     }
     if (!fileType) throw new Error("Select a PDF or ZIP file to scan.");
     await loadFormsManifest();
@@ -614,12 +616,15 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
       try {
         bytes = await entry.async("uint8array");
         if (!hasPdfHeader(bytes)) throw new Error("The file does not contain a readable PDF.");
+        // PDF.js transfers its input buffer to a worker. Keep a separate copy
+        // for the page renderer, which needs the original PDF bytes.
+        const renderBytes = bytes.slice();
         loadingTask = pdfjsLib.getDocument({ data: bytes, isEvalSupported: false, useWorkerFetch: false });
         pdf = await loadingTask.promise;
         for (let pageNo = 1; pageNo <= pdf.numPages; pageNo += 1) {
           setProgress(`Scanning ${entry.name} · page ${pageNo} of ${pdf.numPages}`);
           try {
-            const result = await scanPage(pdf, pageNo, entry.name);
+            const result = await scanPage(pdf, pageNo, entry.name, renderBytes);
             if (result?.guidePage) guidePagesSkipped += 1;
             else {
               result.id = globalThis.crypto?.randomUUID?.() || `scan-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -727,19 +732,22 @@ function hasPdfHeader(bytes) {
   return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2d;
 }
 
-async function scanPage(pdf, pageNo, sourceFile) {
-  const page = await pdf.getPage(pageNo);
-  const baseViewport = page.getViewport({ scale: 1 });
-  const scale = Math.min(2.8, 1600 / Math.max(baseViewport.width, baseViewport.height));
-  const viewport = page.getViewport({ scale });
+async function scanPage(pdf, pageNo, sourceFile, pdfBytes) {
+  const response = await fetch(`/scan/render-page?page=${pageNo}`, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/pdf", "X-Scan-Render": "1" },
+    body: pdfBytes,
+  });
+  if (!response.ok) throw new Error(`The PDF page could not be rendered (${response.status}).`);
+  const rawPage = await response.blob();
+  const bitmap = await createImageBitmap(rawPage);
   const sourceCanvas = document.createElement("canvas");
-  sourceCanvas.width = Math.ceil(viewport.width);
-  sourceCanvas.height = Math.ceil(viewport.height);
+  sourceCanvas.width = bitmap.width;
+  sourceCanvas.height = bitmap.height;
   const sourceContext = sourceCanvas.getContext("2d", { willReadFrequently: true });
-  sourceContext.fillStyle = "white";
-  sourceContext.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
-  await page.render({ canvasContext: sourceContext, viewport, background: "#ffffff" }).promise;
-  page.cleanup();
+  sourceContext.drawImage(bitmap, 0, 0);
+  bitmap.close();
 
   // Scanner apps often produce a pale gray page. Use a maximally contrasted
   // black/white copy for structural detection, while retaining the original
@@ -755,6 +763,7 @@ async function scanPage(pdf, pageNo, sourceFile) {
   }
   let alignedCanvas = null;
   let singleFormFallbackCanvas = null;
+  let selectedRegistrationPoints = null;
   let qr = null;
   // Registration marks are symmetric, so try each physical page orientation.
   // A valid form QR in the expected top-right area identifies the upright one.
@@ -780,6 +789,7 @@ async function scanPage(pdf, pageNo, sourceFile) {
     if (decoded) {
       alignedCanvas = candidate;
       qr = decoded;
+      selectedRegistrationPoints = points;
       break;
     }
     if (rotation === 0 && formsById.size === 1) {
@@ -796,6 +806,7 @@ async function scanPage(pdf, pageNo, sourceFile) {
   if (!alignedCanvas && singleFormFallbackCanvas) {
     const design = formsById.values().next().value;
     alignedCanvas = singleFormFallbackCanvas;
+    selectedRegistrationPoints = marks;
     // Layout 3 and 4 share answer and ID geometry. Existing pale sheets use
     // layout 3; clean layout-4 sheets remain identified from their QR above.
     qr = {
@@ -818,40 +829,56 @@ async function scanPage(pdf, pageNo, sourceFile) {
     }
     const form = identifyScannedForm(qr);
     if (!form.ok) throw new Error(form.reason);
-    let originalPage = null;
+    setProgress(`Annotating raw scan circles - ${sourceFile} - page ${pageNo}`);
+    const rawMapping = createTemplateToRawMapping(
+      selectedRegistrationPoints,
+      form.layoutVersion === 4 ? CURRENT_MARK_MARGIN : MARK_MARGIN,
+    );
+    if (!rawMapping) throw new Error("The scan registration geometry could not be mapped to the raw page.");
+    const annotations = detectRawBubbleAnnotations(
+      sourceCanvas, form.design, form.layoutVersion, rawMapping,
+    );
+    let identity = { printedName: "", writtenStudentId: "", digitOCR: "", ocrError: "" };
     try {
-      originalPage = await createLocalPagePreview(sourceCanvas, true);
+      setProgress(`Reading student identity - ${sourceFile} - page ${pageNo}`);
+      identity = await readWrittenIdentity(alignedCanvas, form.layoutVersion);
     } catch (error) {
-      console.warn("Could not create a locally saved original-page preview", error);
+      identity.ocrError = error.message || "Student name and ID could not be read.";
     }
-    setProgress(`Reading answer and student-number bubbles - ${sourceFile} - page ${pageNo}`);
-    const answers = readAnswers(alignedCanvas, form.design, form.layoutVersion);
-    const bubbleId = readStudentId(alignedCanvas, form.layoutVersion);
-    const idMatch = resolveStudentId(bubbleId);
+    let annotatedPage = null;
+    try {
+      // The server-rendered PNG is saved unchanged as rawPage. Draw diagnostic
+      // overlays only on a separate copy of those pixels.
+      annotatedPage = await createAnnotatedBubblePreview(
+        sourceCanvas, annotations,
+      );
+    } catch (error) {
+      console.warn("Could not create a locally annotated scan preview", error);
+    }
+    const idMatch = resolveWrittenIdentity(identity);
     return {
       sourceFile,
       pageNo,
-      originalPage,
-      previewContrastVersion: PREVIEW_CONTRAST_VERSION,
+      rawPage,
+      annotatedPage,
+      rawScanVersion: RAW_SCAN_VERSION,
+      annotationVersion: ANNOTATION_VERSION,
       formId: form.design.form_id,
       formTitle: form.design.title,
       layoutVersion: form.layoutVersion,
       questionCount: form.design.question_count,
       studentId: idMatch.studentId,
-      bubbleStudentId: bubbleId.studentId,
-      bubbleIdRaw: bubbleId.raw,
-      bubbleIdUncertainColumns: bubbleId.uncertainColumns,
-      writtenStudentId: "",
-      digitOCR: "",
-      printedName: "",
-      answerReaderVersion: ANSWER_READER_VERSION,
+      bubbleStudentId: "",
+      bubbleIdRaw: "",
+      bubbleIdUncertainColumns: [],
+      writtenStudentId: identity.writtenStudentId,
+      digitOCR: identity.digitOCR,
+      printedName: identity.printedName,
       idMatchStatus: idMatch.status,
-      ocrError: "",
-      sampleExpectedAnswers: form.sampleSeed
-        ? Array.from({ length: form.design.question_count }, (_, index) =>
-          String.fromCharCode(65 + ((index + 1 + form.sampleSeed) % form.design.choice_count)))
-        : null,
-      answers,
+      ocrError: identity.ocrError || "",
+      annotations: annotations.annotations,
+      annotationCounts: annotations.counts,
+      answers: [],
     };
   } finally {
     sourceCanvas.width = 0;
@@ -917,51 +944,125 @@ function createBinarizedCanvas(sourceCanvas) {
   return output;
 }
 
-function restorePaleScanContrast(image) {
-  let darkPixels = 0;
-  let paleInkPixels = 0;
-  let sampledPixels = 0;
-  // Sampling is sufficient to classify the page and avoids another complete
-  // pass before enhancement. Normal PDFs contain substantially more genuinely
-  // dark ink than mixed-raster scans whose foreground mask PDF.js has lost.
-  for (let offset = 0; offset < image.data.length; offset += 16) {
-    const gray = Math.round((image.data[offset] * 299 + image.data[offset + 1] * 587 +
-      image.data[offset + 2] * 114) / 1000);
-    if (gray < 170) darkPixels += 1;
-    else if (gray < 254) paleInkPixels += 1;
-    sampledPixels += 1;
-  }
-  const darkRatio = darkPixels / Math.max(1, sampledPixels);
-  const paleInkRatio = paleInkPixels / Math.max(1, sampledPixels);
-  if (darkRatio >= 0.025 || paleInkRatio < 0.01) return false;
-
-  for (let offset = 0; offset < image.data.length; offset += 4) {
-    const gray = Math.round((image.data[offset] * 299 + image.data[offset + 1] * 587 +
-      image.data[offset + 2] * 114) / 1000);
-    const value = gray >= 254 ? 255 : Math.max(0, 255 - (254 - gray) * 10);
-    image.data[offset] = value;
-    image.data[offset + 1] = value;
-    image.data[offset + 2] = value;
-  }
-  return true;
+async function createLocalPagePreview(sourceCanvas) {
+  const preview = document.createElement("canvas");
+  preview.width = sourceCanvas.width;
+  preview.height = sourceCanvas.height;
+  const context = preview.getContext("2d");
+  context.drawImage(sourceCanvas, 0, 0);
+  const blob = await new Promise((resolve, reject) => {
+    preview.toBlob((imageBlob) => imageBlob ? resolve(imageBlob) : reject(new Error("The local raw scan could not be saved.")), "image/png");
+  });
+  preview.width = 0;
+  preview.height = 0;
+  return blob;
 }
 
-async function createLocalPagePreview(sourceCanvas, restoreContrast = false) {
-  const maxWidth = 1200;
-  const scale = Math.min(1, maxWidth / sourceCanvas.width);
-  const preview = document.createElement("canvas");
-  preview.width = Math.max(1, Math.round(sourceCanvas.width * scale));
-  preview.height = Math.max(1, Math.round(sourceCanvas.height * scale));
-  const context = preview.getContext("2d");
-  context.fillStyle = "white";
-  context.fillRect(0, 0, preview.width, preview.height);
-  context.drawImage(sourceCanvas, 0, 0, preview.width, preview.height);
-  if (restoreContrast) {
-    const image = context.getImageData(0, 0, preview.width, preview.height);
-    if (restorePaleScanContrast(image)) context.putImageData(image, 0, 0);
+function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping) {
+  const context = sourceCanvas.getContext("2d", { willReadFrequently: true });
+  const image = context.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+  const scale = 1500 / A4.width;
+  const currentLayout = [3, 4].includes(layoutVersion);
+  const questionCount = Number(design.question_count);
+  const choiceCount = Number(design.choice_count);
+  const questionTop = layoutVersion === 1 ? 589 : currentLayout ? 460 : 507;
+  const columns = Math.min(4, Math.max(1, Math.ceil(questionCount / (currentLayout ? 15 : 20))));
+  const rowsPerColumn = currentLayout ? 15 : Math.ceil(questionCount / columns);
+  const columnWidth = (A4.width - 54) / columns;
+  const rowPitch = currentLayout
+    ? Math.min(31, Math.max(12, (questionTop - 38) / Math.max(1, rowsPerColumn - 1)))
+    : Math.min(28.5, Math.max(12, (questionTop - 38) / rowsPerColumn));
+  const rowOffset = (questionTop - 38 - (rowsPerColumn - 1) * rowPitch) / 2;
+  const answerPitch = Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, choiceCount - 1));
+  const annotations = [];
+  const inspect = (kind, label, question, templateX, templateY, templateRadius) => {
+    const [x, y, radius] = rawBubbleGeometry(mapping, templateX * scale, templateY * scale, templateRadius * scale, sourceCanvas.width / A4.width);
+    const analysis = analyzeCircle(image, sourceCanvas.width, sourceCanvas.height, x, y, radius, 0.28);
+    // A real printed bubble has a local circular ring. This gate prevents the
+    // overlay from marking every expected location when a scan is blank/cropped.
+    if (analysis.score < Math.max(3, analysis.paper * 0.012)) return;
+    const status = analysis.fillRatio >= 0.22 && analysis.normalizedContrast >= 0.16
+      ? "filled"
+      : analysis.fillRatio >= 0.08 || analysis.normalizedContrast >= 0.07 ? "uncertain" : "blank";
+    annotations.push({ kind, label, question, x: analysis.cx, y: analysis.cy,
+      radius, status, confidence: Math.min(1, analysis.score / 35) });
+  };
+  for (let column = 0; column < columns; column += 1) {
+    const x = 27 + column * columnWidth + (currentLayout ? 30 : 33);
+    for (let row = 0; row < rowsPerColumn; row += 1) {
+      const question = column * rowsPerColumn + row + 1;
+      if (question > questionCount) break;
+      const y = questionTop - rowOffset - row * rowPitch;
+      const radius = currentLayout ? 6.8 : Math.min(5, Math.max(3.6, rowPitch * 0.28));
+      for (let choice = 0; choice < choiceCount; choice += 1) {
+        inspect("answer", String.fromCharCode(65 + choice), question,
+          x + choice * answerPitch, A4.height - y, radius);
+      }
+    }
   }
+  if ([2, 3, 4].includes(layoutVersion)) {
+    const firstBubbleX = 27 + 2 + 34;
+    const firstRowY = A4.height - (A4.height - 145 - 13);
+    const rowPitchId = currentLayout ? 14.5 : 9.1;
+    for (let column = 0; column < 9; column += 1) {
+      for (let digit = 0; digit < 10; digit += 1) {
+        inspect("student_id", String(digit), null,
+          firstBubbleX + column * 20.5, firstRowY + digit * rowPitchId,
+          currentLayout ? 6.8 : 3.9);
+      }
+    }
+  }
+  const counts = { total: annotations.length, filled: 0, blank: 0, uncertain: 0 };
+  for (const annotation of annotations) counts[annotation.status] += 1;
+  return { annotations, counts };
+}
+
+async function createAnnotatedBubblePreview(sourceCanvas, annotationData) {
+  const preview = document.createElement("canvas");
+  preview.width = sourceCanvas.width;
+  preview.height = sourceCanvas.height;
+  const context = preview.getContext("2d", { willReadFrequently: true });
+  context.drawImage(sourceCanvas, 0, 0);
+
+  // The source pixels remain untouched; this canvas is only the diagnostic copy.
+
+  const scale = preview.width / sourceCanvas.width;
+  const drawBubble = (bubble) => {
+    if (!bubble || !Number.isFinite(bubble.x) || !Number.isFinite(bubble.y)) return;
+    const color = bubble.status === "filled" ? "#00a878"
+      : bubble.status === "uncertain" ? "#d39b00" : "#2878c8";
+    context.beginPath();
+    context.arc(bubble.x * scale, bubble.y * scale, bubble.radius * scale, 0, Math.PI * 2);
+    context.lineWidth = Math.max(2, scale * 1.5);
+    context.strokeStyle = color;
+    context.globalAlpha = bubble.status === "blank" ? 0.72 : 0.95;
+    context.stroke();
+    if (bubble.status === "filled") {
+      context.beginPath();
+      context.arc(bubble.x * scale, bubble.y * scale, Math.max(2, bubble.radius * scale * 0.42), 0, Math.PI * 2);
+      context.fillStyle = color;
+      context.globalAlpha = 0.9;
+      context.fill();
+    }
+  };
+
+  for (const bubble of annotationData?.annotations || []) drawBubble(bubble);
+
+  // Keep a compact legend on the diagnostic copy so the colours are useful
+  // even when someone views the image without the answer list beside it.
+  const fontSize = Math.max(14, Math.round(scale * 7));
+  context.globalAlpha = 0.94;
+  context.fillStyle = "rgba(255,255,255,0.88)";
+  context.fillRect(preview.width - scale * 190, scale * 18, scale * 175, scale * 34);
+  context.font = `bold ${fontSize}px sans-serif`;
+  context.fillStyle = "#111";
+  context.fillText("green filled  blue blank  amber uncertain", preview.width - scale * 180, scale * 39);
+  context.globalAlpha = 1;
+
   const blob = await new Promise((resolve, reject) => {
-    preview.toBlob((imageBlob) => imageBlob ? resolve(imageBlob) : reject(new Error("The local scan preview could not be saved.")), "image/jpeg", 0.88);
+    preview.toBlob((imageBlob) => imageBlob
+      ? resolve(imageBlob)
+      : reject(new Error("The annotated scan preview could not be saved.")), "image/png");
   });
   preview.width = 0;
   preview.height = 0;
@@ -1109,6 +1210,43 @@ function findCornerDarkPatch(image, width, height, corner, expectedSize) {
 function grayAt(rgba, pixelIndex) {
   const offset = pixelIndex * 4;
   return (rgba[offset] * 299 + rgba[offset + 1] * 587 + rgba[offset + 2] * 114) / 1000;
+}
+
+function createTemplateToRawMapping(registrationPoints, markMargin = MARK_MARGIN) {
+  if (!registrationPoints || registrationPoints.length !== 4) return null;
+  const outputWidth = 1500;
+  const outputHeight = Math.round(outputWidth * A4.height / A4.width);
+  const inset = markMargin * outputWidth / A4.width;
+  const destination = [
+    [inset, inset],
+    [outputWidth - inset, inset],
+    [outputWidth - inset, outputHeight - inset],
+    [inset, outputHeight - inset],
+  ];
+  const forward = solveHomography(registrationPoints.map((point) => [point.x, point.y]), destination);
+  return forward && invertHomography(forward);
+}
+
+function mapTemplatePoint(mapping, x, y) {
+  const denominator = mapping[6] * x + mapping[7] * y + mapping[8];
+  return {
+    x: (mapping[0] * x + mapping[1] * y + mapping[2]) / denominator,
+    y: (mapping[3] * x + mapping[4] * y + mapping[5]) / denominator,
+  };
+}
+
+function mapTemplateRadius(mapping, x, y, radius) {
+  const center = mapTemplatePoint(mapping, x, y);
+  const horizontal = mapTemplatePoint(mapping, x + radius, y);
+  const vertical = mapTemplatePoint(mapping, x, y + radius);
+  return (Math.hypot(horizontal.x - center.x, horizontal.y - center.y) +
+    Math.hypot(vertical.x - center.x, vertical.y - center.y)) / 2;
+}
+
+function rawBubbleGeometry(mapping, x, y, radius, scale) {
+  if (!mapping) return [x, y, radius];
+  const center = mapTemplatePoint(mapping, x, y);
+  return [center.x, center.y, mapTemplateRadius(mapping, x, y, radius)];
 }
 
 function rectifyPage(sourceCanvas, registrationPoints, markMargin = MARK_MARGIN) {
@@ -1316,7 +1454,7 @@ function identifyForm(payload) {
   return { ok: true, design, layoutVersion, sampleSeed };
 }
 
-function readAnswers(canvas, design, layoutVersion) {
+function readAnswers(canvas, design, layoutVersion, coordinateMap = null) {
   const questionBottom = 38;
   const questionCount = Number(design.question_count);
   const choiceCount = Number(design.choice_count);
@@ -1333,6 +1471,7 @@ function readAnswers(canvas, design, layoutVersion) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const scale = canvas.width / A4.width;
+  const templateScale = coordinateMap ? 1500 / A4.width : scale;
   const answers = [];
   for (let column = 0; column < columns; column += 1) {
     // Sample the bubble interior, clear of its outline and faint guide letter.
@@ -1345,9 +1484,16 @@ function readAnswers(canvas, design, layoutVersion) {
       const y = questionTop - rowOffset - row * rowPitch;
       const bubbles = [];
       for (let choice = 0; choice < choiceCount; choice += 1) {
+        const templateX = (x + choice * answerPitch) * templateScale;
+        const templateY = (A4.height - y) * templateScale;
+        const radiusPoints = currentLayout ? 6.8 : Math.min(5, Math.max(3.6, rowPitch * 0.28));
+        const center = coordinateMap ? mapTemplatePoint(coordinateMap, templateX, templateY)
+          : { x: templateX, y: templateY };
+        const radius = coordinateMap
+          ? mapTemplateRadius(coordinateMap, templateX, templateY, radiusPoints * templateScale)
+          : radiusPoints * scale;
         bubbles.push(sampleBubble(image, canvas.width, canvas.height,
-          (x + choice * answerPitch) * scale, (A4.height - y) * scale,
-          (currentLayout ? 6.8 : Math.min(5, Math.max(3.6, rowPitch * 0.28))) * scale,
+          center.x, center.y, radius,
           String.fromCharCode(65 + choice)));
       }
       answers.push(resolveQuestion(question, bubbles));
@@ -1356,24 +1502,30 @@ function readAnswers(canvas, design, layoutVersion) {
   return answers;
 }
 
-function readStudentId(canvas, layoutVersion) {
+function readStudentId(canvas, layoutVersion, coordinateMap = null) {
   if (![2, 3, 4].includes(layoutVersion)) return { studentId: "", raw: "", uncertainColumns: [] };
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const scale = canvas.width / A4.width;
+  const templateScale = coordinateMap ? 1500 / A4.width : scale;
   const firstBubbleX = 27 + 2 + 34;
   const firstRowY = A4.height - (A4.height - 145 - 13);
   const rowPitch = [3, 4].includes(layoutVersion) ? 14.5 : 9.1;
   let digits = "";
   const uncertainColumns = [];
+  const bubbleColumns = [];
   for (let column = 0; column < 9; column += 1) {
     const bubbles = [];
     for (let digit = 0; digit < 10; digit += 1) {
       const bubble = sampleIdBubble(
         image, canvas.width, canvas.height,
-        (firstBubbleX + column * 20.5) * scale,
-        (firstRowY + digit * rowPitch) * scale,
-        ([3, 4].includes(layoutVersion) ? 6.8 : 3.9) * scale, String(digit),
+        ...rawBubbleGeometry(
+          coordinateMap,
+          (firstBubbleX + column * 20.5) * templateScale,
+          (firstRowY + digit * rowPitch) * templateScale,
+          ([3, 4].includes(layoutVersion) ? 6.8 : 3.9) * templateScale,
+          scale,
+        ), String(digit),
       );
       bubbles.push(bubble);
     }
@@ -1382,12 +1534,19 @@ function readStudentId(canvas, layoutVersion) {
     const second = ranked[1];
     const signalGap = top.signal - second.signal;
     const clearWinner = top.signal >= 0.28 && signalGap >= 0.07;
-    if (clearWinner) digits += top.label;
+    if (clearWinner) {
+      top.mark = "shaded";
+      digits += top.label;
+    }
     else digits += "?";
     const ambiguous = !clearWinner || second.signal >= top.signal * 0.88;
     if (ambiguous) uncertainColumns.push(column + 1);
+    bubbleColumns.push(bubbles);
   }
-  return { studentId: /^\d{9}$/.test(digits) ? digits : "", raw: digits, uncertainColumns };
+  return {
+    studentId: /^\d{9}$/.test(digits) ? digits : "", raw: digits,
+    uncertainColumns, bubbles: bubbleColumns,
+  };
 }
 
 function sampleIdBubble(image, width, height, centerX, centerY, radius, label) {
@@ -1405,23 +1564,14 @@ function sampleIdBubble(image, width, height, centerX, centerY, radius, label) {
     signal: analysis.signal, centerX: analysis.cx, centerY: analysis.cy };
 }
 
-function resolveStudentId(bubbleId) {
-  const bubbled = bubbleId.studentId;
-  if (bubbled) {
-    return {
-      studentId: bubbled,
-      status: bubbleId.uncertainColumns.length
-        ? `Bubble ID read; check column(s) ${bubbleId.uncertainColumns.join(", ")} because another faint mark was detected.`
-        : "Student number read from the ID bubbles.",
-    };
+function resolveWrittenIdentity(identity) {
+  if (identity.writtenStudentId) {
+    return { studentId: identity.writtenStudentId, status: "Student number read from the ID boxes." };
   }
-  return { studentId: "", status: "Student number could not be read from the ID bubbles." };
+  return { studentId: "", status: "Student number could not be read from the ID boxes." };
 }
 
 async function readWrittenIdentity(canvas, layoutVersion) {
-  // Retained only so older persisted callers fail safe. Runtime identity now
-  // comes exclusively from the student-number bubble grid.
-  return { printedName: "", writtenStudentId: "", digitOCR: "" };
   if (![2, 3, 4].includes(layoutVersion)) return { printedName: "", writtenStudentId: "", digitOCR: "" };
   const worker = await getOcrWorker();
   const scale = canvas.width / A4.width;
@@ -1807,7 +1957,7 @@ function analyzeCircle(image, width, height, expectedX, expectedY, radius, searc
   const normalizedContrast = Math.max(0, Math.min(1.5, (paper - insideMean) / outlineSpan));
   const signal = Math.min(1, fillRatio * 0.72 + Math.min(1, normalizedContrast) * 0.28);
   return {
-    cx: best.cx, cy: best.cy, fillRatio, normalizedContrast, signal,
+    cx: best.cx, cy: best.cy, score: best.score, fillRatio, normalizedContrast, signal,
     darkThreshold, paper, outline,
   };
 }
@@ -1971,6 +2121,7 @@ function resolveQuestion(question, bubbles) {
   const second = ranked[1] || { signal: 0 };
   const clearWinner = top.mark !== "crossed" && top.signal >= 0.28 &&
     top.signal - second.signal >= 0.09;
+  if (clearWinner) top.mark = "shaded";
   const active = clearWinner ? [top] : bubbles.filter((bubble) => bubble.mark === "shaded");
   const crossed = bubbles.filter((bubble) => bubble.mark === "crossed");
   const uncertain = clearWinner ? [] : bubbles.filter((bubble) => bubble.mark === "uncertain");
@@ -2054,33 +2205,24 @@ function isDummyAnswerKey(sheet) {
 
 function identitySummary(sheet) {
   const learner = matchedLearner(sheet);
-  if (learner && sheet.bubbleStudentId === learner.student_id) {
-    const parts = [
-      `Roster identity confirmed: ${learner.name}`,
-      `Nine-digit bubble ID matches SIS login: ${learner.student_id}`,
-    ];
-    if (sheet.bubbleIdUncertainColumns?.length) {
-      parts.push(`The scan flagged faint marks in ${sheet.bubbleIdUncertainColumns.length} digit column(s), but its decoded nine-digit ID matches this roster entry`);
-    }
-    return parts.join(" · ");
-  }
   const parts = [
-    `ID bubbles: ${sheet.bubbleIdRaw || "not read"}`,
+    learner ? `Roster identity confirmed: ${learner.name}` : `Printed name: ${sheet.printedName || "not read"}`,
+    `Student number from boxes: ${sheet.writtenStudentId || "not read"}`,
     sheet.idMatchStatus || "",
   ];
   if (learner) parts.push(`Matched SIS number: ${learner.student_id}`);
-  if (!learner) parts.push("Use the enhanced scan to check the handwritten name if manual identification is needed");
+  if (!learner) parts.push("Review the raw annotated scan if manual identification is needed");
   return parts.filter(Boolean).join(" · ");
 }
 
 function renderGradeWorkspace() {
-  csvButton.disabled = !sheetResults.some((sheet) => sheet.scanSetId === selectedScanSetId);
+  csvButton.disabled = true;
   if (!selectedGradeFormId) {
     const scannedFormCount = (gradeDashboardData?.forms || []).filter((form) =>
       sheetResults.some((sheet) => sheet.formId === form.form_id)).length;
     gradeSummary.textContent = scannedFormCount
-      ? `${scannedFormCount} answer sheet${scannedFormCount === 1 ? "" : "s"} have scans. Choose one to view its scan details and grades.`
-      : "No scanned answer sheets saved for this course yet. Scan completed sheets to start grading.";
+      ? `${scannedFormCount} answer sheet${scannedFormCount === 1 ? "" : "s"} have scans. Choose one to review raw circle annotations.`
+      : "No scanned answer sheets saved for this course yet. Scan completed sheets to review their circles.";
     return;
   }
   if (!selectedScanSetId) {
@@ -2093,18 +2235,11 @@ function renderGradeWorkspace() {
   if (!scanSet) return;
   const formSheets = sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId);
   const studentSheets = formSheets.filter((sheet) => !isDummyAnswerKey(sheet));
-  const sampleMemory = formSheets.filter((sheet) => sheet.sampleExpectedAnswers).map((sheet) => {
-    const check = samplePatternCheck(sheet);
-    return `${check.matched}/${check.total} sample answers matched`;
-  });
-  const sampleNote = sampleMemory.length ? ` · ${sampleMemory.join("; ")}` : "";
   const issueNote = pageIssues.length ? ` · ${pageIssues.length} page/file issue(s) reported during scan` : "";
   if (!formSheets.length) {
     gradeSummary.textContent = `${scanSet.sourceName || "Scan set"}: no student scans.${issueNote}`;
   } else {
-    const key = getGradeKeyForScan(formSheets[0]);
-    const gradeCount = studentSheets.filter((sheet) => getGradeKeyForScan(sheet)).length;
-    gradeSummary.textContent = `${scanSet.sourceName || "Scan set"} · ${studentSheets.length} student scan(s) · ${key ? `answer sheet: ${studentNameFor(key)} · ${gradeCount} scan(s) graded` : "choose an answer sheet above"}.${sampleNote}${issueNote}`;
+    gradeSummary.textContent = `${scanSet.sourceName || "Scan set"} · ${studentSheets.length} student scan(s) ready for raw annotation review.${issueNote}`;
   }
   renderRosterTable();
 }
@@ -2115,10 +2250,9 @@ function getGradeKeyForScan(sheet) {
 }
 
 function gradeLabelForScan(sheet) {
-  const key = getGradeKeyForScan(sheet);
-  if (!key) return "No answer sheet assigned";
-  const grade = gradeForSheet(sheet, key);
-  return `${grade.correct}/${grade.total}${grade.review ? ` · ${grade.review} review` : ""}`;
+  if (sheet.rawScanVersion !== RAW_SCAN_VERSION) return "Rescan required";
+  const counts = sheet.annotationCounts || { total: (sheet.annotations || []).length, filled: 0, blank: 0, uncertain: 0 };
+  return `${counts.total} circles / ${counts.filled || 0} filled / ${counts.uncertain || 0} uncertain`;
 }
 
 function renderRosterTable() {
@@ -2148,7 +2282,7 @@ function renderRosterTable() {
       ? `IDs match multiple roster students: ${candidates.map((learner) => learner.name).join(", ")}`
       : !courseRoster.length ? "Course roster unavailable for cross-reference"
         : sheet.studentId ? `ID ${sheet.studentId} not on course roster` : "No confirmed roster ID";
-    const idNote = [sheet.idMatchStatus, sheet.bubbleStudentId ? `Bubble ID ${sheet.bubbleStudentId}` : "Bubble ID unreadable",
+    const idNote = [sheet.idMatchStatus, sheet.writtenStudentId ? `ID boxes ${sheet.writtenStudentId}` : "ID boxes unreadable",
       rosterNote]
       .filter(Boolean).join(" · ");
     appendRosterRow("Student not identified", idNote,
@@ -2218,62 +2352,33 @@ function openScanPreview(sheet) {
   scanPreviewMeta.textContent = `${sheet.sourceFile} · page ${sheet.pageNo} · ${identitySummary(sheet)}`;
   originalScanToggle.hidden = false;
   originalScanToggle.disabled = true;
-  originalScanToggle.textContent = sheet.originalPage instanceof Blob
-    ? "Preparing enhanced scan..."
+  const hasCurrentRawPage = sheet.rawScanVersion === RAW_SCAN_VERSION && sheet.rawPage instanceof Blob;
+  originalScanToggle.textContent = hasCurrentRawPage
+    ? "Preparing annotated scan..."
     : "Original scan unavailable · rescan required";
-  originalScanToggle.title = sheet.originalPage instanceof Blob
-    ? "Show a contrast-restored rendering of the uploaded PDF page."
+  originalScanToggle.title = hasCurrentRawPage
+    ? "Show the scan with detected bubbles annotated."
     : "This scan was saved before original-page previews were added. Scan the PDF again to save its page image.";
-  if (sheet.originalPage instanceof Blob) {
-    prepareReadableScanPreview(sheet).catch((error) => {
-      console.warn("Could not restore stored scan contrast", error);
-      if (previewedSheetId !== sheet.id) return;
-      showOriginalScanBlob(sheet, sheet.originalPage);
-    });
+  if (hasCurrentRawPage && sheet.annotationVersion === ANNOTATION_VERSION && sheet.annotatedPage instanceof Blob) {
+    showOriginalScanBlob(sheet, sheet.annotatedPage);
+  } else if (hasCurrentRawPage) {
+    showOriginalScanBlob(sheet, sheet.rawPage);
   }
   scanPreviewContent.replaceChildren();
-  const answerKey = getGradeKeyForScan(sheet);
-  const grading = answerKey ? gradeForSheet(sheet, answerKey) : null;
-  for (const [index, answer] of sheet.answers.entries()) {
-    const row = document.createElement("article");
-    row.className = "scan-preview-answer";
-    const question = document.createElement("strong");
-    question.textContent = `Question ${answer.question}`;
-    const gradedAnswer = grading?.gradedAnswers[index];
-    const displayStatus = gradedAnswer?.status || answer.status;
-    const choice = document.createElement("span");
-    choice.className = "scan-preview-choice";
-    if (gradedAnswer?.status === "correct") {
-      choice.textContent = `${answer.response} · Correct`;
-    } else if (gradedAnswer?.status === "incorrect") {
-      choice.textContent = answer.response
-        ? `${answer.response} · Incorrect (key: ${gradedAnswer.correctAnswer?.response || "blank"})`
-        : `No answer · Incorrect (key: ${gradedAnswer.correctAnswer?.response || "blank"})`;
-    } else if (answer.response) {
-      choice.textContent = `${answer.response}${answer.status === "review" ? " · Needs review" : grading ? " · Not graded" : " · Detected"}`;
-    } else {
-      choice.textContent = answer.status === "incorrect_blank" ? "No answer · Incorrect" : "Needs review";
-    }
-    const bubbleList = document.createElement("span");
-    bubbleList.className = "scan-preview-bubbles";
-    for (const bubble of answer.bubbles || []) {
-      const mark = document.createElement("span");
-      mark.className = `scan-preview-bubble ${bubble.mark || ""}`;
-      mark.textContent = bubble.label;
-      bubbleList.append(mark);
-    }
-    row.append(question, choice, bubbleList, statusPill(displayStatus));
-    const reason = gradedAnswer?.status === "correct"
-      ? `Matches the answer sheet (${gradedAnswer.correctAnswer?.response || answer.response}).`
-      : gradedAnswer?.status === "incorrect"
-        ? `The answer sheet has ${gradedAnswer.correctAnswer?.response || "no answer"}.`
-        : answer.reason;
-    if (reason) {
-      const detail = document.createElement("small");
-      detail.textContent = reason;
-      row.append(detail);
-    }
-    scanPreviewContent.append(row);
+  const annotationCounts = sheet.annotationCounts || (sheet.annotations || []).reduce((result, item) => {
+    result.total += 1;
+    if (result[item.status] !== undefined) result[item.status] += 1;
+    return result;
+  }, { total: 0, filled: 0, blank: 0, uncertain: 0 });
+  const annotationReview = document.createElement("p");
+  annotationReview.className = "field-help";
+  annotationReview.textContent = sheet.rawScanVersion === RAW_SCAN_VERSION
+    ? `Raw annotation review: ${annotationCounts.total} circles detected · ${annotationCounts.filled} filled · ${annotationCounts.blank} blank · ${annotationCounts.uncertain} uncertain. Answer choices are intentionally unavailable while the new reader is being validated.`
+    : "This saved scan was created by the retired reader. Rescan it to create a raw annotation record; old answer results are not trusted.";
+  scanPreviewContent.append(annotationReview);
+  if (sheet.rawScanVersion !== RAW_SCAN_VERSION) {
+    if (!scanPreviewDialog.open) scanPreviewDialog.showModal();
+    return;
   }
   if (!scanPreviewDialog.open) scanPreviewDialog.showModal();
 }
@@ -2283,31 +2388,17 @@ function showOriginalScanBlob(sheet, blob) {
   releaseOriginalScanUrl();
   originalScanObjectUrl = URL.createObjectURL(blob);
   originalScanImage.src = originalScanObjectUrl;
-  originalScanImage.alt = `Enhanced scanned page from ${sheet.sourceFile}, page ${sheet.pageNo}`;
+  originalScanImage.alt = `Annotated scanned page from ${sheet.sourceFile}, page ${sheet.pageNo}`;
   originalScanToggle.disabled = false;
-  originalScanToggle.textContent = "View enhanced scan";
+  originalScanToggle.textContent = "View raw annotated scan";
 }
 
 async function prepareReadableScanPreview(sheet) {
-  if (sheet.previewContrastVersion === PREVIEW_CONTRAST_VERSION) {
-    showOriginalScanBlob(sheet, sheet.originalPage);
+  if (sheet.annotatedPage instanceof Blob) {
+    showOriginalScanBlob(sheet, sheet.annotatedPage);
     return;
   }
-  const bitmap = await createImageBitmap(sheet.originalPage);
-  const canvas = document.createElement("canvas");
-  canvas.width = bitmap.width;
-  canvas.height = bitmap.height;
-  canvas.getContext("2d", { willReadFrequently: true }).drawImage(bitmap, 0, 0);
-  bitmap.close();
-  try {
-    sheet.originalPage = await createLocalPagePreview(canvas, true);
-    sheet.previewContrastVersion = PREVIEW_CONTRAST_VERSION;
-    await persistScanState();
-    showOriginalScanBlob(sheet, sheet.originalPage);
-  } finally {
-    canvas.width = 0;
-    canvas.height = 0;
-  }
+  if (sheet.rawPage instanceof Blob) showOriginalScanBlob(sheet, sheet.rawPage);
 }
 
 function resetOriginalScanPreview() {
@@ -2315,7 +2406,7 @@ function resetOriginalScanPreview() {
   originalScanToggle.hidden = true;
   originalScanToggle.disabled = false;
   originalScanPanel.hidden = true;
-  originalScanToggle.textContent = "View enhanced scan";
+  originalScanToggle.textContent = "View raw annotated scan";
   originalScanImage.removeAttribute("src");
 }
 
@@ -2418,82 +2509,43 @@ function setProgress(message) {
   rescanProgressLabel.textContent = message;
 }
 
-async function refreshSavedBubbleIds() {
+async function refreshSavedAnnotations() {
   await loadFormsManifest();
   let changed = false;
   for (const sheet of sheetResults) {
-    if (!(sheet.originalPage instanceof Blob)) continue;
-    let bitmap;
-    let sourceCanvas;
+    // Legacy records intentionally cannot be re-read: their originalPage may
+    // be contrast-adjusted or already annotated rather than raw pixels.
+    if (sheet.rawScanVersion !== RAW_SCAN_VERSION || !(sheet.rawPage instanceof Blob)) continue;
+    if (sheet.annotationVersion === ANNOTATION_VERSION && sheet.annotatedPage instanceof Blob) continue;
+    let bitmap = null;
+    let canvas = null;
     try {
-      bitmap = await createImageBitmap(sheet.originalPage);
-      sourceCanvas = document.createElement("canvas");
-      sourceCanvas.width = bitmap.width;
-      sourceCanvas.height = bitmap.height;
-      sourceCanvas.getContext("2d", { willReadFrequently: true }).drawImage(bitmap, 0, 0);
-      const marks = findRegistrationMarks(sourceCanvas);
-      if (!marks) continue;
-      for (let rotation = 0; rotation < 4; rotation += 1) {
-        const points = marks.map((_, index) => marks[(index + rotation) % marks.length]);
-        let candidate = rectifyPage(sourceCanvas, points);
-        if (!candidate) continue;
-        const qr = decodeFormQr(candidate);
-        let form = qr ? identifyScannedForm(qr) : null;
-        if ((!form || !form.ok) && rotation === 0) {
-          const design = formsById.get(sheet.formId);
-          if (design) {
-            form = { ok: true, design, layoutVersion: sheet.layoutVersion || 3 };
-          }
-        }
-        if (!form?.ok || form.design.form_id !== sheet.formId || ![2, 3, 4].includes(form.layoutVersion)) {
-          candidate.width = 0;
-          candidate.height = 0;
-          continue;
-        }
-        if (form.layoutVersion === 4) {
-          candidate.width = 0;
-          candidate.height = 0;
-          candidate = rectifyPage(sourceCanvas, points, CURRENT_MARK_MARGIN);
-          if (!candidate) continue;
-        }
-        const bubbleId = readStudentId(candidate, form.layoutVersion);
-        const answers = sheet.answerReaderVersion === ANSWER_READER_VERSION
-          ? sheet.answers
-          : readAnswers(candidate, form.design, form.layoutVersion);
-        candidate.width = 0;
-        candidate.height = 0;
-        const idMatch = resolveStudentId(bubbleId);
-        if (sheet.bubbleStudentId !== bubbleId.studentId ||
-            sheet.bubbleIdRaw !== bubbleId.raw ||
-            JSON.stringify(sheet.bubbleIdUncertainColumns || []) !== JSON.stringify(bubbleId.uncertainColumns) ||
-            sheet.studentId !== idMatch.studentId || sheet.idMatchStatus !== idMatch.status ||
-            sheet.digitOCR || sheet.writtenStudentId || sheet.printedName || sheet.ocrError ||
-            sheet.answerReaderVersion !== ANSWER_READER_VERSION ||
-            JSON.stringify(sheet.answers) !== JSON.stringify(answers)) {
-          sheet.bubbleStudentId = bubbleId.studentId;
-          sheet.bubbleIdRaw = bubbleId.raw;
-          sheet.bubbleIdUncertainColumns = bubbleId.uncertainColumns;
-          sheet.writtenStudentId = "";
-          sheet.digitOCR = "";
-          sheet.printedName = "";
-          sheet.ocrError = "";
-          delete sheet.identityOcrVersion;
-          sheet.answerReaderVersion = ANSWER_READER_VERSION;
-          sheet.answers = answers;
-          sheet.studentId = idMatch.studentId;
-          sheet.idMatchStatus = idMatch.status;
-          changed = true;
-        }
-        break;
+      bitmap = await createImageBitmap(sheet.rawPage);
+      canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      canvas.getContext("2d", { willReadFrequently: true }).drawImage(bitmap, 0, 0);
+      const marks = findRegistrationMarks(canvas);
+      const form = formsById.get(String(sheet.formId).toLowerCase());
+      const mapping = form && marks ? createTemplateToRawMapping(marks, sheet.layoutVersion === 4 ? CURRENT_MARK_MARGIN : MARK_MARGIN) : null;
+      if (!mapping || !form) continue;
+      const annotationData = detectRawBubbleAnnotations(canvas, form, sheet.layoutVersion, mapping);
+      if (sheet.annotationVersion !== ANNOTATION_VERSION || !(sheet.annotatedPage instanceof Blob)) {
+        sheet.annotatedPage = await createAnnotatedBubblePreview(canvas, annotationData);
+      }
+      if (JSON.stringify(sheet.annotations || []) !== JSON.stringify(annotationData.annotations) ||
+          JSON.stringify(sheet.annotationCounts || {}) !== JSON.stringify(annotationData.counts) ||
+          sheet.annotationVersion !== ANNOTATION_VERSION) {
+        sheet.annotations = annotationData.annotations;
+        sheet.annotationCounts = annotationData.counts;
+        sheet.annotationVersion = ANNOTATION_VERSION;
+        changed = true;
       }
     } catch (error) {
-      console.warn("Could not refresh the locally saved ID bubble reading", error);
+      console.warn("Could not refresh a raw scan annotation", error);
     } finally {
       if (bitmap) bitmap.close();
-      if (sourceCanvas) {
-        sourceCanvas.width = 0;
-        sourceCanvas.height = 0;
-      }
+      if (canvas) { canvas.width = 0; canvas.height = 0; }
     }
   }
   if (changed) await persistScanState();
