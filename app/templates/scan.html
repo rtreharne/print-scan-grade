@@ -10,7 +10,6 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='scan.css') }}">
   <script src="{{ url_for('static', filename='vendor/jszip.min.js') }}"></script>
   <script src="{{ url_for('static', filename='vendor/jsQR.js') }}"></script>
-  <script src="{{ url_for('static', filename='vendor/tesseract/tesseract.min.js') }}"></script>
 </head>
 <body>
   <main class="workspace">
@@ -99,7 +98,7 @@
         </div>
         <div id="grade-roster-message" class="scan-errors roster-error" hidden></div>
         <label id="set-key-field" class="scan-key-field" for="set-key-select" hidden><span>Answer sheet for this scan set</span><select id="set-key-select" class="review-select"></select></label>
-        <p class="scan-key-help">Open a student to review the original scan with circle annotations. Answer grading is paused while this reader is validated.</p>
+        <p class="scan-key-help">Open a student to review the original scan and template-guided answer selection. Green filled circles are selected; crossed green circles are excluded; rows without an uncrossed green circle are not selected; multiple uncrossed green circles are reported as multiple selection.</p>
         <div class="roster-table-wrap">
           <table class="roster-table">
             <thead><tr><th scope="col">Student</th><th scope="col">SIS login ID</th><th scope="col">Raw scan review</th></tr></thead>
@@ -118,6 +117,6 @@
     <footer>printscangrade.com</footer>
   </main>
 
-<script type="module" src="{{ url_for('static', filename='scan.js', v=23) }}"></script>
+<script type="module" src="{{ url_for('static', filename='scan.js', v=47) }}"></script>
 </body>
 </html>

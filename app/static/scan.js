@@ -54,14 +54,12 @@ const MARK_MARGIN = 16;
 const CURRENT_MARK_MARGIN = 21;
 const ANSWER_READER_VERSION = 5;
 const RAW_SCAN_VERSION = 2;
-const ANNOTATION_VERSION = 2;
+const ANNOTATION_VERSION = 9;
 const CURRENT_SHEET_LAYOUT_VERSION = 4;
 const REGISTRATION_MARK_THRESHOLD = 160;
 const MAX_PDF_BYTES = 64 * 1024 * 1024;
 const MAX_ZIP_BYTES = 256 * 1024 * 1024;
 const formsById = new Map();
-let ocrWorkerPromise = null;
-let ocrUnavailableReason = "";
 
 async function initializeDummyZipForm() {
   if (!dummyZipForm) return;
@@ -748,11 +746,14 @@ async function scanPage(pdf, pageNo, sourceFile, pdfBytes) {
   const sourceContext = sourceCanvas.getContext("2d", { willReadFrequently: true });
   sourceContext.drawImage(bitmap, 0, 0);
   bitmap.close();
+  // This page never changes after it has been rendered. Keep one readback and
+  // share it with structural detection and every rectification candidate.
+  const sourceImage = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
 
   // Scanner apps often produce a pale gray page. Use a maximally contrasted
   // black/white copy for structural detection, while retaining the original
   // grayscale page for bubble analysis and the saved preview.
-  const detectionCanvas = createBinarizedCanvas(sourceCanvas);
+  const detectionCanvas = createBinarizedCanvas(sourceCanvas, sourceImage);
   const marks = findRegistrationMarks(detectionCanvas);
   detectionCanvas.width = 0;
   detectionCanvas.height = 0;
@@ -769,22 +770,30 @@ async function scanPage(pdf, pageNo, sourceFile, pdfBytes) {
   // A valid form QR in the expected top-right area identifies the upright one.
   for (let rotation = 0; rotation < 4; rotation += 1) {
     const points = marks.map((_, index) => marks[(index + rotation) % marks.length]);
-    let candidate = rectifyPage(sourceCanvas, points);
+    let candidate = rectifyPage(sourceCanvas, points, MARK_MARGIN, sourceImage);
     if (!candidate) continue;
-    let qrCanvas = createBinarizedCanvas(candidate);
-    let decoded = decodeFormQr(qrCanvas) || decodeFormQr(candidate);
-    qrCanvas.width = 0;
-    qrCanvas.height = 0;
+    // The QR reader already has a focused local threshold fallback. Only make
+    // a full-page binary copy when the untouched candidate cannot be read.
+    let decoded = decodeFormQr(candidate);
+    if (!decoded) {
+      const qrCanvas = createBinarizedCanvas(candidate);
+      decoded = decodeFormQr(qrCanvas);
+      qrCanvas.width = 0;
+      qrCanvas.height = 0;
+    }
     const preliminaryForm = decoded && !decoded.data.startsWith("PSGGUIDE|")
       ? identifyScannedForm(decoded) : null;
     if (preliminaryForm?.ok && preliminaryForm.layoutVersion === 4) {
       candidate.width = 0;
-      candidate = rectifyPage(sourceCanvas, points, CURRENT_MARK_MARGIN);
+      candidate = rectifyPage(sourceCanvas, points, CURRENT_MARK_MARGIN, sourceImage);
       if (!candidate) continue;
-      qrCanvas = createBinarizedCanvas(candidate);
-      decoded = decodeFormQr(qrCanvas) || decodeFormQr(candidate);
-      qrCanvas.width = 0;
-      qrCanvas.height = 0;
+      decoded = decodeFormQr(candidate);
+      if (!decoded) {
+        const qrCanvas = createBinarizedCanvas(candidate);
+        decoded = decodeFormQr(qrCanvas);
+        qrCanvas.width = 0;
+        qrCanvas.height = 0;
+      }
     }
     if (decoded) {
       alignedCanvas = candidate;
@@ -838,13 +847,9 @@ async function scanPage(pdf, pageNo, sourceFile, pdfBytes) {
     const annotations = detectRawBubbleAnnotations(
       sourceCanvas, form.design, form.layoutVersion, rawMapping,
     );
-    let identity = { printedName: "", writtenStudentId: "", digitOCR: "", ocrError: "" };
-    try {
-      setProgress(`Reading student identity - ${sourceFile} - page ${pageNo}`);
-      identity = await readWrittenIdentity(alignedCanvas, form.layoutVersion);
-    } catch (error) {
-      identity.ocrError = error.message || "Student name and ID could not be read.";
-    }
+    // ID bubbles are analysed as part of the same raw-page pass. Do not read
+    // the same 90 circles again from the rectified canvas.
+    const bubbleIdentity = readStudentIdFromSignals(annotations.idSignals, form.layoutVersion);
     let annotatedPage = null;
     try {
       // The server-rendered PNG is saved unchanged as rawPage. Draw diagnostic
@@ -855,7 +860,7 @@ async function scanPage(pdf, pageNo, sourceFile, pdfBytes) {
     } catch (error) {
       console.warn("Could not create a locally annotated scan preview", error);
     }
-    const idMatch = resolveWrittenIdentity(identity);
+    const idMatch = resolveStudentIdentity(bubbleIdentity);
     return {
       sourceFile,
       pageNo,
@@ -868,17 +873,14 @@ async function scanPage(pdf, pageNo, sourceFile, pdfBytes) {
       layoutVersion: form.layoutVersion,
       questionCount: form.design.question_count,
       studentId: idMatch.studentId,
-      bubbleStudentId: "",
-      bubbleIdRaw: "",
-      bubbleIdUncertainColumns: [],
-      writtenStudentId: identity.writtenStudentId,
-      digitOCR: identity.digitOCR,
-      printedName: identity.printedName,
+      bubbleStudentId: bubbleIdentity.studentId,
+      bubbleIdRaw: bubbleIdentity.raw,
+      bubbleIdUncertainColumns: bubbleIdentity.uncertainColumns,
       idMatchStatus: idMatch.status,
-      ocrError: identity.ocrError || "",
       annotations: annotations.annotations,
       annotationCounts: annotations.counts,
-      answers: [],
+      answers: annotations.answers,
+      answerCounts: annotations.answerCounts,
     };
   } finally {
     sourceCanvas.width = 0;
@@ -888,9 +890,9 @@ async function scanPage(pdf, pageNo, sourceFile, pdfBytes) {
   }
 }
 
-function createBinarizedCanvas(sourceCanvas) {
+function createBinarizedCanvas(sourceCanvas, suppliedImage = null) {
   const sourceContext = sourceCanvas.getContext("2d", { willReadFrequently: true });
-  const image = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+  const image = suppliedImage || sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
   const histogram = new Uint32Array(256);
   const grayscale = new Uint8Array(sourceCanvas.width * sourceCanvas.height);
   for (let pixel = 0; pixel < grayscale.length; pixel += 1) {
@@ -975,17 +977,44 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
   const rowOffset = (questionTop - 38 - (rowsPerColumn - 1) * rowPitch) / 2;
   const answerPitch = Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, choiceCount - 1));
   const annotations = [];
+  const idSignals = [];
   const inspect = (kind, label, question, templateX, templateY, templateRadius) => {
     const [x, y, radius] = rawBubbleGeometry(mapping, templateX * scale, templateY * scale, templateRadius * scale, sourceCanvas.width / A4.width);
     const analysis = analyzeCircle(image, sourceCanvas.width, sourceCanvas.height, x, y, radius, 0.28);
+    if (kind === "student_id") {
+      idSignals.push({ label, signal: analysis.signal, fillRatio: analysis.fillRatio,
+        normalizedContrast: analysis.normalizedContrast, column: Math.floor(idSignals.length / 10) });
+    }
     // A real printed bubble has a local circular ring. This gate prevents the
     // overlay from marking every expected location when a scan is blank/cropped.
     if (analysis.score < Math.max(3, analysis.paper * 0.012)) return;
     const status = analysis.fillRatio >= 0.22 && analysis.normalizedContrast >= 0.16
       ? "filled"
       : analysis.fillRatio >= 0.08 || analysis.normalizedContrast >= 0.07 ? "uncertain" : "blank";
+    const crossScore = status === "filled"
+      ? relativeDiagonalCoverage(image, sourceCanvas.width, sourceCanvas.height,
+        analysis.cx, analysis.cy, radius, analysis.darkThreshold)
+      : 0;
+    const crossExtensionStats = status === "filled"
+      ? diagonalCoverageStats(image, sourceCanvas.width, sourceCanvas.height,
+        analysis.cx, analysis.cy, radius, analysis.darkThreshold, 0.8, 1.8, 3)
+      : { min: 0, max: 0, average: 0 };
+    const crossOuterStats = status === "filled"
+      ? diagonalCoverageStats(image, sourceCanvas.width, sourceCanvas.height,
+        analysis.cx, analysis.cy, radius, analysis.darkThreshold, 1.0, 1.8, 3)
+      : { min: 0, max: 0, average: 0 };
+    // Handwritten Xs are often faint, skewed, and not centred on the bubble.
+    // Use a wider diagonal stroke and require dark ink outside the bubble so
+    // a normal filled circle does not become a false cross.
+    const crossed = status === "filled" && crossExtensionStats.max >= 0.5 &&
+      (crossOuterStats.max >= 0.5 || crossScore >= 0.75);
     annotations.push({ kind, label, question, x: analysis.cx, y: analysis.cy,
-      radius, status, confidence: Math.min(1, analysis.score / 35) });
+      radius, status, crossed, crossScore,
+      crossExtensionScore: crossExtensionStats.min,
+      crossExtensionMax: crossExtensionStats.max,
+      crossOuterScore: crossOuterStats.min,
+      crossOuterMax: crossOuterStats.max,
+      confidence: Math.min(1, analysis.score / 35) });
   };
   for (let column = 0; column < columns; column += 1) {
     const x = 27 + column * columnWidth + (currentLayout ? 30 : 33);
@@ -1014,7 +1043,50 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
   }
   const counts = { total: annotations.length, filled: 0, blank: 0, uncertain: 0 };
   for (const annotation of annotations) counts[annotation.status] += 1;
-  return { annotations, counts };
+  const answerData = resolveTemplateAnswers(annotations, questionCount);
+  return { annotations, counts, idSignals, answers: answerData.answers,
+    answerCounts: answerData.counts };
+}
+
+function resolveTemplateAnswers(annotations, questionCount) {
+  const byQuestion = new Map();
+  for (const annotation of annotations) {
+    if (annotation.kind !== "answer" || !Number.isInteger(annotation.question)) continue;
+    if (!byQuestion.has(annotation.question)) byQuestion.set(annotation.question, []);
+    byQuestion.get(annotation.question).push(annotation);
+  }
+  const answers = [];
+  const counts = { selected: 0, not_selected: 0, multiple: 0, crossed: 0 };
+  for (let question = 1; question <= questionCount; question += 1) {
+    const row = byQuestion.get(question) || [];
+    const green = row.filter((bubble) => bubble.status === "filled");
+    const uncrossedGreen = green.filter((bubble) => !bubble.crossed);
+    counts.crossed += green.filter((bubble) => bubble.crossed).length;
+    let response = "";
+    let status = "not_selected";
+    let reason = "No green filled circle was identified in this row.";
+    if (uncrossedGreen.length === 1) {
+      response = uncrossedGreen[0].label;
+      status = "selected";
+      reason = `Green filled circle identified: ${response}.`;
+      if (green.length > 1) {
+        const crossedLabels = green.filter((bubble) => bubble.crossed).map((bubble) => bubble.label).join(", ");
+        reason += ` Crossed green circle${crossedLabels ? ` (${crossedLabels})` : ""} excluded.`;
+      }
+    } else if (uncrossedGreen.length > 1) {
+      response = uncrossedGreen.map((bubble) => bubble.label).join(", ");
+      status = "multiple";
+      reason = `More than one uncrossed green filled circle identified (${response}).`;
+    } else if (green.length) {
+      reason = "All green filled circles in this row are crossed out.";
+    }
+    const corrected = status === "selected" && green.some((bubble) => bubble.crossed);
+    counts[status] += 1;
+    answers.push({ question, response, status, corrected, reason,
+      bubbles: row.map((bubble) => ({ label: bubble.label, status: bubble.status,
+        crossed: Boolean(bubble.crossed), crossScore: bubble.crossScore || 0 })) });
+  }
+  return { answers, counts };
 }
 
 async function createAnnotatedBubblePreview(sourceCanvas, annotationData) {
@@ -1044,6 +1116,17 @@ async function createAnnotatedBubblePreview(sourceCanvas, annotationData) {
       context.globalAlpha = 0.9;
       context.fill();
     }
+    if (bubble.crossed) {
+      context.beginPath();
+      context.moveTo((bubble.x - bubble.radius * 0.72) * scale, (bubble.y - bubble.radius * 0.72) * scale);
+      context.lineTo((bubble.x + bubble.radius * 0.72) * scale, (bubble.y + bubble.radius * 0.72) * scale);
+      context.moveTo((bubble.x + bubble.radius * 0.72) * scale, (bubble.y - bubble.radius * 0.72) * scale);
+      context.lineTo((bubble.x - bubble.radius * 0.72) * scale, (bubble.y + bubble.radius * 0.72) * scale);
+      context.lineWidth = Math.max(2, scale * 1.8);
+      context.strokeStyle = "#d9534f";
+      context.globalAlpha = 0.95;
+      context.stroke();
+    }
   };
 
   for (const bubble of annotationData?.annotations || []) drawBubble(bubble);
@@ -1056,7 +1139,7 @@ async function createAnnotatedBubblePreview(sourceCanvas, annotationData) {
   context.fillRect(preview.width - scale * 190, scale * 18, scale * 175, scale * 34);
   context.font = `bold ${fontSize}px sans-serif`;
   context.fillStyle = "#111";
-  context.fillText("green filled  blue blank  amber uncertain", preview.width - scale * 180, scale * 39);
+  context.fillText("green filled  blue blank  amber uncertain  red X crossed", preview.width - scale * 180, scale * 39);
   context.globalAlpha = 1;
 
   const blob = await new Promise((resolve, reject) => {
@@ -1249,7 +1332,7 @@ function rawBubbleGeometry(mapping, x, y, radius, scale) {
   return [center.x, center.y, mapTemplateRadius(mapping, x, y, radius)];
 }
 
-function rectifyPage(sourceCanvas, registrationPoints, markMargin = MARK_MARGIN) {
+function rectifyPage(sourceCanvas, registrationPoints, markMargin = MARK_MARGIN, suppliedImage = null) {
   const outputWidth = 1500;
   const outputHeight = Math.round(outputWidth * A4.height / A4.width);
   const scale = outputWidth / A4.width;
@@ -1265,7 +1348,7 @@ function rectifyPage(sourceCanvas, registrationPoints, markMargin = MARK_MARGIN)
   const inverse = forward && invertHomography(forward);
   if (!inverse) return null;
 
-  const sourceImage = sourceCanvas.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+  const sourceImage = suppliedImage || sourceCanvas.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
   const outputCanvas = document.createElement("canvas");
   outputCanvas.width = outputWidth;
   outputCanvas.height = outputHeight;
@@ -1274,10 +1357,13 @@ function rectifyPage(sourceCanvas, registrationPoints, markMargin = MARK_MARGIN)
   const out = outputImage.data;
   const input = sourceImage.data;
   for (let y = 0, offset = 0; y < outputHeight; y += 1) {
+    const rowDenominator = inverse[7] * y + inverse[8];
+    const rowSourceX = inverse[1] * y + inverse[2];
+    const rowSourceY = inverse[4] * y + inverse[5];
     for (let x = 0; x < outputWidth; x += 1, offset += 4) {
-      const denominator = inverse[6] * x + inverse[7] * y + inverse[8];
-      const sx = (inverse[0] * x + inverse[1] * y + inverse[2]) / denominator;
-      const sy = (inverse[3] * x + inverse[4] * y + inverse[5]) / denominator;
+      const denominator = inverse[6] * x + rowDenominator;
+      const sx = (inverse[0] * x + rowSourceX) / denominator;
+      const sy = (inverse[3] * x + rowSourceY) / denominator;
       const ix = Math.round(sx);
       const iy = Math.round(sy);
       if (ix >= 0 && ix < sourceCanvas.width && iy >= 0 && iy < sourceCanvas.height) {
@@ -1502,398 +1588,54 @@ function readAnswers(canvas, design, layoutVersion, coordinateMap = null) {
   return answers;
 }
 
-function readStudentId(canvas, layoutVersion, coordinateMap = null) {
-  if (![2, 3, 4].includes(layoutVersion)) return { studentId: "", raw: "", uncertainColumns: [] };
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const scale = canvas.width / A4.width;
-  const templateScale = coordinateMap ? 1500 / A4.width : scale;
-  const firstBubbleX = 27 + 2 + 34;
-  const firstRowY = A4.height - (A4.height - 145 - 13);
-  const rowPitch = [3, 4].includes(layoutVersion) ? 14.5 : 9.1;
+function readStudentIdFromSignals(idSignals, layoutVersion) {
+  if (![2, 3, 4].includes(layoutVersion) || !Array.isArray(idSignals) || idSignals.length < 90) {
+    return { studentId: "", raw: "", uncertainColumns: [] };
+  }
   let digits = "";
   const uncertainColumns = [];
-  const bubbleColumns = [];
   for (let column = 0; column < 9; column += 1) {
-    const bubbles = [];
-    for (let digit = 0; digit < 10; digit += 1) {
-      const bubble = sampleIdBubble(
-        image, canvas.width, canvas.height,
-        ...rawBubbleGeometry(
-          coordinateMap,
-          (firstBubbleX + column * 20.5) * templateScale,
-          (firstRowY + digit * rowPitch) * templateScale,
-          ([3, 4].includes(layoutVersion) ? 6.8 : 3.9) * templateScale,
-          scale,
-        ), String(digit),
-      );
-      bubbles.push(bubble);
-    }
+    const bubbles = idSignals.slice(column * 10, column * 10 + 10);
     const ranked = [...bubbles].sort((a, b) => b.signal - a.signal);
     const top = ranked[0];
     const second = ranked[1];
     const signalGap = top.signal - second.signal;
     const clearWinner = top.signal >= 0.28 && signalGap >= 0.07;
-    if (clearWinner) {
-      top.mark = "shaded";
-      digits += top.label;
-    }
-    else digits += "?";
-    const ambiguous = !clearWinner || second.signal >= top.signal * 0.88;
-    if (ambiguous) uncertainColumns.push(column + 1);
-    bubbleColumns.push(bubbles);
+    digits += clearWinner ? top.label : "?";
+    if (!clearWinner || second.signal >= top.signal * 0.88) uncertainColumns.push(column + 1);
   }
   return {
-    studentId: /^\d{9}$/.test(digits) ? digits : "", raw: digits,
-    uncertainColumns, bubbles: bubbleColumns,
+    studentId: /^\d{9}$/.test(digits) ? digits : "",
+    raw: digits,
+    uncertainColumns,
+    bubbles: idSignals,
   };
 }
 
-function sampleIdBubble(image, width, height, centerX, centerY, radius, label) {
-  const analysis = analyzeCircle(image, width, height, centerX, centerY, radius, 0.12);
-  let mark = "blank";
-  let confidence = 0.92;
-  if (analysis.fillRatio >= 0.3 && analysis.normalizedContrast >= 0.22) {
-    mark = "shaded";
-    confidence = Math.min(0.99, 0.62 + analysis.signal * 0.35);
-  } else if (analysis.fillRatio >= 0.14 && analysis.normalizedContrast >= 0.1) {
-    mark = "uncertain";
-    confidence = 0.48;
+function resolveStudentIdentity(bubbleIdentity) {
+  if (bubbleIdentity?.studentId) {
+    return { studentId: bubbleIdentity.studentId, status: "Student number read from the ID bubbles." };
   }
-  return { label, mark, confidence, fillRatio: analysis.fillRatio, crossScore: 0,
-    signal: analysis.signal, centerX: analysis.cx, centerY: analysis.cy };
+  if (bubbleIdentity?.raw) {
+    return { studentId: "", status: `Student-number bubbles need review (${bubbleIdentity.raw}).` };
+  }
+  return { studentId: "", status: "Student-number bubbles could not be read." };
 }
 
-function resolveWrittenIdentity(identity) {
-  if (identity.writtenStudentId) {
-    return { studentId: identity.writtenStudentId, status: "Student number read from the ID boxes." };
-  }
-  return { studentId: "", status: "Student number could not be read from the ID boxes." };
-}
 
-async function readWrittenIdentity(canvas, layoutVersion) {
-  if (![2, 3, 4].includes(layoutVersion)) return { printedName: "", writtenStudentId: "", digitOCR: "" };
-  const worker = await getOcrWorker();
-  const scale = canvas.width / A4.width;
-  const firstBubbleX = 27 + 2 + 34;
-  const boxTop = 117;
-  await worker.setParameters({
-    tessedit_char_whitelist: "0123456789",
-    tessedit_pageseg_mode: window.Tesseract.PSM.SINGLE_WORD,
-    classify_bln_numeric_mode: "1",
-    user_defined_dpi: "300",
-    load_system_dawg: "0",
-    load_freq_dawg: "0",
-  });
-  const digitCrops = [];
-  for (let column = 0; column < 9; column += 1) {
-    const centerX = firstBubbleX + column * 20.5;
-    digitCrops.push(cropForOcr(canvas,
-      (centerX - 8.5) * scale, (boxTop + 1.5) * scale,
-      17 * scale, 25 * scale, 5, null));
-  }
-  let digitOCR = "";
-  const strip = stitchOcrCrops(digitCrops);
-  try {
-    const lineCandidates = [];
-    await worker.setParameters({ tessedit_pageseg_mode: window.Tesseract.PSM.SINGLE_WORD });
-    const wordLine = await worker.recognize(strip);
-    lineCandidates.push(parseDigitLineCandidate(wordLine.data));
-    await worker.setParameters({ tessedit_pageseg_mode: window.Tesseract.PSM.RAW_LINE });
-    const rawLine = await worker.recognize(strip);
-    lineCandidates.push(parseDigitLineCandidate(rawLine.data));
-    digitOCR = chooseDigitLineCandidate(lineCandidates);
-    if (!/^\d{9}$/.test(digitOCR)) {
-      digitOCR = await readDigitCropsIndividually(worker, digitCrops);
-    }
-  } finally {
-    strip.width = 0;
-    strip.height = 0;
-    for (const crop of digitCrops) {
-      crop.width = 0;
-      crop.height = 0;
-    }
-  }
-  const writtenStudentId = /^\d{9}$/.test(digitOCR) ? digitOCR : "";
 
-  await worker.setParameters({
-    tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'- ",
-    tessedit_pageseg_mode: window.Tesseract.PSM.SINGLE_LINE,
-    preserve_interword_spaces: "1",
-    user_defined_dpi: "300",
-  });
-  const nameX = 287;
-  const nameY = A4.height - (620 + 36);
-  const nameCrop = cropForOcr(canvas,
-    (nameX + 7) * scale, (nameY + 4) * scale,
-    (281 - 14) * scale, 28 * scale, 3.5, null);
-  let printedName = "";
-  try {
-    const first = await worker.recognize(nameCrop);
-    const candidates = [parseNameCandidate(first.data)];
-    if (!candidates[0].text || candidates[0].confidence < 82) {
-      const binary = thresholdOcrCrop(nameCrop);
-      try {
-        const second = await worker.recognize(binary);
-        candidates.push(parseNameCandidate(second.data));
-      } finally {
-        binary.width = 0;
-        binary.height = 0;
-      }
-    }
-    printedName = chooseNameCandidate(candidates).text;
-  } finally {
-    nameCrop.width = 0;
-    nameCrop.height = 0;
-  }
-  return { printedName, writtenStudentId, digitOCR };
-}
 
-function cropForOcr(source, x, y, width, height, upscale, threshold = null) {
-  const crop = document.createElement("canvas");
-  crop.width = Math.max(1, Math.round(width * upscale));
-  crop.height = Math.max(1, Math.round(height * upscale));
-  const context = crop.getContext("2d", { willReadFrequently: true });
-  context.fillStyle = "white";
-  context.fillRect(0, 0, crop.width, crop.height);
-  context.imageSmoothingEnabled = true;
-  context.imageSmoothingQuality = "high";
-  context.drawImage(source, x, y, width, height, 0, 0, crop.width, crop.height);
-  const image = context.getImageData(0, 0, crop.width, crop.height);
-  for (let index = 0; index < image.data.length; index += 4) {
-    const gray = Math.round(image.data[index] * 0.299 + image.data[index + 1] * 0.587 + image.data[index + 2] * 0.114);
-    // Mixed-raster scanner PDFs can reach this point with handwriting around
-    // 235â€“250 gray because PDF.js lost their masked foreground layer. Expand
-    // darkness from the paper white point while retaining grayscale edges.
-    const enhanced = gray >= 254 ? 255 : Math.max(0, 255 - (254 - gray) * 8);
-    const value = threshold === null ? enhanced : enhanced < threshold ? 0 : 255;
-    image.data[index] = value;
-    image.data[index + 1] = value;
-    image.data[index + 2] = value;
-  }
-  context.putImageData(image, 0, 0);
-  return crop;
-}
 
-function stitchOcrCrops(crops) {
-  const trimmed = crops.map(trimDigitCrop);
-  const gap = Math.max(8, Math.round(crops[0]?.height * 0.14 || 24));
-  const strip = document.createElement("canvas");
-  strip.width = trimmed.reduce((total, crop) => total + crop.width, 0) + gap * Math.max(0, trimmed.length - 1);
-  strip.height = Math.max(1, ...crops.map((crop) => crop.height));
-  const context = strip.getContext("2d", { willReadFrequently: true });
-  context.fillStyle = "white";
-  context.fillRect(0, 0, strip.width, strip.height);
-  let x = 0;
-  for (const crop of trimmed) {
-    context.drawImage(crop, x, 0);
-    x += crop.width + gap;
-  }
-  for (const crop of trimmed) {
-    crop.width = 0;
-    crop.height = 0;
-  }
-  return strip;
-}
 
-function trimDigitCrop(crop) {
-  const context = crop.getContext("2d", { willReadFrequently: true });
-  const image = context.getImageData(0, 0, crop.width, crop.height);
-  let left = crop.width;
-  let right = -1;
-  for (let y = 0; y < crop.height; y += 1) {
-    for (let x = 0; x < crop.width; x += 1) {
-      if (image.data[(y * crop.width + x) * 4] < 242) {
-        if (x < left) left = x;
-        if (x > right) right = x;
-      }
-    }
-  }
-  if (right < left) {
-    const blank = document.createElement("canvas");
-    blank.width = crop.width;
-    blank.height = crop.height;
-    blank.getContext("2d").fillStyle = "white";
-    blank.getContext("2d").fillRect(0, 0, blank.width, blank.height);
-    return blank;
-  }
-  const padding = Math.round(crop.height * 0.1);
-  left = Math.max(0, left - padding);
-  right = Math.min(crop.width - 1, right + padding);
-  const trimmed = document.createElement("canvas");
-  trimmed.width = right - left + 1;
-  trimmed.height = crop.height;
-  const trimmedContext = trimmed.getContext("2d");
-  trimmedContext.fillStyle = "white";
-  trimmedContext.fillRect(0, 0, trimmed.width, trimmed.height);
-  trimmedContext.drawImage(crop, left, 0, trimmed.width, trimmed.height, 0, 0, trimmed.width, trimmed.height);
-  return trimmed;
-}
 
-async function readDigitCropsIndividually(worker, crops) {
-  const digits = [];
-  for (const crop of crops) {
-    await worker.setParameters({ tessedit_pageseg_mode: window.Tesseract.PSM.SINGLE_WORD });
-    const word = await worker.recognize(crop);
-    const candidates = [parseDigitCandidate(word.data)];
-    await worker.setParameters({ tessedit_pageseg_mode: window.Tesseract.PSM.SINGLE_CHAR });
-    const character = await worker.recognize(crop);
-    candidates.push(parseDigitCandidate(character.data));
-    await worker.setParameters({ tessedit_pageseg_mode: window.Tesseract.PSM.SINGLE_WORD });
-    if (candidates.some((candidate) => !candidate || candidate.confidence < 58)) {
-      const binary = thresholdOcrCrop(crop);
-      try {
-        const result = await worker.recognize(binary);
-        candidates.push(parseDigitCandidate(result.data));
-      } finally {
-        binary.width = 0;
-        binary.height = 0;
-      }
-    }
-    digits.push(chooseDigitCandidate(candidates).digit);
-  }
-  return digits.join("");
-}
 
-function thresholdOcrCrop(source) {
-  const crop = document.createElement("canvas");
-  crop.width = source.width;
-  crop.height = source.height;
-  const context = crop.getContext("2d", { willReadFrequently: true });
-  context.drawImage(source, 0, 0);
-  const image = context.getImageData(0, 0, crop.width, crop.height);
-  const histogram = new Uint32Array(256);
-  let count = 0;
-  for (let index = 0; index < image.data.length; index += 4) {
-    const gray = image.data[index];
-    histogram[gray] += 1;
-    count += 1;
-  }
-  let sum = 0;
-  for (let value = 0; value < 256; value += 1) sum += value * histogram[value];
-  let sumBackground = 0;
-  let weightBackground = 0;
-  let bestVariance = -1;
-  let threshold = 180;
-  for (let value = 0; value < 256; value += 1) {
-    weightBackground += histogram[value];
-    if (!weightBackground) continue;
-    const weightForeground = count - weightBackground;
-    if (!weightForeground) break;
-    sumBackground += value * histogram[value];
-    const meanBackground = sumBackground / weightBackground;
-    const meanForeground = (sum - sumBackground) / weightForeground;
-    const variance = weightBackground * weightForeground * (meanBackground - meanForeground) ** 2;
-    if (variance > bestVariance) {
-      bestVariance = variance;
-      threshold = value;
-    }
-  }
-  threshold = Math.max(100, Math.min(225, threshold));
-  for (let index = 0; index < image.data.length; index += 4) {
-    const value = image.data[index] < threshold ? 0 : 255;
-    image.data[index] = value;
-    image.data[index + 1] = value;
-    image.data[index + 2] = value;
-  }
-  context.putImageData(image, 0, 0);
-  return crop;
-}
 
-function parseDigitCandidate(data) {
-  const token = String(data?.text || "").replace(/\s/g, "");
-  if (!/^\d$/.test(token)) return null;
-  return { digit: token, confidence: Number(data.confidence) || 0 };
-}
 
-function parseDigitLineCandidate(data) {
-  const digits = String(data?.text || "").replace(/\D/g, "");
-  if (!/^\d{9}$/.test(digits)) return null;
-  return { digits, confidence: Number(data?.confidence) || 0 };
-}
 
-function chooseDigitLineCandidate(candidates) {
-  const valid = candidates.filter(Boolean).sort((a, b) => b.confidence - a.confidence);
-  if (!valid.length) return "";
-  if (valid.length > 1 && valid[0].digits !== valid[1].digits &&
-      valid[0].confidence - valid[1].confidence < 18) return "";
-  return valid[0].confidence >= 30 ? valid[0].digits : "";
-}
 
-function chooseDigitCandidate(candidates) {
-  const valid = candidates.filter(Boolean).sort((a, b) => b.confidence - a.confidence);
-  if (!valid.length) return { digit: "?", confidence: 0 };
-  const counts = new Map();
-  for (const candidate of valid) {
-    const group = counts.get(candidate.digit) || { count: 0, confidence: 0 };
-    group.count += 1;
-    group.confidence = Math.max(group.confidence, candidate.confidence);
-    counts.set(candidate.digit, group);
-  }
-  const ranked = [...counts.entries()].sort((a, b) =>
-    b[1].count - a[1].count || b[1].confidence - a[1].confidence);
-  const [digit, best] = ranked[0];
-  const runnerUp = ranked[1]?.[1];
-  if (runnerUp && best.count === runnerUp.count && best.confidence - runnerUp.confidence < 18) {
-    return { digit: "?", confidence: best.confidence };
-  }
-  return best.confidence >= 35 ? { digit, confidence: best.confidence } : { digit: "?", confidence: best.confidence };
-}
 
-function parseNameCandidate(data) {
-  const text = String(data?.text || "")
-    .replace(/[^\p{L}' -]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return { text, confidence: Number(data?.confidence) || 0 };
-}
 
-function chooseNameCandidate(candidates) {
-  const valid = candidates.filter((candidate) => candidate.text).sort((a, b) => b.confidence - a.confidence);
-  if (valid.length > 1 && valid[0].text !== valid[1].text &&
-      valid[0].confidence - valid[1].confidence < 12) {
-    return { text: valid[0].text, confidence: valid[0].confidence, uncertain: true };
-  }
-  return valid[0] || { text: "", confidence: 0, uncertain: true };
-}
 
-async function getOcrWorker() {
-  if (ocrUnavailableReason) throw new Error(ocrUnavailableReason);
-  if (!window.Tesseract) {
-    ocrUnavailableReason = "Local handwriting recognition is unavailable.";
-    throw new Error(ocrUnavailableReason);
-  }
-  if (!ocrWorkerPromise) {
-    const assetUrl = (path) => new URL(path, import.meta.url).toString();
-    const langPath = assetUrl("./vendor/tesseract/lang").replace(/\/$/, "");
-    ocrWorkerPromise = window.Tesseract.createWorker("eng", window.Tesseract.OEM.LSTM_ONLY, {
-      workerPath: assetUrl("./vendor/tesseract/worker.min.js"),
-      corePath: assetUrl("./vendor/tesseract/tesseract-core-lstm.wasm.js"),
-      langPath,
-      gzip: true,
-      cacheMethod: "none",
-    });
-  }
-  try {
-    return await ocrWorkerPromise;
-  } catch (error) {
-    ocrUnavailableReason = error.message || "Local handwriting recognition could not start.";
-    ocrWorkerPromise = null;
-    throw error;
-  }
-}
-
-async function releaseOcrWorker() {
-  const workerPromise = ocrWorkerPromise;
-  ocrWorkerPromise = null;
-  if (!workerPromise) return;
-  try {
-    const worker = await workerPromise;
-    await worker.terminate();
-  } catch (_) {
-    // OCR may have failed to initialize; PDF and bubble scanning can still finish.
-  }
-}
 
 function sampleBubble(image, width, height, centerX, centerY, radius, label) {
   const analysis = analyzeCircle(image, width, height, centerX, centerY, radius);
@@ -1930,30 +1672,34 @@ function analyzeCircle(image, width, height, expectedX, expectedY, radius, searc
     for (const dx of offsets) {
       const cx = Math.round(expectedX + dx);
       const cy = Math.round(expectedY + dy);
-      const ring = radialGraySamples(image, width, height, cx, cy, r, 0.78, 1.12);
-      const outside = radialGraySamples(image, width, height, cx, cy, r, 1.3, 1.62);
-      if (!ring.length || !outside.length) continue;
-      const paper = percentile(outside, 0.75);
-      const outline = percentile(ring, 0.2);
+      const edgeSamples = radialRingStats(image, width, height, cx, cy, r);
+      if (!edgeSamples.ringCount || !edgeSamples.outsideCount) continue;
+      const paper = histogramPercentile(edgeSamples.outsideHistogram,
+        edgeSamples.outsideCount, 0.75);
+      const outline = histogramPercentile(edgeSamples.ringHistogram,
+        edgeSamples.ringCount, 0.2);
       const offsetPenalty = Math.hypot(dx, dy) / r * 0.35;
       const score = paper - outline - offsetPenalty;
-      if (!best || score > best.score) best = { cx, cy, score, ring, outside };
+      if (!best || score > best.score) best = { cx, cy, score, edgeSamples };
     }
   }
   if (!best) {
     best = {
       cx: Math.round(expectedX), cy: Math.round(expectedY), score: 0,
-      ring: [], outside: [],
+      edgeSamples: { ringHistogram: new Uint32Array(256), ringCount: 0,
+        outsideHistogram: new Uint32Array(256), outsideCount: 0 },
     };
   }
-  const inside = radialGraySamples(image, width, height, best.cx, best.cy, r, 0, 0.62);
-  const paper = percentile(best.outside, 0.75) || 255;
-  const outline = percentile(best.ring, 0.2) || Math.max(0, paper - 16);
+  const inside = radialStats(image, width, height, best.cx, best.cy, r, 0, 0.62);
+  const paper = histogramPercentile(best.edgeSamples.outsideHistogram,
+    best.edgeSamples.outsideCount, 0.75) || 255;
+  const outline = histogramPercentile(best.edgeSamples.ringHistogram,
+    best.edgeSamples.ringCount, 0.2) || Math.max(0, paper - 16);
   const outlineSpan = Math.max(2, paper - outline);
   const darkThreshold = paper - Math.max(1.5, outlineSpan * 0.28);
-  const darkPixels = inside.filter((gray) => gray < darkThreshold).length;
-  const fillRatio = darkPixels / Math.max(1, inside.length);
-  const insideMean = inside.reduce((total, gray) => total + gray, 0) / Math.max(1, inside.length);
+  const darkPixels = histogramCountBelow(inside.histogram, darkThreshold);
+  const fillRatio = darkPixels / Math.max(1, inside.count);
+  const insideMean = inside.sum / Math.max(1, inside.count);
   const normalizedContrast = Math.max(0, Math.min(1.5, (paper - insideMean) / outlineSpan));
   const signal = Math.min(1, fillRatio * 0.72 + Math.min(1, normalizedContrast) * 0.28);
   return {
@@ -1962,34 +1708,96 @@ function analyzeCircle(image, width, height, expectedX, expectedY, radius, searc
   };
 }
 
-function radialGraySamples(image, width, height, cx, cy, radius, innerScale, outerScale) {
-  const samples = [];
-  const inner = radius * innerScale;
-  const outer = radius * outerScale;
-  const limit = Math.ceil(outer);
+function radialRingStats(image, width, height, cx, cy, radius) {
+  const ringHistogram = new Uint32Array(256);
+  const outsideHistogram = new Uint32Array(256);
+  const ringInner = radius * 0.78;
+  const ringOuter = radius * 1.12;
+  const outsideInner = radius * 1.3;
+  const outsideOuter = radius * 1.62;
+  const ringInner2 = ringInner * ringInner;
+  const ringOuter2 = ringOuter * ringOuter;
+  const outsideInner2 = outsideInner * outsideInner;
+  const outsideOuter2 = outsideOuter * outsideOuter;
+  const limit = Math.ceil(outsideOuter);
+  let ringCount = 0;
+  let outsideCount = 0;
   for (let dy = -limit; dy <= limit; dy += 1) {
     for (let dx = -limit; dx <= limit; dx += 1) {
-      const distance = Math.hypot(dx, dy);
-      if (distance < inner || distance > outer) continue;
+      const distance2 = dx * dx + dy * dy;
+      const inRing = distance2 >= ringInner2 && distance2 <= ringOuter2;
+      const outside = distance2 >= outsideInner2 && distance2 <= outsideOuter2;
+      if (!inRing && !outside) continue;
       const px = cx + dx;
       const py = cy + dy;
       if (px < 0 || px >= width || py < 0 || py >= height) continue;
-      samples.push(grayAt(image.data, py * width + px));
+      const gray = Math.max(0, Math.min(255, Math.round(grayAt(image.data, py * width + px))));
+      if (inRing) {
+        ringHistogram[gray] += 1;
+        ringCount += 1;
+      } else {
+        outsideHistogram[gray] += 1;
+        outsideCount += 1;
+      }
     }
   }
-  return samples;
+  return { ringHistogram, ringCount, outsideHistogram, outsideCount };
 }
 
-function percentile(values, fraction) {
-  if (!values.length) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * fraction)))];
+function radialStats(image, width, height, cx, cy, radius, innerScale, outerScale) {
+  const histogram = new Uint32Array(256);
+  const inner = radius * innerScale;
+  const outer = radius * outerScale;
+  const inner2 = inner * inner;
+  const outer2 = outer * outer;
+  const limit = Math.ceil(outer);
+  let count = 0;
+  let sum = 0;
+  for (let dy = -limit; dy <= limit; dy += 1) {
+    for (let dx = -limit; dx <= limit; dx += 1) {
+      const distance2 = dx * dx + dy * dy;
+      if (distance2 < inner2 || distance2 > outer2) continue;
+      const px = cx + dx;
+      const py = cy + dy;
+      if (px < 0 || px >= width || py < 0 || py >= height) continue;
+      const gray = Math.max(0, Math.min(255, Math.round(grayAt(image.data, py * width + px))));
+      histogram[gray] += 1;
+      sum += gray;
+      count += 1;
+    }
+  }
+  return { histogram, count, sum };
 }
 
-function relativeDiagonalCoverage(image, width, height, cx, cy, radius, darkThreshold) {
-  const start = Math.max(2, Math.round(radius * 0.5));
-  const end = Math.round(radius * 1.5);
-  let weakerDiagonal = 1;
+function histogramPercentile(histogram, count, fraction) {
+  if (!count) return 0;
+  const target = Math.floor((count - 1) * fraction);
+  let seen = 0;
+  for (let gray = 0; gray < histogram.length; gray += 1) {
+    seen += histogram[gray];
+    if (seen > target) return gray;
+  }
+  return histogram.length - 1;
+}
+
+function histogramCountBelow(histogram, threshold) {
+  let count = 0;
+  const limit = Math.max(0, Math.min(histogram.length, Math.ceil(threshold)));
+  for (let gray = 0; gray < limit; gray += 1) count += histogram[gray];
+  return count;
+}
+
+function relativeDiagonalCoverage(image, width, height, cx, cy, radius, darkThreshold,
+  startScale = 0.5, endScale = 1.5) {
+  return diagonalCoverageStats(image, width, height, cx, cy, radius, darkThreshold,
+    startScale, endScale).min;
+}
+
+function diagonalCoverageStats(image, width, height, cx, cy, radius, darkThreshold,
+  startScale = 0.5, endScale = 1.5, lineHalfWidth = 1) {
+  const start = Math.max(2, Math.round(radius * startScale));
+  const end = Math.round(radius * endScale);
+  const diagonalRatios = [];
   for (const direction of [1, -1]) {
     let hits = 0;
     let samples = 0;
@@ -1998,7 +1806,7 @@ function relativeDiagonalCoverage(image, width, height, cx, cy, radius, darkThre
         const dx = Math.round(distance / Math.sqrt(2)) * sign;
         const dy = Math.round(distance / Math.sqrt(2)) * sign * direction;
         let dark = false;
-        for (let offset = -1; offset <= 1; offset += 1) {
+        for (let offset = -lineHalfWidth; offset <= lineHalfWidth; offset += 1) {
           const px = cx + dx + offset;
           const py = cy + dy - offset * direction;
           if (px < 0 || px >= width || py < 0 || py >= height) continue;
@@ -2008,9 +1816,11 @@ function relativeDiagonalCoverage(image, width, height, cx, cy, radius, darkThre
         samples += 1;
       }
     }
-    weakerDiagonal = Math.min(weakerDiagonal, samples ? hits / samples : 0);
+    diagonalRatios.push(samples ? hits / samples : 0);
   }
-  return weakerDiagonal;
+  const min = Math.min(...diagonalRatios);
+  const max = Math.max(...diagonalRatios);
+  return { min, max, average: (min + max) / 2 };
 }
 
 function sampleBubbleLegacy(image, width, height, centerX, centerY, radius, label) {
@@ -2205,9 +2015,10 @@ function isDummyAnswerKey(sheet) {
 
 function identitySummary(sheet) {
   const learner = matchedLearner(sheet);
+  const recognizedStudentId = sheet.studentId || sheet.bubbleStudentId || sheet.writtenStudentId;
   const parts = [
     learner ? `Roster identity confirmed: ${learner.name}` : `Printed name: ${sheet.printedName || "not read"}`,
-    `Student number from boxes: ${sheet.writtenStudentId || "not read"}`,
+    `Student number: ${recognizedStudentId || "not read"}`,
     sheet.idMatchStatus || "",
   ];
   if (learner) parts.push(`Matched SIS number: ${learner.student_id}`);
@@ -2239,7 +2050,7 @@ function renderGradeWorkspace() {
   if (!formSheets.length) {
     gradeSummary.textContent = `${scanSet.sourceName || "Scan set"}: no student scans.${issueNote}`;
   } else {
-    gradeSummary.textContent = `${scanSet.sourceName || "Scan set"} · ${studentSheets.length} student scan(s) ready for raw annotation review.${issueNote}`;
+    gradeSummary.textContent = `${scanSet.sourceName || "Scan set"} · ${studentSheets.length} student scan(s) ready for answer review.${issueNote}`;
   }
   renderRosterTable();
 }
@@ -2251,8 +2062,16 @@ function getGradeKeyForScan(sheet) {
 
 function gradeLabelForScan(sheet) {
   if (sheet.rawScanVersion !== RAW_SCAN_VERSION) return "Rescan required";
+  const answerKey = getGradeKeyForScan(sheet);
+  if (answerKey && answerKey.id !== sheet.id && Array.isArray(sheet.answers) && sheet.answers.length) {
+    const grade = gradeForSheet(sheet, answerKey);
+    return `${grade.correct}/${grade.total} correct · ${grade.review} review · ${grade.total - grade.correct - grade.review} incorrect`;
+  }
   const counts = sheet.annotationCounts || { total: (sheet.annotations || []).length, filled: 0, blank: 0, uncertain: 0 };
-  return `${counts.total} circles / ${counts.filled || 0} filled / ${counts.uncertain || 0} uncertain`;
+  const answerCounts = sheet.answerCounts || {};
+  return `${counts.total} circles / ${counts.filled || 0} filled / ${counts.uncertain || 0} uncertain · ` +
+    `${answerCounts.selected || 0} selected / ${answerCounts.not_selected || 0} not selected / ${answerCounts.multiple || 0} multiple` +
+    (answerCounts.crossed ? ` / ${answerCounts.crossed} crossed` : "");
 }
 
 function renderRosterTable() {
@@ -2282,7 +2101,8 @@ function renderRosterTable() {
       ? `IDs match multiple roster students: ${candidates.map((learner) => learner.name).join(", ")}`
       : !courseRoster.length ? "Course roster unavailable for cross-reference"
         : sheet.studentId ? `ID ${sheet.studentId} not on course roster` : "No confirmed roster ID";
-    const idNote = [sheet.idMatchStatus, sheet.writtenStudentId ? `ID boxes ${sheet.writtenStudentId}` : "ID boxes unreadable",
+    const idNote = [sheet.idMatchStatus,
+      sheet.bubbleStudentId ? `ID bubbles ${sheet.bubbleStudentId}` : sheet.writtenStudentId ? `ID boxes ${sheet.writtenStudentId}` : "ID unreadable",
       rosterNote]
       .filter(Boolean).join(" · ");
     appendRosterRow("Student not identified", idNote,
@@ -2349,7 +2169,12 @@ function openScanPreview(sheet) {
   resetOriginalScanPreview();
   previewedSheetId = sheet.id;
   scanPreviewTitle.textContent = `${studentNameFor(sheet)} · ${sheet.formTitle}`;
-  scanPreviewMeta.textContent = `${sheet.sourceFile} · page ${sheet.pageNo} · ${identitySummary(sheet)}`;
+  const answerKey = getGradeKeyForScan(sheet);
+  const sheetGrade = answerKey && answerKey.id !== sheet.id ? gradeForSheet(sheet, answerKey) : null;
+  const gradeSummaryText = sheetGrade
+    ? ` · ${sheetGrade.correct}/${sheetGrade.total} correct`
+    : "";
+  scanPreviewMeta.textContent = `${sheet.sourceFile} · page ${sheet.pageNo} · ${identitySummary(sheet)}${gradeSummaryText}`;
   originalScanToggle.hidden = false;
   originalScanToggle.disabled = true;
   const hasCurrentRawPage = sheet.rawScanVersion === RAW_SCAN_VERSION && sheet.rawPage instanceof Blob;
@@ -2365,17 +2190,51 @@ function openScanPreview(sheet) {
     showOriginalScanBlob(sheet, sheet.rawPage);
   }
   scanPreviewContent.replaceChildren();
-  const annotationCounts = sheet.annotationCounts || (sheet.annotations || []).reduce((result, item) => {
-    result.total += 1;
-    if (result[item.status] !== undefined) result[item.status] += 1;
-    return result;
-  }, { total: 0, filled: 0, blank: 0, uncertain: 0 });
-  const annotationReview = document.createElement("p");
-  annotationReview.className = "field-help";
-  annotationReview.textContent = sheet.rawScanVersion === RAW_SCAN_VERSION
-    ? `Raw annotation review: ${annotationCounts.total} circles detected · ${annotationCounts.filled} filled · ${annotationCounts.blank} blank · ${annotationCounts.uncertain} uncertain. Answer choices are intentionally unavailable while the new reader is being validated.`
-    : "This saved scan was created by the retired reader. Rescan it to create a raw annotation record; old answer results are not trusted.";
-  scanPreviewContent.append(annotationReview);
+  if (sheet.rawScanVersion !== RAW_SCAN_VERSION) {
+    const legacyNotice = document.createElement("p");
+    legacyNotice.className = "field-help";
+    legacyNotice.textContent = "This saved scan was created by the retired reader; rescan it to create a current answer result.";
+    scanPreviewContent.append(legacyNotice);
+  }
+  if (sheet.rawScanVersion === RAW_SCAN_VERSION && Array.isArray(sheet.answers) && sheet.answers.length) {
+    const tableWrap = document.createElement("div");
+    tableWrap.className = "scan-results-table-wrap";
+    const table = document.createElement("table");
+    table.className = "scan-results-table";
+    const header = document.createElement("thead");
+    const headerRow = document.createElement("tr");
+    for (const label of ["Question", "Scanned answer", "Correct answer", "Result"]) {
+      const cell = document.createElement("th");
+      cell.scope = "col";
+      cell.textContent = label;
+      headerRow.append(cell);
+    }
+    header.append(headerRow);
+    const body = document.createElement("tbody");
+    const gradedAnswers = sheetGrade?.gradedAnswers || [];
+    for (const [index, answer] of sheet.answers.entries()) {
+      const row = document.createElement("tr");
+      const question = document.createElement("th");
+      question.scope = "row";
+      question.textContent = String(answer.question);
+      const scanned = document.createElement("td");
+      scanned.textContent = answerDisplayValue(answer.response) +
+        (answer.corrected ? " (crossed correction)" : "");
+      scanned.className = `scan-answer-status ${answer.status}`;
+      const correct = document.createElement("td");
+      const grade = gradedAnswers[index];
+      correct.textContent = grade ? answerDisplayValue(grade.correctAnswer?.response) : "—";
+      const result = document.createElement("td");
+      result.textContent = grade ? gradeResultLabel(grade.status, answer.corrected) : "Not graded";
+      result.className = `scan-answer-result ${grade?.status || "ungraded"}`;
+      result.title = answer.reason;
+      row.append(question, scanned, correct, result);
+      body.append(row);
+    }
+    table.append(header, body);
+    tableWrap.append(table);
+    scanPreviewContent.append(tableWrap);
+  }
   if (sheet.rawScanVersion !== RAW_SCAN_VERSION) {
     if (!scanPreviewDialog.open) scanPreviewDialog.showModal();
     return;
@@ -2391,6 +2250,16 @@ function showOriginalScanBlob(sheet, blob) {
   originalScanImage.alt = `Annotated scanned page from ${sheet.sourceFile}, page ${sheet.pageNo}`;
   originalScanToggle.disabled = false;
   originalScanToggle.textContent = "View raw annotated scan";
+}
+
+function answerDisplayValue(response) {
+  return response || "Not selected";
+}
+
+function gradeResultLabel(status, corrected = false) {
+  if (status === "correct") return corrected ? "Correct (crossed correction)" : "Correct";
+  if (status === "review") return "Review";
+  return "Incorrect";
 }
 
 async function prepareReadableScanPreview(sheet) {
@@ -2535,9 +2404,13 @@ async function refreshSavedAnnotations() {
       }
       if (JSON.stringify(sheet.annotations || []) !== JSON.stringify(annotationData.annotations) ||
           JSON.stringify(sheet.annotationCounts || {}) !== JSON.stringify(annotationData.counts) ||
+          JSON.stringify(sheet.answers || []) !== JSON.stringify(annotationData.answers) ||
+          JSON.stringify(sheet.answerCounts || {}) !== JSON.stringify(annotationData.answerCounts) ||
           sheet.annotationVersion !== ANNOTATION_VERSION) {
         sheet.annotations = annotationData.annotations;
         sheet.annotationCounts = annotationData.counts;
+        sheet.answers = annotationData.answers;
+        sheet.answerCounts = annotationData.answerCounts;
         sheet.annotationVersion = ANNOTATION_VERSION;
         changed = true;
       }
