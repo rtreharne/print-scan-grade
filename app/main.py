@@ -1,5 +1,6 @@
 """Print Scan Grade: a small LTI 1.3 launch app."""
 import json
+import math
 import os
 import random
 import re
@@ -38,7 +39,7 @@ DATABASE = DATA_DIR / "print-scan-grade.sqlite3"
 KEY_FILE = DATA_DIR / "tool-private.pem"
 LTI = "https://purl.imsglobal.org/spec/lti/claim/"
 LTI_DEEP_LINKING = "https://purl.imsglobal.org/spec/lti-dl/claim/"
-SHEET_LAYOUT_VERSION = 4
+SHEET_LAYOUT_VERSION = 7
 LEGACY_SHEET_LAYOUT_VERSION = 1
 NRPS_SCOPE = "https://purl.imsglobal.org/spec/lti-nrps/scope/contextmembership.readonly"
 NRPS_CLAIM = "https://purl.imsglobal.org/spec/lti-nrps/claim/namesroleservice"
@@ -81,6 +82,39 @@ def base_url():
     return os.getenv("TOOL_BASE_URL", "http://localhost:8004").rstrip("/")
 
 
+def environment_platforms():
+    """Load both the current single-platform and legacy JSON configuration."""
+    result = {}
+    legacy = os.getenv("LTI_PLATFORM_REGISTRATIONS", "").strip()
+    if legacy:
+        raw = json.loads(legacy)
+        if not isinstance(raw, list):
+            raise ValueError("LTI_PLATFORM_REGISTRATIONS must be a JSON array")
+        for item in raw:
+            if not isinstance(item, dict) or not str(item.get("issuer", "")).strip():
+                raise ValueError("Each LTI platform registration must have an issuer")
+            issuer = str(item["issuer"]).strip().rstrip("/")
+            platform = dict(item)
+            platform["issuer"] = issuer
+            platform["deployment_ids"] = list(item.get("deployment_ids") or [])
+            platform["client_ids"] = list(item.get("client_ids") or [])
+            if item.get("client_id") and item["client_id"] not in platform["client_ids"]:
+                platform["client_ids"].append(item["client_id"])
+            result[issuer] = platform
+
+    configured_issuer = os.getenv("LTI_PLATFORM_ISSUER", "").strip().rstrip("/")
+    if configured_issuer:
+        result[configured_issuer] = {
+            "issuer": configured_issuer,
+            "authorization_endpoint": os.getenv("LTI_PLATFORM_AUTHORIZATION_ENDPOINT", "").strip(),
+            "jwks_url": os.getenv("LTI_PLATFORM_JWKS_URL", "").strip(),
+            "token_endpoint": os.getenv("LTI_PLATFORM_TOKEN_ENDPOINT", "").strip(),
+            "deployment_ids": [],
+            "client_ids": [],
+        }
+    return result
+
+
 def connect():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DATABASE)
@@ -103,6 +137,10 @@ def connect():
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             UNIQUE (issuer, client_id)
+        );
+        CREATE TABLE IF NOT EXISTS app_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS exam_designs (
             form_id TEXT PRIMARY KEY,
@@ -127,6 +165,34 @@ def connect():
             PRIMARY KEY (issuer, context_id)
         );
     """)
+    # Releases before lti_clients was introduced stored only deployment rows.
+    # Once endpoint metadata is available, retain those clients in the new
+    # registration table so existing launches continue to work and appear in
+    # the admin UI.
+    now = int(time.time())
+    for issuer, platform in environment_platforms().items():
+        migration_name = f"deployment-clients:{issuer}"
+        if db.execute(
+                "SELECT 1 FROM app_migrations WHERE name=?", (migration_name,)
+        ).fetchone():
+            continue
+        endpoints = tuple(platform.get(key, "") for key in (
+            "authorization_endpoint", "jwks_url", "token_endpoint"
+        ))
+        if not all(endpoints):
+            continue
+        db.execute(
+            "INSERT OR IGNORE INTO lti_clients "
+            "(name, issuer, client_id, authorization_endpoint, jwks_url, token_endpoint, created_at, updated_at) "
+            "SELECT ? || ' / ' || client_id, issuer, client_id, ?, ?, ?, ?, ? "
+            "FROM deployments WHERE issuer=?",
+            (issuer, *endpoints, now, now, issuer),
+        )
+        db.execute(
+            "INSERT INTO app_migrations (name, applied_at) VALUES (?, ?)",
+            (migration_name, now),
+        )
+    db.commit()
     return db
 
 
@@ -136,16 +202,7 @@ def platforms():
             "SELECT issuer, client_id, authorization_endpoint, jwks_url, token_endpoint "
             "FROM lti_clients WHERE enabled=1 ORDER BY id"
         ).fetchall()
-    result = {}
-    configured_issuer = os.getenv("LTI_PLATFORM_ISSUER", "").strip().rstrip("/")
-    if configured_issuer:
-        result[configured_issuer] = {
-            "issuer": configured_issuer,
-            "authorization_endpoint": os.getenv("LTI_PLATFORM_AUTHORIZATION_ENDPOINT", "").strip(),
-            "jwks_url": os.getenv("LTI_PLATFORM_JWKS_URL", "").strip(),
-            "token_endpoint": os.getenv("LTI_PLATFORM_TOKEN_ENDPOINT", "").strip(),
-            "deployment_ids": [], "client_ids": [],
-        }
+    result = environment_platforms()
     for row in rows:
         platform = result.setdefault(row["issuer"].rstrip("/"), {
             "issuer": row["issuer"].rstrip("/"),
@@ -156,11 +213,6 @@ def platforms():
         })
         if row["client_id"] not in platform.get("client_ids", []):
             platform.setdefault("client_ids", []).append(row["client_id"])
-    with connect() as db:
-        for row in db.execute("SELECT issuer, client_id, deployment_id FROM deployments"):
-            platform = result.get(row["issuer"])
-            if platform and row["deployment_id"] not in platform["deployment_ids"]:
-                platform["deployment_ids"].append(row["deployment_id"])
     return result
 
 
@@ -254,7 +306,7 @@ def is_learner_role(role):
 
 def fetch_active_learners(context):
     memberships_url = context.get("nrps_url")
-    platform = platforms().get(context["issuer"])
+    platform = platform_client(context["issuer"], context.get("client_id")) or platforms().get(context["issuer"])
     token_url = (platform or {}).get("token_endpoint", "")
     if not memberships_url or not token_url:
         raise ValueError("Update the MiniVLE tool registration to grant the course roster read scope, then reopen this page.")
@@ -689,14 +741,15 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
     pdf.drawString(grid_x, height - 99, "Write one digit in each box. Shade the matching row below.")
     box_y, box_w, box_h = height - 145, 19, 28
     pdf.setLineWidth(0.85)
+    student_id = str(sample_response.get("student_id") or "") if sample_response else ""
     for index in range(9):
         center_x = first_bubble_x + index * col_pitch
         box_x = center_x - box_w / 2
         pdf.rect(box_x, box_y, box_w, box_h, fill=0, stroke=1)
-        if sample_response:
+        if sample_response and index < len(student_id):
             pdf.setFillColorRGB(0.08, 0.08, 0.08)
             pdf.setFont(sample_response["font"], 15)
-            pdf.drawCentredString(center_x, box_y + 8, sample_response["student_id"][index])
+            pdf.drawCentredString(center_x, box_y + 8, student_id[index])
             pdf.setFillColorRGB(0, 0, 0)
     # Match the answer bubbles and give the ten digit rows enough vertical room
     # that their outlines and 12pt guide letters never touch.
@@ -707,7 +760,11 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
         y = first_row_y - digit * row_pitch
         pdf.drawRightString(first_bubble_x - 12, y - 2, str(digit))
         for column in range(9):
-            selected_digit = sample_response and int(sample_response["student_id"][column]) == digit
+            selected_digit = bool(
+                sample_response and sample_response.get("fill_id_bubbles", True) and
+                column < len(student_id) and student_id[column].isdigit() and
+                int(student_id[column]) == digit
+            )
             pdf.circle(
                 first_bubble_x + column * col_pitch,
                 y,
@@ -743,14 +800,46 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
     question_grid_top = question_top - 50
     column_width = (right - left) / columns
     row_pitch = min(31, max(12, (question_grid_top - question_bottom) / max(1, rows_per_column - 1)))
-    bubble_radius = FORM_BUBBLE_RADIUS
+    # In the uniquely dense four-column A–H layout, a modestly smaller answer
+    # bubble preserves a real gap between columns. ID bubbles stay full size.
+    if layout_version >= 7:
+        max_answer_radius = (
+            column_width - 35 - 8 - max(0, design["choice_count"] - 1) * 0.75
+        ) / (2 * design["choice_count"] - 1)
+        bubble_radius = max(5.5, min(FORM_BUBBLE_RADIUS, max_answer_radius))
+    else:
+        bubble_radius = FORM_BUBBLE_RADIUS
     row_offset = (question_grid_top - question_bottom - (rows_per_column - 1) * row_pitch) / 2
     for column in range(columns):
         x = left + column * column_width
         pdf.setFillColorRGB(0, 0, 0)
         pdf.setFont("Helvetica-Bold", 6)
-        answer_start = x + 30
-        answer_pitch = min(20.5, (column_width - 34) / max(1, design["choice_count"] - 1))
+        # Layout 5 moves the first choice bubble right, giving the question
+        # number a clear visual gap even when all A–H choices are present.
+        # Layout 6 reserves space after the final bubble before the next
+        # column's question number; layout 7 keeps that space even in dense
+        # A–H grids. Keep prior geometry for older QR layouts so their scans
+        # remain valid.
+        if layout_version >= 5:
+            answer_start = x + 35
+            requested_trailing_gap = 8 if layout_version >= 6 else 0
+            # Never make adjacent bubbles overlap just to create a column
+            # gutter in a particularly dense (for example, 60-question A–H)
+            # sheet.
+            minimum_pitch = bubble_radius * 2 + 0.75
+            trailing_gap = max(0, min(
+                requested_trailing_gap,
+                column_width - (answer_start - x) - bubble_radius -
+                max(0, design["choice_count"] - 1) * minimum_pitch,
+            ))
+            answer_pitch = min(
+                20.5,
+                (column_width - (answer_start - x) - bubble_radius - trailing_gap) /
+                max(1, design["choice_count"] - 1),
+            )
+        else:
+            answer_start = x + 30
+            answer_pitch = min(20.5, (column_width - 34) / max(1, design["choice_count"] - 1))
         for choice in range(design["choice_count"]):
             pdf.drawCentredString(answer_start + choice * answer_pitch, question_top - 16,
                                   chr(ord("A") + choice))
@@ -771,18 +860,33 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
                     selected_choice = answer_key[question_number - 1] if answer_key else (
                         question_number + sample_response["seed"]
                     ) % design["choice_count"]
-                    selected = choice == selected_choice
+                    crossed_choice = sample_response.get("crossed_answers", {}).get(question_number)
+                    extra_choices = sample_response.get("additional_answers", {}).get(question_number, [])
+                    selected = (choice == selected_choice or choice == crossed_choice or
+                                choice in extra_choices)
                 else:
                     selected = False
                 bubble_x = answer_start + choice * answer_pitch
                 pdf.circle(bubble_x, y, bubble_radius, fill=0, stroke=1)
                 pdf.setFillColorRGB(0.74, 0.74, 0.74)
-                pdf.setFont("Helvetica-Bold", 5)
+                # These letters are deliberately tiny, pale guides inside the
+                # answer bubbles. The minimum-font canvas must not enlarge
+                # them, or the scanner can mistake the printed glyphs for marks.
+                pdf.setFontExact("Helvetica-Bold", 5)
                 pdf.drawCentredString(bubble_x, y - 3.5, chr(ord("A") + choice))
                 if selected:
                     # Sample marks cover the printed guide just as a student's mark should.
                     pdf.setFillColorRGB(0, 0, 0)
                     pdf.circle(bubble_x, y, bubble_radius * 0.76, fill=1, stroke=0)
+                    if sample_response and choice == crossed_choice:
+                        pdf.setStrokeColorRGB(0, 0, 0)
+                        pdf.setLineWidth(1.5)
+                        cross_radius = bubble_radius * 1.35
+                        pdf.line(bubble_x - cross_radius, y - cross_radius,
+                                 bubble_x + cross_radius, y + cross_radius)
+                        pdf.line(bubble_x - cross_radius, y + cross_radius,
+                                 bubble_x + cross_radius, y - cross_radius)
+                        pdf.setLineWidth(0.75)
 
     pdf.setFontExact("Helvetica", 10)
     pdf.setFillColorRGB(0.28, 0.28, 0.28)
@@ -821,7 +925,8 @@ def draw_sample_handwriting(pdf, text, x, y, max_width, font_name):
 
 
 def make_sample_response_pdf(design, learner, logo=None, sample_index=0, seed=None, answers=None,
-                             layout_version=SHEET_LAYOUT_VERSION):
+                             layout_version=SHEET_LAYOUT_VERSION, fill_id_bubbles=True,
+                             crossed_answers=None, additional_answers=None):
     student = {
         "name": learner["name"],
         "student_id": learner["student_id"],
@@ -829,13 +934,80 @@ def make_sample_response_pdf(design, learner, logo=None, sample_index=0, seed=No
         # All sheets in a generated set share the answer-key seed.
         "seed": seed if seed is not None else (sample_index % 100) + 1,
         "font": sample_handwriting_font(sample_index),
+        "fill_id_bubbles": fill_id_bubbles,
     }
     if answers is not None:
         student["answers"] = answers
+    if crossed_answers:
+        student["crossed_answers"] = crossed_answers
+    if additional_answers:
+        student["additional_answers"] = additional_answers
     return make_answer_sheet(
         design, logo, sample_response=student, include_guide=False,
         layout_version=layout_version,
     )
+
+
+def dummy_score_counts(student_count, question_count, rng):
+    """Return balanced, bounded correct-answer counts for a dummy cohort.
+
+    The paired offsets make the cohort's target mean exactly 65% and its
+    population standard deviation 20% before answers are rounded to whole
+    questions. Odd-sized cohorts retain one student at the mean.
+    """
+    if student_count < 1 or question_count < 1:
+        return []
+    target_mean = 0.65
+    target_stddev = 0.20
+    minimum = math.ceil(question_count * 0.10)
+    maximum = math.floor(question_count * 0.90)
+    # Very short tests cannot express a distinct 10–90% interval.
+    if minimum > maximum:
+        minimum, maximum = 0, question_count
+    if student_count == 1:
+        return [min(maximum, max(minimum, round(question_count * target_mean)))]
+
+    pair_count = student_count // 2
+    # For an odd cohort, the central score contributes no variance, so each
+    # pair needs a slightly wider offset to keep the cohort's target spread.
+    pair_offset_rms = target_stddev * math.sqrt(student_count / (2 * pair_count))
+    raw_offsets = [rng.uniform(0.995, 1.005) for _ in range(pair_count)]
+    raw_rms = math.sqrt(sum(offset * offset for offset in raw_offsets) / pair_count)
+    offsets = [pair_offset_rms * offset / raw_rms for offset in raw_offsets]
+    target_rates = [target_mean - offset for offset in offsets]
+    target_rates += [target_mean + offset for offset in offsets]
+    if student_count % 2:
+        target_rates.append(target_mean)
+    rng.shuffle(target_rates)
+
+    target_counts = [rate * question_count for rate in target_rates]
+    counts = [min(maximum, max(minimum, round(target))) for target in target_counts]
+    desired_total = min(student_count * maximum, max(student_count * minimum,
+                        round(student_count * question_count * target_mean)))
+    # Correct rounding drift without favouring a particular learner.
+    while sum(counts) < desired_total:
+        candidates = [index for index, score in enumerate(counts) if score < maximum]
+        if not candidates:
+            break
+        index = max(candidates, key=lambda item: target_counts[item] - counts[item])
+        counts[index] += 1
+    while sum(counts) > desired_total:
+        candidates = [index for index, score in enumerate(counts) if score > minimum]
+        if not candidates:
+            break
+        index = max(candidates, key=lambda item: counts[item] - target_counts[item])
+        counts[index] -= 1
+    return counts
+
+
+def score_distribution(counts, question_count):
+    """Return population mean and standard deviation as score proportions."""
+    if not counts or question_count < 1:
+        return 0.0, 0.0
+    scores = [count / question_count for count in counts]
+    mean = sum(scores) / len(scores)
+    variance = sum((score - mean) ** 2 for score in scores) / len(scores)
+    return mean, math.sqrt(variance)
 
 
 def create_app():
@@ -1043,7 +1215,8 @@ def create_app():
             return render_template("scan.html", context=context, initial_phase="grade")
         roster_available = bool(
             context.get("nrps_url") and
-            (platforms().get(context["issuer"]) or {}).get("token_endpoint")
+            (platform_client(context["issuer"], context.get("client_id")) or
+             platforms().get(context["issuer"]) or {}).get("token_endpoint")
         )
         roster = []
         roster_error = ""
@@ -1104,7 +1277,7 @@ def create_app():
         # Old open tabs do not send a scanner version. Generate the latest
         # layout they can read instead of handing them a newly introduced QR
         # version that the already-loaded JavaScript will reject.
-        dummy_layout_version = 4 if scanner_layout_version >= 4 else 3
+        dummy_layout_version = 7 if scanner_layout_version >= 7 else 6 if scanner_layout_version >= 6 else 5 if scanner_layout_version >= 5 else 4 if scanner_layout_version >= 4 else 3
         with connect() as db:
             design = db.execute(
                 "SELECT * FROM exam_designs WHERE form_id=? AND issuer=? AND context_id=?",
@@ -1134,6 +1307,47 @@ def create_app():
             (question_number + answer_seed) % choice_count
             for question_number in range(1, question_count + 1)
         ]
+        rng = random.SystemRandom()
+        score_counts = dummy_score_counts(count, question_count, rng)
+        all_answer_slots = [
+            (student_index, question_number)
+            for student_index in range(count)
+            for question_number in range(1, question_count + 1)
+        ]
+        shuffled_slots = rng.sample(all_answer_slots, len(all_answer_slots))
+        total_student_answers = len(all_answer_slots)
+        correction_target = max(1, (total_student_answers * 5 + 99) // 100)
+        multiple_target = max(1, (total_student_answers + 99) // 100)
+        blank_target = max(1, (total_student_answers * 5 + 99) // 100)
+        # Tiny sheets may not have enough distinct answers for every requested
+        # category; reserve one slot per category in order when possible.
+        correction_count = min(correction_target, len(shuffled_slots))
+        multiple_count = min(multiple_target, len(shuffled_slots) - correction_count)
+        blank_count = min(blank_target, len(shuffled_slots) - correction_count - multiple_count)
+        correction_slots = shuffled_slots[:correction_count]
+        multiple_slots = shuffled_slots[correction_count:correction_count + multiple_count]
+        blank_slots = shuffled_slots[correction_count + multiple_count:
+                                     correction_count + multiple_count + blank_count]
+        corrections_by_student = [{} for _ in range(count)]
+        multiples_by_student = [{} for _ in range(count)]
+        blanks_by_student = [set() for _ in range(count)]
+        for student_index, question_number in correction_slots:
+            corrections_by_student[student_index][question_number] = True
+        for student_index, question_number in multiple_slots:
+            multiples_by_student[student_index][question_number] = True
+        for student_index, question_number in blank_slots:
+            blanks_by_student[student_index].add(question_number)
+        # A blank or uncrossed multiple answer is deliberately ungradeable.
+        # Reserve those questions before choosing correct answers so the final
+        # scored response, rather than a hidden preliminary mark, follows the
+        # requested cohort distribution.
+        effective_score_counts = [
+            min(score_counts[index], question_count - len(
+                blanks_by_student[index] | set(multiples_by_student[index])
+            ))
+            for index in range(count)
+        ]
+        score_mean, score_stddev = score_distribution(effective_score_counts, question_count)
         answer_sheet = {
             "name": "Answer Sheet",
             "student_id": "000000000",
@@ -1147,28 +1361,85 @@ def create_app():
             )
             archive.writestr("000-Answer_Sheet.pdf", answer_pdf.getvalue())
 
-            rng = random.SystemRandom()
-            possible_scores = [
-                score for score in range(question_count + 1)
-                if 0.5 <= score / question_count <= 0.9
+            missing_name_index = 0
+            missing_id_bubble_count = max(1, math.ceil(count * 0.05))
+            missing_id_bubbles_indices = set(rng.sample(range(count), missing_id_bubble_count))
+            issue_lines = [
+                "Page appearance: clean white PDF; no rotation or geometric distortion.",
+                f"Student pages: {count}; questions per page: {question_count}.",
+                "Score target: 65% cohort average, 20% population standard deviation, bounded to 10%–90%.",
+                f"Generated scores: {score_mean:.0%} average, {score_stddev:.0%} standard deviation, "
+                f"{min(score_counts) / question_count:.0%}–{max(score_counts) / question_count:.0%} range.",
+                f"Filled answer then crossed out: {correction_count} of {total_student_answers} student answers.",
+                f"Two filled answers with no cross: {multiple_count} of {total_student_answers} student answers.",
+                f"No answer filled: {blank_count} of {total_student_answers} student answers.",
+                f"Name left blank: {learners[missing_name_index]['name']}.",
+                "ID bubbles left blank (written student number remains): " +
+                ", ".join(learners[index]["name"] for index in sorted(missing_id_bubbles_indices)) + ".",
+                "Question numbers below are one-based.",
             ]
-            for index, learner in enumerate(learners[:count]):
+            for index, roster_learner in enumerate(learners[:count]):
+                learner = dict(roster_learner)
                 student_name = secure_filename(learner["name"]) or f"student-{index + 1}"
-                correct_count = rng.choice(possible_scores) if possible_scores else round(question_count * 0.7)
-                changed_questions = set(rng.sample(range(question_count), question_count - correct_count))
-                student_answers = list(correct_answers)
-                for question_index in changed_questions:
-                    alternatives = [choice for choice in range(choice_count)
-                                    if choice != correct_answers[question_index]]
-                    student_answers[question_index] = rng.choice(alternatives)
+                excluded_questions = blanks_by_student[index] | set(multiples_by_student[index])
+                gradeable_questions = [
+                    question_index for question_index in range(question_count)
+                    if question_index + 1 not in excluded_questions
+                ]
+                correct_questions = set(rng.sample(
+                    gradeable_questions, effective_score_counts[index]
+                ))
+                student_answers = []
+                for question_index, correct_answer in enumerate(correct_answers):
+                    if question_index + 1 in blanks_by_student[index]:
+                        student_answers.append(None)
+                    elif question_index in correct_questions:
+                        student_answers.append(correct_answer)
+                    else:
+                        alternatives = [choice for choice in range(choice_count)
+                                        if choice != correct_answer]
+                        student_answers.append(rng.choice(alternatives))
+                crossed_answers = {}
+                additional_answers = {}
+                for question_number in corrections_by_student[index]:
+                    answer = student_answers[question_number - 1]
+                    alternatives = [choice for choice in range(choice_count) if choice != answer]
+                    crossed_answers[question_number] = rng.choice(alternatives)
+                for question_number in multiples_by_student[index]:
+                    answer = student_answers[question_number - 1]
+                    alternatives = [choice for choice in range(choice_count) if choice != answer]
+                    additional_answers[question_number] = [rng.choice(alternatives)]
+                if index == missing_name_index:
+                    learner["name"] = ""
+                fill_id_bubbles = index not in missing_id_bubbles_indices
                 pdf_data = make_sample_response_pdf(
                     design, learner, branding["logo"] if branding else None,
                     sample_index=index + 1, seed=answer_seed, answers=student_answers,
                     layout_version=dummy_layout_version,
+                    fill_id_bubbles=fill_id_bubbles,
+                    crossed_answers=crossed_answers,
+                    additional_answers=additional_answers,
                 )
                 archive.writestr(
-                    f"{index + 1:03d}-{student_name}.pdf", pdf_data.getvalue()
+                    f"{index + 1:03d}-{student_name}.pdf",
+                    pdf_data.getvalue(),
                 )
+                if crossed_answers:
+                    issue_lines.append(
+                        f"Filled answer crossed out: {roster_learner['name']} — "
+                        f"questions {', '.join(map(str, sorted(crossed_answers)))}."
+                    )
+                if additional_answers:
+                    issue_lines.append(
+                        f"Multiple un-crossed answers: {roster_learner['name']} — "
+                        f"questions {', '.join(map(str, sorted(additional_answers)))}."
+                    )
+                if blanks_by_student[index]:
+                    issue_lines.append(
+                        f"Blank answers: {roster_learner['name']} — "
+                        f"questions {', '.join(map(str, sorted(blanks_by_student[index])))}."
+                    )
+            archive.writestr("dummy-set-notes.txt", "\n".join(issue_lines) + "\n")
         output.seek(0)
         return send_file(
             output,
@@ -1416,7 +1687,11 @@ def create_app():
                     "SELECT 1 FROM deployments WHERE issuer=? AND client_id=? AND deployment_id=?",
                     (issuer, client_id, deployment_id),
                 ).fetchone()
-                if not registered and deployment_id not in platform.get("deployment_ids", []):
+                configured_deployment = (
+                    client_id in platform.get("client_ids", []) and
+                    deployment_id in platform.get("deployment_ids", [])
+                )
+                if not registered and not configured_deployment:
                     raise ValueError("Unregistered LTI deployment")
                 if message_type == "LtiDeepLinkingRequest":
                     settings = claims.get(LTI_DEEP_LINKING + "deep_linking_settings", {})

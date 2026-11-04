@@ -9,6 +9,10 @@ services:
       TOOL_BASE_URL: ${TOOL_BASE_URL:-http://localhost:8004}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       LTI_INTERNAL_PLATFORM_BASE_URL: ${LTI_INTERNAL_PLATFORM_BASE_URL:-http://host.docker.internal:8001}
+      LTI_PLATFORM_ISSUER: ${LTI_PLATFORM_ISSUER:-https://demo.minivle.com}
+      LTI_PLATFORM_AUTHORIZATION_ENDPOINT: ${LTI_PLATFORM_AUTHORIZATION_ENDPOINT:-https://demo.minivle.com/lti/authorize/}
+      LTI_PLATFORM_JWKS_URL: ${LTI_PLATFORM_JWKS_URL:-http://host.docker.internal:8001/lti/jwks/}
+      LTI_PLATFORM_TOKEN_ENDPOINT: ${LTI_PLATFORM_TOKEN_ENDPOINT:-http://host.docker.internal:8001/lti/token/}
     volumes:
       - ./data:/data
       - ./app:/app/app

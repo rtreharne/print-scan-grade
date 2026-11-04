@@ -57,7 +57,7 @@
       <div class="scan-heading">
         <div><p class="eyebrow">Optional test data</p><h2 id="dummy-zip-title">Generate dummy student sheets</h2></div>
       </div>
-      <p class="muted">Download one answer sheet plus completed sheets for enrolled students. Student responses are randomized to score 50–90% against the included key, where the question count allows.</p>
+      <p class="muted">Download one answer sheet plus clean student sheets. The set includes a blank name, unfilled ID bubbles, crossed corrections, multiple marks and blank answers; see the ZIP notes for details.</p>
       <div id="dummy-zip-error" class="scan-errors" role="alert" hidden></div>
       <form id="dummy-zip-form" class="dummy-zip-form">
         <label for="dummy-form-select">Answer sheet
@@ -98,18 +98,24 @@
         </div>
         <div id="grade-roster-message" class="scan-errors roster-error" hidden></div>
         <label id="set-key-field" class="scan-key-field" for="set-key-select" hidden><span>Answer sheet for this scan set</span><select id="set-key-select" class="review-select"></select></label>
-        <p class="scan-key-help">Open a student to review the original scan and template-guided answer selection. Green filled circles are selected; crossed green circles are excluded; rows without an uncrossed green circle are not selected; multiple uncrossed green circles are reported as multiple selection.</p>
+        <p class="scan-key-help">An answer sheet must contain exactly one detected answer for every question before it can be used as the key. In student previews, green filled circles are selected, solid blue circles show the correct answer, blue outlines are blank, and red Xs are excluded crossed-out selections.</p>
         <div class="roster-table-wrap">
           <table class="roster-table">
-            <thead><tr><th scope="col">Student</th><th scope="col">SIS login ID</th><th scope="col">Raw scan review</th></tr></thead>
+            <thead><tr><th scope="col"><button type="button" class="roster-sort-button" data-roster-sort="name" data-label="Student">Student ↕</button></th><th scope="col"><button type="button" class="roster-sort-button" data-roster-sort="score" data-label="Score">Score ↕</button></th><th scope="col"><button type="button" class="roster-sort-button" data-roster-sort="percentage" data-label="Percentage">Percentage ↕</button></th></tr></thead>
             <tbody id="roster-rows"><tr><td colspan="3">No sheets scanned yet.</td></tr></tbody>
           </table>
         </div>
         <dialog id="scan-preview-dialog" class="scan-preview-dialog" aria-labelledby="scan-preview-title">
           <div class="scan-preview-heading"><div><p class="eyebrow">Saved scan results</p><h2 id="scan-preview-title">Scanned answer sheet</h2><p id="scan-preview-meta" class="muted"></p></div><div class="scan-preview-actions"><button id="scan-preview-close" class="download-button" type="button">Close</button></div></div>
           <button id="original-scan-toggle" class="download-button original-scan-toggle" type="button" hidden>View raw annotated scan</button>
-          <section id="original-scan-panel" class="original-scan-panel" hidden><p class="field-help">This is the original scan with diagnostic circle overlays only. Green indicates filled, blue indicates blank, and amber indicates uncertain.</p><img id="original-scan-image" alt="Raw annotated scanned answer sheet page"></section>
+          <section id="original-scan-panel" class="original-scan-panel" hidden><p class="field-help">This is the original scan with diagnostic circle overlays only. Green indicates filled, blue indicates blank, and a red X marks a crossed-out response.</p><img id="original-scan-image" alt="Raw annotated scanned answer sheet page"></section>
           <div id="scan-preview-content" class="scan-preview-content"></div>
+        </dialog>
+        <dialog id="unidentified-dialog" class="scan-preview-dialog unidentified-dialog" aria-labelledby="unidentified-dialog-title">
+          <div class="scan-preview-heading"><div><p class="eyebrow">Student identification</p><h2 id="unidentified-dialog-title">Student not identified</h2><p id="unidentified-dialog-meta" class="muted"></p></div><div class="scan-preview-actions"><button id="unidentified-dialog-close" class="download-button" type="button">Close</button></div></div>
+          <p class="field-help">Check the scanned name area, then type a name, login or student number. Press Enter to assign and move to the next unidentified scan.</p>
+          <div class="unidentified-name-preview"><img id="unidentified-name-image" alt="Name area from unidentified scanned sheet"><p id="unidentified-name-status" class="field-help" hidden></p></div>
+          <div class="unidentified-assignment"><label for="unidentified-search">Search roster<input id="unidentified-search" class="review-select" type="search" placeholder="Type to search…" autocomplete="off"></label><select id="unidentified-match" class="review-select" aria-label="Matching roster student"></select><button id="unidentified-assign" class="primary-button" type="button">Assign and next</button></div>
         </dialog>
       </section>
     </section>
@@ -117,6 +123,6 @@
     <footer>printscangrade.com</footer>
   </main>
 
-<script type="module" src="{{ url_for('static', filename='scan.js', v=47) }}"></script>
+<script type="module" src="{{ url_for('static', filename='scan.js', v=66) }}"></script>
 </body>
 </html>

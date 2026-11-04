@@ -12,6 +12,7 @@ const dummyStudentCount = $("#dummy-student-count");
 const dummyStudentLimit = $("#dummy-student-limit");
 const dummyZipButton = $("#dummy-zip-button");
 const dummyZipError = $("#dummy-zip-error");
+const dummyZipButtonText = dummyZipButton?.textContent || "Download dummy ZIP";
 const progressBox = $("#scan-progress");
 const progressBar = $("#progress-bar");
 const progressLabel = $("#progress-label");
@@ -25,6 +26,9 @@ const courseRoster = [];
 const setKeyField = $("#set-key-field");
 const setKeySelect = $("#set-key-select");
 const rosterRows = $("#roster-rows");
+const rosterSortButtons = [...document.querySelectorAll("[data-roster-sort]")];
+let rosterSortKey = "name";
+let rosterSortDirection = "asc";
 const gradeSummary = $("#grade-summary");
 const gradeRosterMessage = $("#grade-roster-message");
 const gradeFormList = $("#grade-form-list");
@@ -40,6 +44,17 @@ const scanPreviewContent = $("#scan-preview-content");
 const originalScanToggle = $("#original-scan-toggle");
 const originalScanPanel = $("#original-scan-panel");
 const originalScanImage = $("#original-scan-image");
+const unidentifiedDialog = $("#unidentified-dialog");
+const unidentifiedDialogTitle = $("#unidentified-dialog-title");
+const unidentifiedDialogMeta = $("#unidentified-dialog-meta");
+const unidentifiedNameImage = $("#unidentified-name-image");
+const unidentifiedNameStatus = $("#unidentified-name-status");
+const unidentifiedSearch = $("#unidentified-search");
+const unidentifiedMatch = $("#unidentified-match");
+const unidentifiedAssign = $("#unidentified-assign");
+let unidentifiedDialogSheet = null;
+let unidentifiedDialogNextId = "";
+let unidentifiedNameObjectUrl = "";
 const scanDashboard = $("#scan-dashboard");
 const gradeDashboard = $("#grade-dashboard");
 const gradeLink = document.querySelector("[data-grade-link]");
@@ -54,8 +69,8 @@ const MARK_MARGIN = 16;
 const CURRENT_MARK_MARGIN = 21;
 const ANSWER_READER_VERSION = 5;
 const RAW_SCAN_VERSION = 2;
-const ANNOTATION_VERSION = 9;
-const CURRENT_SHEET_LAYOUT_VERSION = 4;
+const ANNOTATION_VERSION = 15;
+const CURRENT_SHEET_LAYOUT_VERSION = 7;
 const REGISTRATION_MARK_THRESHOLD = 160;
 const MAX_PDF_BYTES = 64 * 1024 * 1024;
 const MAX_ZIP_BYTES = 256 * 1024 * 1024;
@@ -98,7 +113,21 @@ async function initializeDummyZipForm() {
   }
 }
 
-dummyZipForm?.addEventListener("submit", (event) => {
+function setDummyZipDownloadState(preparing) {
+  if (!dummyZipButton) return;
+  dummyZipButton.disabled = preparing;
+  dummyZipButton.classList.toggle("is-loading", preparing);
+  dummyZipButton.setAttribute("aria-busy", String(preparing));
+  dummyZipButton.textContent = preparing ? "Preparing dummy ZIP…" : dummyZipButtonText;
+}
+
+function downloadFilename(response) {
+  const header = response.headers.get("Content-Disposition") || "";
+  const match = header.match(/filename="?([^";]+)"?/i);
+  return match?.[1] || "dummy-student-sheets.zip";
+}
+
+dummyZipForm?.addEventListener("submit", async (event) => {
   event.preventDefault();
   const formId = dummyFormSelect.value;
   const count = Number(dummyStudentCount.value);
@@ -109,8 +138,29 @@ dummyZipForm?.addEventListener("submit", (event) => {
     return;
   }
   dummyZipError.hidden = true;
-  window.location.assign(`/scan/${encodeURIComponent(formId)}/dummy.zip?count=${count}` +
-    `&scanner_layout_version=${CURRENT_SHEET_LAYOUT_VERSION}`);
+  setDummyZipDownloadState(true);
+  try {
+    const response = await fetch(`/scan/${encodeURIComponent(formId)}/dummy.zip?count=${count}` +
+      `&scanner_layout_version=${CURRENT_SHEET_LAYOUT_VERSION}`, { credentials: "same-origin" });
+    if (!response.ok) {
+      const message = await response.text();
+      throw new Error(message || "Could not create the dummy ZIP.");
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = downloadFilename(response);
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    dummyZipError.textContent = error.message || "Could not create the dummy ZIP.";
+    dummyZipError.hidden = false;
+  } finally {
+    setDummyZipDownloadState(false);
+  }
 });
 
 initializeDummyZipForm();
@@ -131,6 +181,7 @@ let persistenceWarning = "";
 let persistenceLoadPromise = null;
 let formsManifestPromise = null;
 let annotationRefreshPromise = null;
+let pendingUnidentifiedFocusId = "";
 
 async function loadFormsManifest() {
   if (formsManifestLoaded) return;
@@ -783,7 +834,7 @@ async function scanPage(pdf, pageNo, sourceFile, pdfBytes) {
     }
     const preliminaryForm = decoded && !decoded.data.startsWith("PSGGUIDE|")
       ? identifyScannedForm(decoded) : null;
-    if (preliminaryForm?.ok && preliminaryForm.layoutVersion === 4) {
+    if (preliminaryForm?.ok && preliminaryForm.layoutVersion >= 4) {
       candidate.width = 0;
       candidate = rectifyPage(sourceCanvas, points, CURRENT_MARK_MARGIN, sourceImage);
       if (!candidate) continue;
@@ -841,7 +892,7 @@ async function scanPage(pdf, pageNo, sourceFile, pdfBytes) {
     setProgress(`Annotating raw scan circles - ${sourceFile} - page ${pageNo}`);
     const rawMapping = createTemplateToRawMapping(
       selectedRegistrationPoints,
-      form.layoutVersion === 4 ? CURRENT_MARK_MARGIN : MARK_MARGIN,
+      form.layoutVersion >= 4 ? CURRENT_MARK_MARGIN : MARK_MARGIN,
     );
     if (!rawMapping) throw new Error("The scan registration geometry could not be mapped to the raw page.");
     const annotations = detectRawBubbleAnnotations(
@@ -868,6 +919,7 @@ async function scanPage(pdf, pageNo, sourceFile, pdfBytes) {
       annotatedPage,
       rawScanVersion: RAW_SCAN_VERSION,
       annotationVersion: ANNOTATION_VERSION,
+      annotationKeyId: "",
       formId: form.design.form_id,
       formTitle: form.design.title,
       layoutVersion: form.layoutVersion,
@@ -964,7 +1016,10 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
   const context = sourceCanvas.getContext("2d", { willReadFrequently: true });
   const image = context.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
   const scale = 1500 / A4.width;
-  const currentLayout = [3, 4].includes(layoutVersion);
+  const currentLayout = [3, 4, 5, 6, 7].includes(layoutVersion);
+  const spaciousChoiceLayout = layoutVersion >= 5;
+  const columnGutterLayout = layoutVersion >= 6;
+  const adaptiveBubbleLayout = layoutVersion >= 7;
   const questionCount = Number(design.question_count);
   const choiceCount = Number(design.choice_count);
   const questionTop = layoutVersion === 1 ? 589 : currentLayout ? 460 : 507;
@@ -975,22 +1030,43 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
     ? Math.min(31, Math.max(12, (questionTop - 38) / Math.max(1, rowsPerColumn - 1)))
     : Math.min(28.5, Math.max(12, (questionTop - 38) / rowsPerColumn));
   const rowOffset = (questionTop - 38 - (rowsPerColumn - 1) * rowPitch) / 2;
-  const answerPitch = Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, choiceCount - 1));
+  const answerStart = currentLayout ? (spaciousChoiceLayout ? 35 : 30) : 33;
+  const standardAnswerRadius = currentLayout ? 6.8 : Math.min(5, Math.max(3.6, rowPitch * 0.28));
+  const maxAnswerRadius = (columnWidth - 35 - 8 - Math.max(0, choiceCount - 1) * 0.75) /
+    (2 * choiceCount - 1);
+  const answerRadius = adaptiveBubbleLayout
+    ? Math.max(5.5, Math.min(standardAnswerRadius, maxAnswerRadius))
+    : standardAnswerRadius;
+  const requestedTrailingGap = columnGutterLayout ? 8 : 0;
+  const minimumPitch = answerRadius * 2 + 0.75;
+  const trailingGap = spaciousChoiceLayout ? Math.max(0, Math.min(requestedTrailingGap,
+    columnWidth - answerStart - answerRadius - Math.max(0, choiceCount - 1) * minimumPitch)) : 0;
+  const answerPitch = spaciousChoiceLayout
+    ? Math.min(20.5, (columnWidth - answerStart - answerRadius - trailingGap) /
+      Math.max(1, choiceCount - 1))
+    : Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, choiceCount - 1));
   const annotations = [];
   const idSignals = [];
   const inspect = (kind, label, question, templateX, templateY, templateRadius) => {
     const [x, y, radius] = rawBubbleGeometry(mapping, templateX * scale, templateY * scale, templateRadius * scale, sourceCanvas.width / A4.width);
-    const analysis = analyzeCircle(image, sourceCanvas.width, sourceCanvas.height, x, y, radius, 0.28);
+    // Registration marks correct page-level rotation and perspective. A wider
+    // local search then absorbs small residual print/scan distortions at each
+    // bubble, while remaining well inside the gap to neighboring circles.
+    const analysis = analyzeCircle(image, sourceCanvas.width, sourceCanvas.height, x, y, radius, 0.46);
     if (kind === "student_id") {
-      idSignals.push({ label, signal: analysis.signal, fillRatio: analysis.fillRatio,
+      // ID selection follows the same strict central-ink evidence as answers.
+      // Contrast alone is not meaningful for an empty printed circle.
+      idSignals.push({ label, signal: analysis.fillRatio, fillRatio: analysis.fillRatio,
         normalizedContrast: analysis.normalizedContrast, column: Math.floor(idSignals.length / 10) });
     }
     // A real printed bubble has a local circular ring. This gate prevents the
     // overlay from marking every expected location when a scan is blank/cropped.
     if (analysis.score < Math.max(3, analysis.paper * 0.012)) return;
-    const status = analysis.fillRatio >= 0.22 && analysis.normalizedContrast >= 0.16
-      ? "filled"
-      : analysis.fillRatio >= 0.08 || analysis.normalizedContrast >= 0.07 ? "uncertain" : "blank";
+    // Sample only the central 55% of the bubble and count only genuinely dark
+    // ink. A printed A-D guide letter, pale photocopy grain, or the outline
+    // cannot cover 30% of that central disc, so every non-mark is blue rather
+    // than becoming an ambiguous or false-green result.
+    const status = analysis.fillRatio >= 0.3 ? "filled" : "blank";
     const crossScore = status === "filled"
       ? relativeDiagonalCoverage(image, sourceCanvas.width, sourceCanvas.height,
         analysis.cx, analysis.cy, radius, analysis.darkThreshold)
@@ -1017,19 +1093,19 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
       confidence: Math.min(1, analysis.score / 35) });
   };
   for (let column = 0; column < columns; column += 1) {
-    const x = 27 + column * columnWidth + (currentLayout ? 30 : 33);
+    const x = 27 + column * columnWidth + answerStart;
     for (let row = 0; row < rowsPerColumn; row += 1) {
       const question = column * rowsPerColumn + row + 1;
       if (question > questionCount) break;
       const y = questionTop - rowOffset - row * rowPitch;
-      const radius = currentLayout ? 6.8 : Math.min(5, Math.max(3.6, rowPitch * 0.28));
+      const radius = answerRadius;
       for (let choice = 0; choice < choiceCount; choice += 1) {
         inspect("answer", String.fromCharCode(65 + choice), question,
           x + choice * answerPitch, A4.height - y, radius);
       }
     }
   }
-  if ([2, 3, 4].includes(layoutVersion)) {
+  if ([2, 3, 4, 5, 6, 7].includes(layoutVersion)) {
     const firstBubbleX = 27 + 2 + 34;
     const firstRowY = A4.height - (A4.height - 145 - 13);
     const rowPitchId = currentLayout ? 14.5 : 9.1;
@@ -1089,7 +1165,7 @@ function resolveTemplateAnswers(annotations, questionCount) {
   return { answers, counts };
 }
 
-async function createAnnotatedBubblePreview(sourceCanvas, annotationData) {
+async function createAnnotatedBubblePreview(sourceCanvas, annotationData, correctAnswers = null) {
   const preview = document.createElement("canvas");
   preview.width = sourceCanvas.width;
   preview.height = sourceCanvas.height;
@@ -1101,19 +1177,23 @@ async function createAnnotatedBubblePreview(sourceCanvas, annotationData) {
   const scale = preview.width / sourceCanvas.width;
   const drawBubble = (bubble) => {
     if (!bubble || !Number.isFinite(bubble.x) || !Number.isFinite(bubble.y)) return;
-    const color = bubble.status === "filled" ? "#00a878"
-      : bubble.status === "uncertain" ? "#d39b00" : "#2878c8";
+    // The current raw detector has a binary result: strict central ink is
+    // green, everything else is blue. Keep the preview binary too, so stale
+    // or imported metadata can never introduce an amber diagnostic circle.
+    const isExpectedAnswer = bubble.kind === "answer" &&
+      correctAnswers?.get(bubble.question) === bubble.label;
+    const color = bubble.status === "filled" ? "#00a878" : "#2878c8";
     context.beginPath();
     context.arc(bubble.x * scale, bubble.y * scale, bubble.radius * scale, 0, Math.PI * 2);
     context.lineWidth = Math.max(2, scale * 1.5);
     context.strokeStyle = color;
     context.globalAlpha = bubble.status === "blank" ? 0.72 : 0.95;
     context.stroke();
-    if (bubble.status === "filled") {
+    if (bubble.status === "filled" || isExpectedAnswer) {
       context.beginPath();
       context.arc(bubble.x * scale, bubble.y * scale, Math.max(2, bubble.radius * scale * 0.42), 0, Math.PI * 2);
       context.fillStyle = color;
-      context.globalAlpha = 0.9;
+      context.globalAlpha = bubble.status === "filled" ? 0.9 : 0.82;
       context.fill();
     }
     if (bubble.crossed) {
@@ -1136,10 +1216,10 @@ async function createAnnotatedBubblePreview(sourceCanvas, annotationData) {
   const fontSize = Math.max(14, Math.round(scale * 7));
   context.globalAlpha = 0.94;
   context.fillStyle = "rgba(255,255,255,0.88)";
-  context.fillRect(preview.width - scale * 190, scale * 18, scale * 175, scale * 34);
+  context.fillRect(preview.width - scale * 375, scale * 18, scale * 360, scale * 34);
   context.font = `bold ${fontSize}px sans-serif`;
   context.fillStyle = "#111";
-  context.fillText("green filled  blue blank  amber uncertain  red X crossed", preview.width - scale * 180, scale * 39);
+  context.fillText("green selected  blue solid correct  blue outline blank  red X crossed", preview.width - scale * 365, scale * 39);
   context.globalAlpha = 1;
 
   const blob = await new Promise((resolve, reject) => {
@@ -1536,7 +1616,7 @@ function identifyForm(payload) {
     return { ok: false, reason: "The QR code settings don’t match the saved form. Re-download the sheet from Print." };
   }
   if (layoutVersion === null) layoutVersion = design.legacy_layout_version;
-  if (![1, 2, 3, 4].includes(layoutVersion)) return { ok: false, reason: "This answer-sheet layout version is not supported." };
+  if (![1, 2, 3, 4, 5, 6, 7].includes(layoutVersion)) return { ok: false, reason: "This answer-sheet layout version is not supported." };
   return { ok: true, design, layoutVersion, sampleSeed };
 }
 
@@ -1544,7 +1624,10 @@ function readAnswers(canvas, design, layoutVersion, coordinateMap = null) {
   const questionBottom = 38;
   const questionCount = Number(design.question_count);
   const choiceCount = Number(design.choice_count);
-  const currentLayout = [3, 4].includes(layoutVersion);
+  const currentLayout = [3, 4, 5, 6, 7].includes(layoutVersion);
+  const spaciousChoiceLayout = layoutVersion >= 5;
+  const columnGutterLayout = layoutVersion >= 6;
+  const adaptiveBubbleLayout = layoutVersion >= 7;
   const questionTop = layoutVersion === 1 ? 589 : currentLayout ? 460 : 507;
   const columns = Math.min(4, Math.max(1, Math.ceil(questionCount / (currentLayout ? 15 : 20))));
   const rowsPerColumn = currentLayout ? 15 : Math.ceil(questionCount / columns);
@@ -1553,7 +1636,21 @@ function readAnswers(canvas, design, layoutVersion, coordinateMap = null) {
     ? Math.min(31, Math.max(12, (questionTop - questionBottom) / Math.max(1, rowsPerColumn - 1)))
     : Math.min(28.5, Math.max(12, (questionTop - questionBottom) / rowsPerColumn));
   const rowOffset = (questionTop - questionBottom - (rowsPerColumn - 1) * rowPitch) / 2;
-  const answerPitch = Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, choiceCount - 1));
+  const answerStart = currentLayout ? (spaciousChoiceLayout ? 35 : 30) : 33;
+  const standardAnswerRadius = currentLayout ? 6.8 : Math.min(5, Math.max(3.6, rowPitch * 0.28));
+  const maxAnswerRadius = (columnWidth - 35 - 8 - Math.max(0, choiceCount - 1) * 0.75) /
+    (2 * choiceCount - 1);
+  const answerRadius = adaptiveBubbleLayout
+    ? Math.max(5.5, Math.min(standardAnswerRadius, maxAnswerRadius))
+    : standardAnswerRadius;
+  const requestedTrailingGap = columnGutterLayout ? 8 : 0;
+  const minimumPitch = answerRadius * 2 + 0.75;
+  const trailingGap = spaciousChoiceLayout ? Math.max(0, Math.min(requestedTrailingGap,
+    columnWidth - answerStart - answerRadius - Math.max(0, choiceCount - 1) * minimumPitch)) : 0;
+  const answerPitch = spaciousChoiceLayout
+    ? Math.min(20.5, (columnWidth - answerStart - answerRadius - trailingGap) /
+      Math.max(1, choiceCount - 1))
+    : Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, choiceCount - 1));
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const scale = canvas.width / A4.width;
@@ -1563,7 +1660,7 @@ function readAnswers(canvas, design, layoutVersion, coordinateMap = null) {
     // Sample the bubble interior, clear of its outline and faint guide letter.
     // Keep sampling centered on the printed bubble so its outline does not
     // leak into the interior sample and look like a faint student mark.
-    const x = 27 + column * columnWidth + (currentLayout ? 30 : 33);
+    const x = 27 + column * columnWidth + answerStart;
     for (let row = 0; row < rowsPerColumn; row += 1) {
       const question = column * rowsPerColumn + row + 1;
       if (question > questionCount) break;
@@ -1572,7 +1669,7 @@ function readAnswers(canvas, design, layoutVersion, coordinateMap = null) {
       for (let choice = 0; choice < choiceCount; choice += 1) {
         const templateX = (x + choice * answerPitch) * templateScale;
         const templateY = (A4.height - y) * templateScale;
-        const radiusPoints = currentLayout ? 6.8 : Math.min(5, Math.max(3.6, rowPitch * 0.28));
+        const radiusPoints = answerRadius;
         const center = coordinateMap ? mapTemplatePoint(coordinateMap, templateX, templateY)
           : { x: templateX, y: templateY };
         const radius = coordinateMap
@@ -1589,7 +1686,7 @@ function readAnswers(canvas, design, layoutVersion, coordinateMap = null) {
 }
 
 function readStudentIdFromSignals(idSignals, layoutVersion) {
-  if (![2, 3, 4].includes(layoutVersion) || !Array.isArray(idSignals) || idSignals.length < 90) {
+  if (![2, 3, 4, 5, 6, 7].includes(layoutVersion) || !Array.isArray(idSignals) || idSignals.length < 90) {
     return { studentId: "", raw: "", uncertainColumns: [] };
   }
   let digits = "";
@@ -1666,22 +1763,36 @@ function sampleBubble(image, width, height, centerX, centerY, radius, label) {
 function analyzeCircle(image, width, height, expectedX, expectedY, radius, searchScale = 0.32) {
   const r = Math.max(4, radius);
   const search = Math.max(1, Math.round(r * searchScale));
-  const offsets = [-search, 0, search];
-  let best = null;
-  for (const dy of offsets) {
-    for (const dx of offsets) {
-      const cx = Math.round(expectedX + dx);
-      const cy = Math.round(expectedY + dy);
-      const edgeSamples = radialRingStats(image, width, height, cx, cy, r);
-      if (!edgeSamples.ringCount || !edgeSamples.outsideCount) continue;
-      const paper = histogramPercentile(edgeSamples.outsideHistogram,
-        edgeSamples.outsideCount, 0.75);
-      const outline = histogramPercentile(edgeSamples.ringHistogram,
-        edgeSamples.ringCount, 0.2);
-      const offsetPenalty = Math.hypot(dx, dy) / r * 0.35;
-      const score = paper - outline - offsetPenalty;
-      if (!best || score > best.score) best = { cx, cy, score, edgeSamples };
+  let candidates;
+  if (searchScale > 0.4) {
+    // Sample a compact 5x5 lattice inside the search disk. This covers
+    // arbitrary local displacement more reliably than only checking the four
+    // diagonal corners of a square, without approaching adjacent bubbles.
+    const half = Math.max(1, Math.round(search / 2));
+    const positions = [...new Set([-search, -half, 0, half, search])];
+    candidates = [];
+    for (const dy of positions) {
+      for (const dx of positions) {
+        if (Math.hypot(dx, dy) <= search + 0.01) candidates.push([dx, dy]);
+      }
     }
+  } else {
+    const offsets = [-search, 0, search];
+    candidates = offsets.flatMap((dy) => offsets.map((dx) => [dx, dy]));
+  }
+  let best = null;
+  for (const [dx, dy] of candidates) {
+    const cx = Math.round(expectedX + dx);
+    const cy = Math.round(expectedY + dy);
+    const edgeSamples = radialRingStats(image, width, height, cx, cy, r);
+    if (!edgeSamples.ringCount || !edgeSamples.outsideCount) continue;
+    const paper = histogramPercentile(edgeSamples.outsideHistogram,
+      edgeSamples.outsideCount, 0.75);
+    const outline = histogramPercentile(edgeSamples.ringHistogram,
+      edgeSamples.ringCount, 0.2);
+    const offsetPenalty = Math.hypot(dx, dy) / r * 0.35;
+    const score = paper - outline - offsetPenalty;
+    if (!best || score > best.score) best = { cx, cy, score, edgeSamples };
   }
   if (!best) {
     best = {
@@ -1690,13 +1801,18 @@ function analyzeCircle(image, width, height, expectedX, expectedY, radius, searc
         outsideHistogram: new Uint32Array(256), outsideCount: 0 },
     };
   }
-  const inside = radialStats(image, width, height, best.cx, best.cy, r, 0, 0.62);
+  // Match the reviewed detector: inspect only the central part of the circle.
+  const inside = radialStats(image, width, height, best.cx, best.cy, r, 0, 0.55);
   const paper = histogramPercentile(best.edgeSamples.outsideHistogram,
     best.edgeSamples.outsideCount, 0.75) || 255;
   const outline = histogramPercentile(best.edgeSamples.ringHistogram,
     best.edgeSamples.ringCount, 0.2) || Math.max(0, paper - 16);
   const outlineSpan = Math.max(2, paper - outline);
-  const darkThreshold = paper - Math.max(1.5, outlineSpan * 0.28);
+  // The calibration set succeeds with an ink ceiling of 140. Keep that hard
+  // ceiling on normal/bright paper and only lower it for dark photocopies.
+  // This is deliberately conservative: a faint guide glyph must never become
+  // a student response.
+  const darkThreshold = Math.max(70, Math.min(140, paper - 50));
   const darkPixels = histogramCountBelow(inside.histogram, darkThreshold);
   const fillRatio = darkPixels / Math.max(1, inside.count);
   const insideMean = inside.sum / Math.max(1, inside.count);
@@ -1977,20 +2093,46 @@ function renderSetAnswerKeyOptions() {
   placeholder.value = "";
   placeholder.textContent = "Choose answer sheet";
   setKeySelect.append(placeholder);
-  for (const candidate of sheetResults.filter((result) => result.formId === scanSet.formId)) {
+  const candidates = sheetResults.filter((result) => result.formId === scanSet.formId);
+  for (const candidate of candidates) {
     const option = document.createElement("option");
     option.value = candidate.id;
     const otherSet = candidate.scanSetId !== scanSet.id ? " · another scan set" : "";
-    option.textContent = `${studentNameFor(candidate)} · ${candidate.sourceFile} · page ${candidate.pageNo}${otherSet}`;
+    const complete = completeAnswerKeyAnswers(candidate);
+    option.disabled = !complete;
+    option.textContent = `${studentNameFor(candidate)} · ${candidate.sourceFile} · page ${candidate.pageNo}${otherSet}` +
+      (complete ? "" : " · incomplete answers");
     setKeySelect.append(option);
+  }
+  const selectedKey = candidates.find((candidate) => candidate.id === answerKeyByScanSet[scanSet.id]);
+  if (selectedKey && !completeAnswerKeyAnswers(selectedKey)) {
+    delete answerKeyByScanSet[scanSet.id];
+    persistScanState();
   }
   setKeySelect.value = answerKeyByScanSet[scanSet.id] || "";
   setKeySelect.onchange = async () => {
-    if (setKeySelect.value) answerKeyByScanSet[scanSet.id] = setKeySelect.value;
-    else delete answerKeyByScanSet[scanSet.id];
+    const candidate = candidates.find((item) => item.id === setKeySelect.value);
+    if (candidate && completeAnswerKeyAnswers(candidate)) {
+      answerKeyByScanSet[scanSet.id] = candidate.id;
+    } else {
+      delete answerKeyByScanSet[scanSet.id];
+    }
     await persistScanState();
+    await refreshSavedAnnotationsInBackground();
     renderGradeWorkspace();
   };
+}
+
+function completeAnswerKeyAnswers(sheet) {
+  const questionCount = Number(sheet?.questionCount);
+  if (!Number.isInteger(questionCount) || questionCount < 1 || !Array.isArray(sheet?.answers)) return null;
+  const answers = new Map();
+  for (let question = 1; question <= questionCount; question += 1) {
+    const answer = sheet.answers.find((item) => item.question === question);
+    if (!answer || answer.status !== "selected" || !/^[A-Z]$/.test(answer.response || "")) return null;
+    answers.set(question, answer.response);
+  }
+  return answers;
 }
 
 function rosterCandidates(sheet) {
@@ -1998,9 +2140,41 @@ function rosterCandidates(sheet) {
   return courseRoster.filter((learner) => identifiers.has(learner.student_id));
 }
 
+function manuallyMatchedLearner(sheet) {
+  if (!sheet?.manualStudentId) return null;
+  return courseRoster.find((learner) => learner.student_id === sheet.manualStudentId) || null;
+}
+
 function matchedLearner(sheet) {
+  const manualMatch = manuallyMatchedLearner(sheet);
+  if (manualMatch) return manualMatch;
   const matches = rosterCandidates(sheet);
   return matches.length === 1 ? matches[0] : null;
+}
+
+function rosterNameParts(learner) {
+  const name = String(learner?.name || "").trim().replace(/\s+/g, " ");
+  if (!name) return { first: "", last: "" };
+  if (name.includes(",")) {
+    const [last, ...firstParts] = name.split(",");
+    return { first: firstParts.join(",").trim(), last: last.trim() };
+  }
+  const parts = name.split(" ");
+  return parts.length > 1
+    ? { first: parts.slice(0, -1).join(" "), last: parts.at(-1) }
+    : { first: "", last: name };
+}
+
+function rosterDisplayName(learner) {
+  const { first, last } = rosterNameParts(learner);
+  return first ? `${last}, ${first}` : last;
+}
+
+function compareRosterLearners(left, right) {
+  const leftParts = rosterNameParts(left);
+  const rightParts = rosterNameParts(right);
+  return leftParts.last.localeCompare(rightParts.last, undefined, { sensitivity: "base" }) ||
+    leftParts.first.localeCompare(rightParts.first, undefined, { sensitivity: "base" });
 }
 
 function studentNameFor(sheet) {
@@ -2015,9 +2189,10 @@ function isDummyAnswerKey(sheet) {
 
 function identitySummary(sheet) {
   const learner = matchedLearner(sheet);
+  const manuallyMatched = manuallyMatchedLearner(sheet);
   const recognizedStudentId = sheet.studentId || sheet.bubbleStudentId || sheet.writtenStudentId;
   const parts = [
-    learner ? `Roster identity confirmed: ${learner.name}` : `Printed name: ${sheet.printedName || "not read"}`,
+    learner ? `${manuallyMatched ? "Roster identity assigned manually" : "Roster identity confirmed"}: ${learner.name}` : `Printed name: ${sheet.printedName || "not read"}`,
     `Student number: ${recognizedStudentId || "not read"}`,
     sheet.idMatchStatus || "",
   ];
@@ -2028,6 +2203,7 @@ function identitySummary(sheet) {
 
 function renderGradeWorkspace() {
   csvButton.disabled = true;
+  csvButton.hidden = true;
   if (!selectedGradeFormId) {
     const scannedFormCount = (gradeDashboardData?.forms || []).filter((form) =>
       sheetResults.some((sheet) => sheet.formId === form.form_id)).length;
@@ -2046,6 +2222,8 @@ function renderGradeWorkspace() {
   if (!scanSet) return;
   const formSheets = sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId);
   const studentSheets = formSheets.filter((sheet) => !isDummyAnswerKey(sheet));
+  csvButton.disabled = studentSheets.length === 0;
+  csvButton.hidden = studentSheets.length === 0;
   const issueNote = pageIssues.length ? ` · ${pageIssues.length} page/file issue(s) reported during scan` : "";
   if (!formSheets.length) {
     gradeSummary.textContent = `${scanSet.sourceName || "Scan set"}: no student scans.${issueNote}`;
@@ -2057,22 +2235,71 @@ function renderGradeWorkspace() {
 
 function getGradeKeyForScan(sheet) {
   const keyId = answerKeyByScanSet[sheet.scanSetId];
-  return sheetResults.find((candidate) => candidate.id === keyId && candidate.formId === sheet.formId) || null;
+  const key = sheetResults.find((candidate) => candidate.id === keyId && candidate.formId === sheet.formId) || null;
+  return completeAnswerKeyAnswers(key) ? key : null;
 }
 
-function gradeLabelForScan(sheet) {
-  if (sheet.rawScanVersion !== RAW_SCAN_VERSION) return "Rescan required";
+function correctAnswersForPreview(sheet) {
   const answerKey = getGradeKeyForScan(sheet);
-  if (answerKey && answerKey.id !== sheet.id && Array.isArray(sheet.answers) && sheet.answers.length) {
-    const grade = gradeForSheet(sheet, answerKey);
-    return `${grade.correct}/${grade.total} correct · ${grade.review} review · ${grade.total - grade.correct - grade.review} incorrect`;
-  }
-  const counts = sheet.annotationCounts || { total: (sheet.annotations || []).length, filled: 0, blank: 0, uncertain: 0 };
-  const answerCounts = sheet.answerCounts || {};
-  return `${counts.total} circles / ${counts.filled || 0} filled / ${counts.uncertain || 0} uncertain · ` +
-    `${answerCounts.selected || 0} selected / ${answerCounts.not_selected || 0} not selected / ${answerCounts.multiple || 0} multiple` +
-    (answerCounts.crossed ? ` / ${answerCounts.crossed} crossed` : "");
+  if (!answerKey || answerKey.id === sheet.id) return null;
+  return completeAnswerKeyAnswers(answerKey);
 }
+
+function scoreLabelForScan(sheet) {
+  const answerKey = getGradeKeyForScan(sheet);
+  if (sheet.rawScanVersion !== RAW_SCAN_VERSION || !answerKey || answerKey.id === sheet.id || !Array.isArray(sheet.answers)) return "—";
+  const grade = gradeForSheet(sheet, answerKey);
+  return `${grade.correct}/${grade.total}`;
+}
+
+function percentageLabelForScan(sheet) {
+  const answerKey = getGradeKeyForScan(sheet);
+  if (sheet.rawScanVersion !== RAW_SCAN_VERSION || !answerKey || answerKey.id === sheet.id || !Number(sheet.questionCount)) return "—";
+  const grade = gradeForSheet(sheet, answerKey);
+  return `${((grade.correct / grade.total) * 100).toFixed(1)}%`;
+}
+
+function rosterNumericScore(sheetRecords) {
+  const sheet = sheetRecords.find((item) => getGradeKeyForScan(item) && item.rawScanVersion === RAW_SCAN_VERSION);
+  if (!sheet) return null;
+  const grade = gradeForSheet(sheet, getGradeKeyForScan(sheet));
+  return grade.total ? grade.correct / grade.total : null;
+}
+
+function compareRosterRows(left, right) {
+  const leftValue = rosterSortKey === "name" ? left.name : rosterNumericScore(left.sheetRecords);
+  const rightValue = rosterSortKey === "name" ? right.name : rosterNumericScore(right.sheetRecords);
+  if (leftValue === null && rightValue !== null) return 1;
+  if (leftValue !== null && rightValue === null) return -1;
+  if (leftValue === null && rightValue === null) return left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
+  const comparison = typeof leftValue === "string"
+    ? leftValue.localeCompare(rightValue, undefined, { sensitivity: "base" })
+    : leftValue - rightValue;
+  return rosterSortDirection === "asc" ? comparison : -comparison;
+}
+
+function updateRosterSortIndicators() {
+  for (const button of rosterSortButtons) {
+    const active = button.dataset.rosterSort === rosterSortKey;
+    button.textContent = `${button.dataset.label} ${active ? (rosterSortDirection === "asc" ? "↑" : "↓") : "↕"}`;
+    button.setAttribute("aria-label", `Sort by ${button.dataset.label} ${active && rosterSortDirection === "desc" ? "ascending" : "descending"}`);
+    button.closest("th")?.setAttribute("aria-sort", active ? (rosterSortDirection === "asc" ? "ascending" : "descending") : "none");
+  }
+}
+
+for (const button of rosterSortButtons) {
+  button.addEventListener("click", () => {
+    const key = button.dataset.rosterSort;
+    if (key === rosterSortKey) rosterSortDirection = rosterSortDirection === "asc" ? "desc" : "asc";
+    else {
+      rosterSortKey = key;
+      rosterSortDirection = "asc";
+    }
+    updateRosterSortIndicators();
+    renderRosterTable();
+  });
+}
+updateRosterSortIndicators();
 
 function renderRosterTable() {
   rosterRows.replaceChildren();
@@ -2089,13 +2316,11 @@ function renderRosterTable() {
     appendRosterMessage("No active students are available from the course roster.");
     return;
   }
-  for (const learner of courseRoster) {
+  const rows = courseRoster.map((learner) => {
     const scans = learnerScans.get(learner.student_id) || [];
-    appendRosterRow(learner.name, learner.sis_login_id, scans.length
-      ? scans.map(gradeLabelForScan).join("; ")
-      : "—", scans);
-  }
-  for (const sheet of unidentified) {
+    return { name: rosterDisplayName(learner), learner, sheetRecords: scans, unidentified: false };
+  });
+  for (const [index, sheet] of unidentified.entries()) {
     const candidates = rosterCandidates(sheet);
     const rosterNote = candidates.length > 1
       ? `IDs match multiple roster students: ${candidates.map((learner) => learner.name).join(", ")}`
@@ -2105,8 +2330,18 @@ function renderRosterTable() {
       sheet.bubbleStudentId ? `ID bubbles ${sheet.bubbleStudentId}` : sheet.writtenStudentId ? `ID boxes ${sheet.writtenStudentId}` : "ID unreadable",
       rosterNote]
       .filter(Boolean).join(" · ");
-    appendRosterRow("Student not identified", idNote,
-      gradeLabelForScan(sheet), [sheet]);
+    rows.push({ name: "Student not identified", sheet, sheetRecords: [sheet], idNote,
+      nextSheetId: unidentified[index + 1]?.id || "", unidentified: true });
+  }
+  rows.sort(compareRosterRows);
+  for (const rowData of rows) {
+    if (rowData.unidentified) {
+      appendUnidentifiedRosterRow(rowData.sheet, rowData.idNote, rowData.nextSheetId);
+      continue;
+    }
+    const scans = rowData.sheetRecords;
+    appendRosterRow(rowData.name, scans.length ? scans.map(scoreLabelForScan).join("; ") : "—",
+      scans.length ? scans.map(percentageLabelForScan).join("; ") : "—", scans);
   }
 }
 
@@ -2119,7 +2354,7 @@ function appendRosterMessage(message) {
   rosterRows.append(row);
 }
 
-function appendRosterRow(name, sisLoginId, grade, sheetRecords = []) {
+function appendRosterRow(name, score, percentage, sheetRecords = []) {
   const row = document.createElement("tr");
   const nameCell = document.createElement("td");
   if (sheetRecords.length) {
@@ -2136,12 +2371,230 @@ function appendRosterRow(name, sisLoginId, grade, sheetRecords = []) {
   } else {
     nameCell.textContent = name;
   }
-  const idCell = document.createElement("td");
-  idCell.textContent = sisLoginId || "—";
-  const gradeCell = document.createElement("td");
-  gradeCell.textContent = grade;
-  row.append(nameCell, idCell, gradeCell);
+  const scoreCell = document.createElement("td");
+  scoreCell.textContent = score;
+  const percentageCell = document.createElement("td");
+  percentageCell.textContent = percentage;
+  row.append(nameCell, scoreCell, percentageCell);
   rosterRows.append(row);
+}
+
+function rosterSearchLabel(learner) {
+  const sisLogin = learner.sis_login_id || "no SIS login";
+  return `${rosterDisplayName(learner)} · ${sisLogin} · ${learner.student_id}`;
+}
+
+let unidentifiedDialogMatches = [];
+
+function updateUnidentifiedDialogMatches() {
+  const query = unidentifiedSearch.value.trim().toLocaleLowerCase();
+  unidentifiedDialogMatches = courseRoster.filter((learner) =>
+    rosterSearchLabel(learner).toLocaleLowerCase().includes(query));
+  unidentifiedMatch.replaceChildren(new Option(
+    unidentifiedDialogMatches.length ? "Choose student" : "No matching students", ""));
+  for (const learner of unidentifiedDialogMatches) {
+    unidentifiedMatch.add(new Option(rosterSearchLabel(learner), learner.student_id));
+  }
+  unidentifiedMatch.disabled = unidentifiedDialogMatches.length === 0;
+  if (unidentifiedDialogMatches.length === 1) unidentifiedMatch.value = unidentifiedDialogMatches[0].student_id;
+  unidentifiedAssign.disabled = !unidentifiedMatch.value;
+}
+
+async function createNameAreaPreview(sheet) {
+  if (!(sheet?.rawPage instanceof Blob)) return null;
+  const bitmap = await createImageBitmap(sheet.rawPage);
+  const scale = bitmap.width / A4.width;
+  // The printed name box is x=287, y=620, w≈281, h=36 in A4 points.
+  const sourceX = Math.max(0, Math.round((287 - 14) * scale));
+  const sourceY = Math.max(0, Math.round((A4.height - 620 - 36 - 20) * scale));
+  const sourceWidth = Math.min(bitmap.width - sourceX, Math.round((281 + 28) * scale));
+  const sourceHeight = Math.min(bitmap.height - sourceY, Math.round((36 + 34) * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, sourceWidth);
+  canvas.height = Math.max(1, sourceHeight);
+  canvas.getContext("2d").drawImage(bitmap, sourceX, sourceY, sourceWidth, sourceHeight,
+    0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("The name area preview could not be created.")), "image/png");
+  });
+}
+
+function closeUnidentifiedDialog() {
+  if (unidentifiedNameObjectUrl) URL.revokeObjectURL(unidentifiedNameObjectUrl);
+  unidentifiedNameObjectUrl = "";
+  unidentifiedNameImage.removeAttribute("src");
+  unidentifiedDialogSheet = null;
+  unidentifiedDialog.close();
+}
+
+async function openUnidentifiedDialog(sheet, nextSheetId = "") {
+  unidentifiedDialogSheet = sheet;
+  unidentifiedDialogNextId = nextSheetId;
+  unidentifiedDialogTitle.textContent = "Student not identified";
+  unidentifiedDialogMeta.textContent = `${sheet.sourceFile} · page ${sheet.pageNo}`;
+  unidentifiedSearch.value = "";
+  updateUnidentifiedDialogMatches();
+  unidentifiedNameStatus.hidden = true;
+  unidentifiedNameImage.alt = "Name area from unidentified scanned sheet";
+  if (unidentifiedNameObjectUrl) URL.revokeObjectURL(unidentifiedNameObjectUrl);
+  unidentifiedNameObjectUrl = "";
+  unidentifiedNameImage.removeAttribute("src");
+  unidentifiedDialog.showModal();
+  queueMicrotask(() => unidentifiedSearch.focus());
+  try {
+    const preview = await createNameAreaPreview(sheet);
+    if (!preview || unidentifiedDialogSheet !== sheet) {
+      unidentifiedNameStatus.textContent = "Name-area preview is unavailable; use Review scan for the full page.";
+      unidentifiedNameStatus.hidden = false;
+      return;
+    }
+    unidentifiedNameObjectUrl = URL.createObjectURL(preview);
+    unidentifiedNameImage.src = unidentifiedNameObjectUrl;
+  } catch (error) {
+    unidentifiedNameStatus.textContent = error.message;
+    unidentifiedNameStatus.hidden = false;
+  }
+}
+
+async function assignUnidentifiedDialogStudent() {
+  const learner = courseRoster.find((candidate) => candidate.student_id === unidentifiedMatch.value);
+  if (!learner || !unidentifiedDialogSheet) return;
+  const assignedSheet = unidentifiedDialogSheet;
+  const nextSheet = sheetResults.find((sheet) => sheet.id === unidentifiedDialogNextId);
+  assignedSheet.manualStudentId = learner.student_id;
+  await persistScanState();
+  closeUnidentifiedDialog();
+  renderRosterTable();
+  if (nextSheet) queueMicrotask(() => openUnidentifiedDialog(nextSheet, findNextUnidentifiedSheetId(nextSheet.id)));
+}
+
+function findNextUnidentifiedSheetId(currentId) {
+  const unidentified = sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId &&
+    !isDummyAnswerKey(sheet) && !matchedLearner(sheet));
+  const index = unidentified.findIndex((sheet) => sheet.id === currentId);
+  return index >= 0 ? unidentified[index + 1]?.id || "" : "";
+}
+
+unidentifiedSearch?.addEventListener("input", updateUnidentifiedDialogMatches);
+unidentifiedSearch?.addEventListener("keydown", async (event) => {
+  if (event.key === "ArrowDown" && unidentifiedDialogMatches.length > 1) {
+    event.preventDefault();
+    unidentifiedMatch.focus();
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    await assignUnidentifiedDialogStudent();
+  }
+});
+unidentifiedMatch?.addEventListener("change", () => { unidentifiedAssign.disabled = !unidentifiedMatch.value; });
+unidentifiedMatch?.addEventListener("keydown", async (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  await assignUnidentifiedDialogStudent();
+});
+unidentifiedAssign?.addEventListener("click", assignUnidentifiedDialogStudent);
+$("#unidentified-dialog-close")?.addEventListener("click", closeUnidentifiedDialog);
+unidentifiedDialog?.addEventListener("cancel", () => {
+  if (unidentifiedNameObjectUrl) URL.revokeObjectURL(unidentifiedNameObjectUrl);
+  unidentifiedNameObjectUrl = "";
+  unidentifiedDialogSheet = null;
+});
+
+function appendUnidentifiedRosterRow(sheet, idNote, nextSheetId = "") {
+  const row = document.createElement("tr");
+  const nameCell = document.createElement("td");
+  const nameLink = document.createElement("a");
+  nameLink.href = "#roster-assignment";
+  nameLink.className = "roster-student-link";
+  nameLink.textContent = "Student not identified";
+  nameLink.setAttribute("aria-label", "Identify this scanned student");
+  nameLink.addEventListener("click", (event) => {
+    event.preventDefault();
+    openUnidentifiedDialog(sheet, nextSheetId);
+  });
+  const previewLink = document.createElement("a");
+  previewLink.href = "#scan-preview";
+  previewLink.className = "unidentified-preview-link";
+  previewLink.textContent = "Review scan";
+  previewLink.addEventListener("click", (event) => {
+    event.preventDefault();
+    openStudentScans("Student not identified", [sheet]);
+  });
+  const identityNote = document.createElement("small");
+  identityNote.className = "roster-identity-note";
+  identityNote.textContent = idNote;
+  nameCell.append(nameLink, previewLink, identityNote);
+
+  const scoreCell = document.createElement("td");
+  scoreCell.textContent = scoreLabelForScan(sheet);
+
+  const percentageCell = document.createElement("td");
+  const percentageText = document.createElement("div");
+  percentageText.textContent = percentageLabelForScan(sheet);
+  const assignment = document.createElement("div");
+  assignment.className = "roster-assignment";
+  const label = document.createElement("label");
+  label.textContent = "Assign from roster — type to search, then press Enter";
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Search name, login or number";
+  search.autocomplete = "off";
+  search.setAttribute("aria-label", "Search course roster");
+  const select = document.createElement("select");
+  select.className = "review-select";
+  select.setAttribute("aria-label", "Matching roster student");
+  const assignButton = document.createElement("button");
+  assignButton.type = "button";
+  assignButton.className = "download-button";
+  assignButton.textContent = "Assign";
+
+  let matches = [];
+  const updateMatches = () => {
+    const query = search.value.trim().toLocaleLowerCase();
+    matches = courseRoster.filter((learner) => rosterSearchLabel(learner).toLocaleLowerCase().includes(query));
+    select.replaceChildren(new Option(matches.length ? "Choose student" : "No matching students", ""));
+    for (const learner of matches) select.add(new Option(rosterSearchLabel(learner), learner.student_id));
+    select.disabled = matches.length === 0;
+    if (matches.length === 1) select.value = matches[0].student_id;
+    assignButton.disabled = !select.value;
+  };
+  search.addEventListener("input", updateMatches);
+  select.addEventListener("change", () => { assignButton.disabled = !select.value; });
+  const assignSelectedStudent = async () => {
+    const learner = courseRoster.find((candidate) => candidate.student_id === select.value);
+    if (!learner) return false;
+    sheet.manualStudentId = learner.student_id;
+    pendingUnidentifiedFocusId = nextSheetId;
+    await persistScanState();
+    renderRosterTable();
+    return true;
+  };
+  assignButton.addEventListener("click", assignSelectedStudent);
+  search.addEventListener("keydown", async (event) => {
+    if (event.key === "ArrowDown" && matches.length > 1) {
+      event.preventDefault();
+      select.focus();
+      return;
+    }
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    await assignSelectedStudent();
+  });
+  select.addEventListener("keydown", async (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    await assignSelectedStudent();
+  });
+  updateMatches();
+  label.append(search);
+  assignment.append(label, select, assignButton);
+  percentageCell.append(percentageText, assignment);
+  row.append(nameCell, scoreCell, percentageCell);
+  rosterRows.append(row);
+  if (pendingUnidentifiedFocusId === sheet.id) {
+    pendingUnidentifiedFocusId = "";
+    queueMicrotask(() => search.focus());
+  }
 }
 
 function openStudentScans(name, sheetRecords) {
@@ -2184,10 +2637,17 @@ function openScanPreview(sheet) {
   originalScanToggle.title = hasCurrentRawPage
     ? "Show the scan with detected bubbles annotated."
     : "This scan was saved before original-page previews were added. Scan the PDF again to save its page image.";
-  if (hasCurrentRawPage && sheet.annotationVersion === ANNOTATION_VERSION && sheet.annotatedPage instanceof Blob) {
+  const expectedAnnotationKeyId = correctAnswersForPreview(sheet) ? answerKeyByScanSet[sheet.scanSetId] : "";
+  if (hasCurrentRawPage && sheet.annotationVersion === ANNOTATION_VERSION &&
+      (sheet.annotationKeyId || "") === expectedAnnotationKeyId && sheet.annotatedPage instanceof Blob) {
     showOriginalScanBlob(sheet, sheet.annotatedPage);
   } else if (hasCurrentRawPage) {
     showOriginalScanBlob(sheet, sheet.rawPage);
+    refreshSavedAnnotationsInBackground().then(() => {
+      if (previewedSheetId === sheet.id && sheet.annotatedPage instanceof Blob) {
+        showOriginalScanBlob(sheet, sheet.annotatedPage);
+      }
+    });
   }
   scanPreviewContent.replaceChildren();
   if (sheet.rawScanVersion !== RAW_SCAN_VERSION) {
@@ -2340,24 +2800,19 @@ function statusPill(status) {
 }
 
 function downloadCsv() {
-  const formSheets = sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId);
-  const rows = [["student_name", "sis_login_id", "student_number", "id_bubbles", "id_match_status", "source_pdf", "page", "form_id", "form_title", "answer_key_scan", "answer_key_page", "question", "answer", "correct_answer", "grade", "sample_expected_answer", "sample_pattern_check", "status", "note"]];
+  const formSheets = sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId && !isDummyAnswerKey(sheet));
+  const questionCount = formSheets.find((sheet) => Number(sheet.questionCount) > 0)?.questionCount;
+  const rows = [["student_id", "student_name", questionCount ? `score /${questionCount}` : "score", "percentage (%)"]];
   for (const sheet of formSheets) {
     const learner = matchedLearner(sheet);
     const key = getGradeKeyForScan(sheet);
-    const grade = key ? gradeForSheet(sheet, key) : null;
-    for (const [index, answer] of sheet.answers.entries()) {
-      const item = grade?.gradedAnswers[index];
-      const expectedSampleAnswer = sheet.sampleExpectedAnswers?.[index] || "";
-      const sampleCheck = expectedSampleAnswer
-        ? (answer.status !== "review" && answer.response === expectedSampleAnswer ? "match" : "mismatch")
-        : "";
-      rows.push([studentNameFor(sheet), learner?.sis_login_id || "", learner?.student_id || sheet.studentId,
-        sheet.bubbleIdRaw || "", sheet.idMatchStatus || "", sheet.sourceFile, sheet.pageNo, sheet.formId, sheet.formTitle,
-        key ? `${studentNameFor(key)} · ${key.sourceFile}` : "", key?.pageNo || "", answer.question,
-        answer.response, item?.correctAnswer?.response || "", item?.status || "not_graded",
-        expectedSampleAnswer, sampleCheck, answer.status, answer.reason]);
-    }
+    const grade = key && key.id !== sheet.id && sheet.rawScanVersion === RAW_SCAN_VERSION
+      ? gradeForSheet(sheet, key) : null;
+    const studentId = learner?.student_id || sheet.studentId || sheet.bubbleStudentId || sheet.writtenStudentId || "";
+    const studentName = learner ? rosterDisplayName(learner) : studentNameFor(sheet);
+    const score = grade ? grade.correct : "";
+    const percentage = grade ? ((grade.correct / grade.total) * 100).toFixed(1) : "";
+    rows.push([studentId, studentName, score, percentage]);
   }
   const csv = rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
   const blobUrl = URL.createObjectURL(new Blob(["\ufeff", csv], { type: "text/csv;charset=utf-8" }));
@@ -2385,7 +2840,10 @@ async function refreshSavedAnnotations() {
     // Legacy records intentionally cannot be re-read: their originalPage may
     // be contrast-adjusted or already annotated rather than raw pixels.
     if (sheet.rawScanVersion !== RAW_SCAN_VERSION || !(sheet.rawPage instanceof Blob)) continue;
-    if (sheet.annotationVersion === ANNOTATION_VERSION && sheet.annotatedPage instanceof Blob) continue;
+    const correctAnswers = correctAnswersForPreview(sheet);
+    const annotationKeyId = correctAnswers ? answerKeyByScanSet[sheet.scanSetId] : "";
+    if (sheet.annotationVersion === ANNOTATION_VERSION && sheet.annotationKeyId === annotationKeyId &&
+        sheet.annotatedPage instanceof Blob) continue;
     let bitmap = null;
     let canvas = null;
     try {
@@ -2396,22 +2854,24 @@ async function refreshSavedAnnotations() {
       canvas.getContext("2d", { willReadFrequently: true }).drawImage(bitmap, 0, 0);
       const marks = findRegistrationMarks(canvas);
       const form = formsById.get(String(sheet.formId).toLowerCase());
-      const mapping = form && marks ? createTemplateToRawMapping(marks, sheet.layoutVersion === 4 ? CURRENT_MARK_MARGIN : MARK_MARGIN) : null;
+      const mapping = form && marks ? createTemplateToRawMapping(marks, sheet.layoutVersion >= 4 ? CURRENT_MARK_MARGIN : MARK_MARGIN) : null;
       if (!mapping || !form) continue;
       const annotationData = detectRawBubbleAnnotations(canvas, form, sheet.layoutVersion, mapping);
-      if (sheet.annotationVersion !== ANNOTATION_VERSION || !(sheet.annotatedPage instanceof Blob)) {
-        sheet.annotatedPage = await createAnnotatedBubblePreview(canvas, annotationData);
-      }
-      if (JSON.stringify(sheet.annotations || []) !== JSON.stringify(annotationData.annotations) ||
+      const previewWasMissing = !(sheet.annotatedPage instanceof Blob);
+      sheet.annotatedPage = await createAnnotatedBubblePreview(canvas, annotationData, correctAnswers);
+      if (previewWasMissing ||
+          JSON.stringify(sheet.annotations || []) !== JSON.stringify(annotationData.annotations) ||
           JSON.stringify(sheet.annotationCounts || {}) !== JSON.stringify(annotationData.counts) ||
           JSON.stringify(sheet.answers || []) !== JSON.stringify(annotationData.answers) ||
           JSON.stringify(sheet.answerCounts || {}) !== JSON.stringify(annotationData.answerCounts) ||
-          sheet.annotationVersion !== ANNOTATION_VERSION) {
+          sheet.annotationVersion !== ANNOTATION_VERSION ||
+          sheet.annotationKeyId !== annotationKeyId) {
         sheet.annotations = annotationData.annotations;
         sheet.annotationCounts = annotationData.counts;
         sheet.answers = annotationData.answers;
         sheet.answerCounts = annotationData.answerCounts;
         sheet.annotationVersion = ANNOTATION_VERSION;
+        sheet.annotationKeyId = annotationKeyId;
         changed = true;
       }
     } catch (error) {
@@ -2436,4 +2896,12 @@ loadPersistedScanState().then(() => {
     renderGradeDashboardSheets([]);
     renderGradeWorkspace();
   }
+  // Annotation rules are versioned. Refresh saved browser-local scans as soon
+  // as the app opens, rather than requiring someone to navigate to Grade
+  // before they can see the current detector's green/blue overlay.
+  refreshSavedAnnotationsInBackground().then(() => {
+    renderScanSetList();
+    renderGradeDashboardSheets(gradeDashboardData?.forms || []);
+    renderGradeWorkspace();
+  });
 });
