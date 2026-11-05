@@ -21,7 +21,7 @@
     <nav class="phase-nav" aria-label="Workspace phases">
       <a href="{{ url_for('print_workspace') }}">1 · Print</a>
       <a class="{{ 'active' if initial_phase|default('scan') == 'scan' else '' }}" href="{{ url_for('scan_workspace') }}" {% if initial_phase|default('scan') == 'scan' %}aria-current="page"{% endif %} data-scan-link>2 · Scan</a>
-      <a class="{{ 'active' if initial_phase|default('scan') == 'grade' else '' }}" href="{{ url_for('grade_workspace') }}" {% if initial_phase|default('scan') == 'grade' %}aria-current="page"{% endif %} data-grade-link>3 · Review</a>
+      <a class="{{ 'active' if initial_phase|default('scan') == 'grade' else '' }}" href="{{ url_for('grade_workspace') }}" {% if initial_phase|default('scan') == 'grade' %}aria-current="page"{% endif %} data-grade-link>3 · Grade</a>
     </nav>
 
     <div id="scan-dashboard">
@@ -75,7 +75,7 @@
 
     <section id="grade-dashboard" class="results-section grade-workspace" aria-labelledby="grade-title" hidden>
       <div class="results-heading">
-        <div><p class="eyebrow">Phase 03 · Review</p><h2 id="grade-title">Raw scan annotations</h2><p id="grade-summary" class="muted"></p></div>
+        <div><p class="eyebrow">Phase 03 · Grade</p><h2 id="grade-title">Grade answer sheets</h2><p id="grade-summary" class="muted"></p></div>
       </div>
       <div id="grade-form-list" class="grade-form-list"></div>
       <section id="grade-set-list" class="grade-set-list" hidden aria-labelledby="grade-set-title">
@@ -99,6 +99,11 @@
         <div id="grade-roster-message" class="scan-errors roster-error" hidden></div>
         <label id="set-key-field" class="scan-key-field" for="set-key-select" hidden><span>Answer sheet for this scan set</span><select id="set-key-select" class="review-select"></select></label>
         <p class="scan-key-help">An answer sheet must contain exactly one detected answer for every question before it can be used as the key. In student previews, green filled circles are selected, solid blue circles show the correct answer, blue outlines are blank, and red Xs are excluded crossed-out selections.</p>
+        <div class="grade-tabs" role="tablist" aria-label="Scan set review views">
+          <button id="students-tab" class="grade-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="students-panel">Students</button>
+          <button id="analysis-tab" class="grade-tab" type="button" role="tab" aria-selected="false" aria-controls="analysis-panel">Analysis</button>
+        </div>
+        <div id="students-panel" role="tabpanel" aria-labelledby="students-tab">
         <div class="roster-table-wrap">
           <table class="roster-table">
             <thead><tr><th scope="col"><button type="button" class="roster-sort-button" data-roster-sort="name" data-label="Student">Student ↕</button></th><th scope="col"><button type="button" class="roster-sort-button" data-roster-sort="score" data-label="Score">Score ↕</button></th><th scope="col"><button type="button" class="roster-sort-button" data-roster-sort="percentage" data-label="Percentage">Percentage ↕</button></th></tr></thead>
@@ -117,12 +122,29 @@
           <div class="unidentified-name-preview"><img id="unidentified-name-image" alt="Name area from unidentified scanned sheet"><p id="unidentified-name-status" class="field-help" hidden></p></div>
           <div class="unidentified-assignment"><label for="unidentified-search">Search roster<input id="unidentified-search" class="review-select" type="search" placeholder="Type to search…" autocomplete="off"></label><select id="unidentified-match" class="review-select" aria-label="Matching roster student"></select><button id="unidentified-assign" class="primary-button" type="button">Assign and next</button></div>
         </dialog>
-      </section>
+        </div>
+        <section id="analysis-panel" class="analysis-panel" role="tabpanel" aria-labelledby="analysis-tab" hidden>
+          <div id="analysis-unavailable" class="analysis-unavailable" role="status" hidden></div>
+          <div id="analysis-content" hidden>
+            <div class="analysis-toolbar">
+              <label class="analysis-scheme-selector" for="analysis-scheme-select">Grade classes <select id="analysis-scheme-select" class="review-select"><option value="undergraduate">UG</option><option value="masters">PG</option></select></label>
+              <button id="analysis-pdf-export" class="download-button analysis-pdf-export" type="button" title="Open a landscape print view; choose Save as PDF">Export analysis PDF</button>
+            </div>
+            <div id="analysis-summary-cards" class="analysis-summary-cards"></div>
+            <article class="analysis-card"><div class="analysis-card-heading"><div><h4>Score distribution</h4><p class="muted">Overall correct answers divided by total questions.</p></div><label>Scale <select id="score-scale-select" class="review-select"><option value="fit">Fitted</option><option value="cohort">Cohort maximum</option></select></label></div><div id="score-distribution-chart" class="analysis-chart" tabindex="0" aria-label="Score distribution chart"></div></article>
+            <article class="analysis-card"><div class="analysis-card-heading"><div><h4>Percentage correct by question</h4><p class="muted">Valid single selections only; line shows the mean item percentage.</p></div><label>Scale <select id="item-scale-select" class="review-select"><option value="fit">Fitted</option><option value="full">0–100%</option></select></label></div><div id="item-correct-chart" class="analysis-chart analysis-chart-scroll" tabindex="0" aria-label="Percentage correct by question chart"></div></article>
+            <article class="analysis-card"><div class="analysis-card-heading"><div><h4>Kelley upper/lower 27% discrimination</h4><p class="muted">Upper and lower groups are ranked by total-question score.</p><div class="analysis-legend" aria-label="Discrimination quality bands"><span class="excellent">Excellent ≥ .35</span><span class="good">Good .25–.349</span><span class="acceptable">Acceptable .20–.249</span><span class="poor">Poor &lt; .20</span></div></div><label>Scale <select id="discrimination-scale-select" class="review-select"><option value="fit">Fitted</option><option value="full">−1 to 1</option></select></label></div><div id="discrimination-chart" class="analysis-chart analysis-chart-scroll" tabindex="0" aria-label="Item discrimination chart"></div></article>
+            <article class="analysis-card"><div class="analysis-card-heading"><div><h4>Answer-option distribution</h4><p class="muted">Valid single selections only. The keyed answer is outlined.</p></div><label>Scale <select id="option-scale-select" class="review-select"><option value="fit">Fitted</option><option value="full">0–100%</option></select></label></div><div id="option-distribution-chart" class="analysis-chart analysis-chart-scroll" tabindex="0" aria-label="Answer option distribution chart"></div></article>
+            <aside class="analysis-method-note"><strong>How item statistics are calculated</strong><p>Item statistics use valid single selections. Blank, crossed and multiple responses are excluded from item denominators but remain unearned in total scores.</p></aside>
+          </div>
+          <div id="analysis-tooltip" class="analysis-tooltip" role="tooltip" hidden></div>
+        </section>
     </section>
 
+    <button id="back-to-top" class="back-to-top" type="button" aria-label="Back to top" hidden>↑ <span>Back to top</span></button>
     <footer>printscangrade.com</footer>
   </main>
 
-<script type="module" src="{{ url_for('static', filename='scan.js', v=66) }}"></script>
+<script type="module" src="{{ url_for('static', filename='scan.js', v=72) }}"></script>
 </body>
 </html>

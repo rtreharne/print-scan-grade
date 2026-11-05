@@ -6,6 +6,7 @@ import random
 import re
 import secrets
 import sqlite3
+from statistics import NormalDist
 import time
 import uuid
 import zipfile
@@ -949,54 +950,69 @@ def make_sample_response_pdf(design, learner, logo=None, sample_index=0, seed=No
 
 
 def dummy_score_counts(student_count, question_count, rng):
-    """Return balanced, bounded correct-answer counts for a dummy cohort.
+    """Return bounded, bell-shaped correct-answer counts for a dummy cohort.
 
-    The paired offsets make the cohort's target mean exactly 65% and its
-    population standard deviation 20% before answers are rounded to whole
-    questions. Odd-sized cohorts retain one student at the mean.
+    Evenly spaced normal quantiles avoid the old two-cluster pattern produced
+    by paired low/high scores. The distribution is centred near 65%, has an
+    approximately 20% population spread, and is deliberately bounded across
+    the 10%–90% range so the generated cohort exercises the grade bands.
     """
     if student_count < 1 or question_count < 1:
         return []
-    target_mean = 0.65
-    target_stddev = 0.20
     minimum = math.ceil(question_count * 0.10)
     maximum = math.floor(question_count * 0.90)
     # Very short tests cannot express a distinct 10–90% interval.
     if minimum > maximum:
         minimum, maximum = 0, question_count
     if student_count == 1:
-        return [min(maximum, max(minimum, round(question_count * target_mean)))]
+        return [min(maximum, max(minimum, round(question_count * 0.65)))]
 
-    pair_count = student_count // 2
-    # For an odd cohort, the central score contributes no variance, so each
-    # pair needs a slightly wider offset to keep the cohort's target spread.
-    pair_offset_rms = target_stddev * math.sqrt(student_count / (2 * pair_count))
-    raw_offsets = [rng.uniform(0.995, 1.005) for _ in range(pair_count)]
-    raw_rms = math.sqrt(sum(offset * offset for offset in raw_offsets) / pair_count)
-    offsets = [pair_offset_rms * offset / raw_rms for offset in raw_offsets]
-    target_rates = [target_mean - offset for offset in offsets]
-    target_rates += [target_mean + offset for offset in offsets]
-    if student_count % 2:
-        target_rates.append(target_mean)
-    rng.shuffle(target_rates)
-
+    # Quantiles give every cohort size a smooth progression of scores instead
+    # of a handful of repeated low/high pairs. The slightly wider source
+    # distribution compensates for the 10%/90% clipping and yields roughly the
+    # requested 20% realised standard deviation.
+    normal = NormalDist(mu=0.67, sigma=0.23)
+    target_rates = [normal.inv_cdf((index + 0.5) / student_count)
+                    for index in range(student_count)]
+    target_rates = [min(0.90, max(0.10, rate)) for rate in target_rates]
     target_counts = [rate * question_count for rate in target_rates]
     counts = [min(maximum, max(minimum, round(target))) for target in target_counts]
+    compensatory_counts = {
+        count for count in range(minimum, maximum + 1)
+        if 0.35 <= count / question_count < 0.40
+    }
+
+    def move_out_of_compensatory(count, target):
+        if count not in compensatory_counts:
+            return count
+        candidates = [candidate for candidate in (count - 1, count + 1)
+                      if minimum <= candidate <= maximum and candidate not in compensatory_counts]
+        return min(candidates, key=lambda candidate: abs(candidate - target)) if candidates else count
+
+    counts = [move_out_of_compensatory(count, target)
+              for count, target in zip(counts, target_counts)]
+    # Keep visible tails so the histogram spans the grade boundaries even when
+    # the requested cohort is modest. The total is rebalanced below.
+    counts[0] = minimum
+    counts[-1] = maximum
     desired_total = min(student_count * maximum, max(student_count * minimum,
-                        round(student_count * question_count * target_mean)))
+                        round(student_count * question_count * 0.65)))
     # Correct rounding drift without favouring a particular learner.
     while sum(counts) < desired_total:
-        candidates = [index for index, score in enumerate(counts) if score < maximum]
+        candidates = [index for index, score in enumerate(counts)
+                      if score < maximum and counts[index] + 1 not in compensatory_counts]
         if not candidates:
             break
         index = max(candidates, key=lambda item: target_counts[item] - counts[item])
         counts[index] += 1
     while sum(counts) > desired_total:
-        candidates = [index for index, score in enumerate(counts) if score > minimum]
+        candidates = [index for index, score in enumerate(counts)
+                      if score > minimum and counts[index] - 1 not in compensatory_counts]
         if not candidates:
             break
         index = max(candidates, key=lambda item: counts[item] - target_counts[item])
         counts[index] -= 1
+    rng.shuffle(counts)
     return counts
 
 
@@ -1341,12 +1357,22 @@ def create_app():
         # Reserve those questions before choosing correct answers so the final
         # scored response, rather than a hidden preliminary mark, follows the
         # requested cohort distribution.
-        effective_score_counts = [
-            min(score_counts[index], question_count - len(
+        compensatory_effective_counts = {
+            score for score in range(question_count + 1)
+            if 0.35 <= score / question_count < 0.40
+        }
+        effective_score_counts = []
+        for index in range(count):
+            gradeable_count = question_count - len(
                 blanks_by_student[index] | set(multiples_by_student[index])
-            ))
-            for index in range(count)
-        ]
+            )
+            effective = min(score_counts[index], gradeable_count)
+            if effective in compensatory_effective_counts:
+                # Keep a final scored result out of the compensatory band even
+                # when a blank/multiple-answer slot lowered the planned score.
+                lower = min(effective - 1, math.ceil(question_count * 0.35) - 1)
+                effective = max(0, lower) if lower >= 0 else min(gradeable_count, math.ceil(question_count * 0.40))
+            effective_score_counts.append(effective)
         score_mean, score_stddev = score_distribution(effective_score_counts, question_count)
         answer_sheet = {
             "name": "Answer Sheet",
@@ -1369,7 +1395,8 @@ def create_app():
                 f"Student pages: {count}; questions per page: {question_count}.",
                 "Score target: 65% cohort average, 20% population standard deviation, bounded to 10%–90%.",
                 f"Generated scores: {score_mean:.0%} average, {score_stddev:.0%} standard deviation, "
-                f"{min(score_counts) / question_count:.0%}–{max(score_counts) / question_count:.0%} range.",
+                f"{min(effective_score_counts) / question_count:.0%}–{max(effective_score_counts) / question_count:.0%} range; "
+                "no compensatory-pass scores.",
                 f"Filled answer then crossed out: {correction_count} of {total_student_answers} student answers.",
                 f"Two filled answers with no cross: {multiple_count} of {total_student_answers} student answers.",
                 f"No answer filled: {blank_count} of {total_student_answers} student answers.",
