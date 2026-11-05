@@ -39,10 +39,10 @@
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}<div class="messages">{% for category, message in messages %}<p class="message {{ category }}" role="status">{{ message }}</p>{% endfor %}</div>{% endif %}
       {% endwith %}
-      <p class="muted">Select a completed answer-sheet PDF or a ZIP of PDFs. Student guide pages are skipped automatically. Pages are rendered temporarily by this app, then the original page image and annotations are saved in this browser for this course.</p>
+      <p class="muted">Select a completed answer-sheet PDF or a ZIP of PDFs. Student guide pages are skipped automatically. Pages are rendered and analyzed in this browser; scan images and results are saved in this browser for this course.</p>
       <label class="file-drop" for="scan-file">
         <span class="upload-symbol" aria-hidden="true">↑</span>
-        <span><strong>Select completed sheets (.pdf or .zip)</strong><small id="file-name">PDF pages are rendered by this app; scan images are saved in this browser.</small></span>
+        <span><strong>Select completed sheets (.pdf or .zip)</strong><small id="file-name">PDF pages are rendered in this browser; scan images are saved in this browser.</small></span>
         <input id="scan-file" type="file" accept=".pdf,application/pdf,.zip,application/zip" aria-describedby="zip-help">
       </label>
       <p id="zip-help" class="field-help">A PDF may contain multiple pages. ZIPs can contain multiple PDFs; non-PDF files are skipped. PDF limit: 64 MB each; ZIP limit: 256 MB.</p>
@@ -50,6 +50,7 @@
       <div id="scan-progress" class="scan-progress" role="status" aria-live="polite" hidden>
         <progress id="progress-bar" max="100" value="0"></progress>
         <span id="progress-label">Preparing scan…</span>
+        <div class="scan-stage-progress"><progress id="progress-stage-bar" max="100"></progress><span id="progress-stage-label">Current step</span></div>
       </div>
     </section>
 
@@ -87,6 +88,7 @@
         <div id="rescan-progress" class="scan-progress" role="status" aria-live="polite" hidden>
           <progress id="rescan-progress-bar" max="100" value="0"></progress>
           <span id="rescan-progress-label">Preparing re-scan…</span>
+          <div class="scan-stage-progress"><progress id="rescan-stage-bar" max="100"></progress><span id="rescan-stage-label">Current step</span></div>
         </div>
         <div id="grade-set-cards" class="grade-set-cards"></div>
       </section>

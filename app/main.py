@@ -9,18 +9,20 @@ import sqlite3
 from statistics import NormalDist
 import time
 import uuid
+import base64
 import zipfile
 from datetime import datetime, timezone
 from functools import wraps
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 import jwt
 import pymupdf
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, send_file, session, url_for
 from jwt.algorithms import RSAAlgorithm
 from reportlab.lib.pagesizes import A4
@@ -143,6 +145,14 @@ def connect():
             name TEXT PRIMARY KEY,
             applied_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS canvas_config (
+            id INTEGER PRIMARY KEY CHECK(id=1), base_url TEXT NOT NULL, token BLOB NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS canvas_connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+            base_url TEXT NOT NULL, token BLOB NOT NULL, updated_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS exam_designs (
             form_id TEXT PRIMARY KEY,
             issuer TEXT NOT NULL,
@@ -171,6 +181,10 @@ def connect():
     # registration table so existing launches continue to work and appear in
     # the admin UI.
     now = int(time.time())
+    legacy_canvas = db.execute("SELECT base_url, token, updated_at FROM canvas_config WHERE id=1").fetchone()
+    if legacy_canvas and not db.execute("SELECT 1 FROM canvas_connections LIMIT 1").fetchone():
+        db.execute("INSERT INTO canvas_connections (name, base_url, token, updated_at) VALUES (?,?,?,?)",
+                   ("Canvas", legacy_canvas["base_url"], legacy_canvas["token"], legacy_canvas["updated_at"]))
     for issuer, platform in environment_platforms().items():
         migration_name = f"deployment-clients:{issuer}"
         if db.execute(
@@ -270,13 +284,152 @@ def is_course_staff(roles):
 
 
 def active_course_context():
-    context = session.get("lti_course")
+    context = session.get("lti_course") or session.get("canvas_course")
     if not isinstance(context, dict) or not context.get("is_staff"):
         abort(403, "Launch Print Scan Grade from a MiniVLE course as an instructor to manage answer sheets.")
     required = ("issuer", "context_id", "deployment_id", "course_title", "user_id")
     if any(not context.get(key) for key in required):
         abort(403, "The active LTI course context is incomplete. Launch the app from MiniVLE again.")
     return context
+
+
+def canvas_cipher():
+    key = os.getenv("CANVAS_TOKEN_ENCRYPTION_KEY", "").strip()
+    if not key:
+        raise ValueError("Set CANVAS_TOKEN_ENCRYPTION_KEY before configuring Canvas.")
+    try:
+        return Fernet(key.encode())
+    except Exception as error:
+        raise ValueError("CANVAS_TOKEN_ENCRYPTION_KEY must be a valid Fernet key.") from error
+
+
+def canvas_config(connection_id=None):
+    with connect() as db:
+        if connection_id is None:
+            row = db.execute("SELECT id, name, base_url, token FROM canvas_connections ORDER BY id LIMIT 1").fetchone()
+        else:
+            row = db.execute("SELECT id, name, base_url, token FROM canvas_connections WHERE id=?", (connection_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        token = canvas_cipher().decrypt(row["token"]).decode()
+    except (InvalidToken, ValueError, UnicodeDecodeError) as error:
+        raise ValueError("Canvas token cannot be decrypted. Check CANVAS_TOKEN_ENCRYPTION_KEY.") from error
+    return {"id": row["id"], "name": row["name"], "base_url": row["base_url"], "token": token}
+
+
+def canvas_connection_list():
+    with connect() as db:
+        rows = db.execute("SELECT id, name, base_url FROM canvas_connections ORDER BY name, id").fetchall()
+    return [dict(row) for row in rows]
+
+
+def canvas_api(path, params=None, connection_id=None):
+    config = canvas_config(connection_id)
+    if not config:
+        raise ValueError("Canvas is not configured. Ask the app administrator to set it up.")
+    url = config["base_url"] + "/api/v1/" + path.lstrip("/")
+    if params:
+        url += "?" + urlencode(params, doseq=True)
+    items = []
+    for _ in range(100):
+        request_obj = Request(url, headers={"Authorization": "Bearer " + config["token"], "Accept": "application/json"})
+        try:
+            with urlopen(request_obj, timeout=12) as response:
+                payload = json.load(response)
+                link_header = response.headers.get("Link", "")
+        except Exception as error:
+            raise ValueError("Canvas API request failed. Check the token, Canvas URL, and course permissions.") from error
+        if isinstance(payload, list):
+            items.extend(payload)
+        else:
+            return payload
+        next_link = re.search(r'<([^>]+)>\s*;\s*rel="?next"?', link_header, re.I)
+        if not next_link:
+            return items
+        next_url = urlparse(next_link.group(1))
+        if next_url.scheme != "https" or next_url.netloc != urlparse(config["base_url"]).netloc:
+            raise ValueError("Canvas returned an unexpected pagination URL.")
+        url = next_link.group(1)
+    raise ValueError("Canvas returned too many pages.")
+
+
+def canvas_courses(connection_id=None):
+    courses = canvas_api("courses", {"enrollment_state": "active", "per_page": 100}, connection_id)
+    return [course for course in courses if course.get("id") and course.get("name")]
+
+
+def canvas_course_context(course_id, connection_id):
+    course_id = str(course_id)
+    course = next((item for item in canvas_courses(connection_id) if str(item.get("id")) == course_id), None)
+    if not course:
+        abort(403, "That Canvas course is not available to the configured token.")
+    config = canvas_config(connection_id)
+    return {
+        "issuer": config["base_url"], "context_id": course_id, "deployment_id": "canvas-personal-token",
+        "course_title": course["name"], "user_id": session.get("canvas_user", "instructor"), "is_staff": True,
+        "canvas": True, "canvas_connection_id": config["id"],
+    }
+
+
+def course_learners(context, allow_synthetic_ids=False):
+    if not context.get("canvas"):
+        return fetch_active_learners(context)
+    rows = canvas_api(f"courses/{context['context_id']}/enrollments", {
+        "type[]": "StudentEnrollment", "state[]": "active", "per_page": 100,
+        "include[]": "user",
+    }, context.get("canvas_connection_id"))
+    learners = []
+    for enrollment in rows:
+        user = enrollment.get("user") or {}
+        name = str(user.get("name") or "").strip()
+        login = str(user.get("login_id") or user.get("sis_user_id") or "").strip()
+        if not name:
+            name = login or str(user.get("id") or "Student")
+        # Canvas can expose the institutional number in different SIS fields
+        # depending on the enrollment source. Search both the enrollment and
+        # embedded user payload, including SIS IDs and login IDs.
+        id_values = []
+        for record in (enrollment, user):
+            for key, value in record.items():
+                if value is not None and ("sis" in key.lower() or key.lower() in {
+                    "login_id", "integration_id", "student_id", "user_id"
+                }):
+                    values = value if isinstance(value, (list, tuple)) else [value]
+                    id_values.extend(str(item).strip() for item in values if item is not None)
+        id_values.append(login)
+        matches = list(dict.fromkeys(
+            match
+            for value in id_values
+            for match in re.findall(r"(?<!\d)(\d{9})(?!\d)", value)
+        ))
+        # Use a nine-digit SIS/login value only when the Canvas response points
+        # to exactly one candidate; ambiguous records are treated as missing.
+        student_id = matches[0] if len(matches) == 1 else ""
+        learners.append({"name": name, "sis_login_id": login, "student_id": student_id})
+    ids = [item["student_id"] for item in learners]
+    id_counts = {}
+    for student_id in ids:
+        id_counts[student_id] = id_counts.get(student_id, 0) + 1
+    duplicate_ids = {student_id for student_id, count in id_counts.items() if count > 1}
+    invalid = [not re.fullmatch(r"\d{9}", student_id) or student_id in duplicate_ids for student_id in ids]
+    if any(invalid):
+        if not allow_synthetic_ids:
+            if duplicate_ids:
+                raise ValueError("Canvas returned duplicate student numbers for active students.")
+            raise ValueError("Canvas roster is missing a unique nine-digit student ID for an active student.")
+        reserved = {student_id for student_id in ids if re.fullmatch(r"\d{9}", student_id)}
+        candidate = 999999999
+        for learner, needs_id in zip(learners, invalid):
+            if not needs_id:
+                continue
+            while f"{candidate:09d}" in reserved:
+                candidate -= 1
+            learner["student_id"] = f"{candidate:09d}"
+            learner["synthetic_student_id"] = True
+            reserved.add(learner["student_id"])
+            candidate -= 1
+    return learners
 
 
 def _same_origin(left, right):
@@ -1040,9 +1193,92 @@ def create_app():
         MAX_CONTENT_LENGTH=4 * 1024 * 1024,
     )
 
+    @app.after_request
+    def iframe_headers(response):
+        if request.path.startswith("/canvas") or request.path in {"/print", "/scan", "/grade"} and session.get("canvas_course"):
+            response.headers.pop("X-Frame-Options", None)
+            ancestors = ["'self'", "https://*.instructure.com", "https://*.canvaslms.com"]
+            connection_id = request.args.get("connection_id", type=int)
+            if not connection_id and request.path == "/canvas/login":
+                next_target = request.args.get("next") or request.form.get("next", "")
+                if next_target.startswith("/canvas"):
+                    connection_id = parse_qs(urlparse(next_target).query).get("connection_id", [None])[0]
+                    try:
+                        connection_id = int(connection_id) if connection_id else None
+                    except ValueError:
+                        connection_id = None
+            active_course = session.get("canvas_course")
+            canvas_origin = active_course.get("issuer") if isinstance(active_course, dict) else None
+            if not canvas_origin and connection_id:
+                try:
+                    configured = canvas_config(connection_id)
+                    canvas_origin = configured.get("base_url") if configured else None
+                except ValueError:
+                    canvas_origin = None
+            if canvas_origin and canvas_origin not in ancestors:
+                ancestors.append(canvas_origin)
+            response.headers["Content-Security-Policy"] = "frame-ancestors " + " ".join(ancestors)
+        return response
+
     @app.get("/")
     def home():
         return render_template("landing.html", course=None, launched=False)
+
+    def canvas_login_required(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            if not session.get("canvas_authenticated") and not session.get("lti_course"):
+                return redirect(url_for("canvas_login", next=request.full_path))
+            return view(*args, **kwargs)
+        return wrapped
+
+    @app.route("/canvas/login", methods=["GET", "POST"])
+    def canvas_login():
+        error = ""
+        if request.method == "POST":
+            username = os.getenv("CANVAS_USERNAME", "")
+            password = os.getenv("CANVAS_PASSWORD", "")
+            if username and password and secrets.compare_digest(request.form.get("username", ""), username) and secrets.compare_digest(request.form.get("password", ""), password):
+                next_target = request.form.get("next", "")
+                session.clear()
+                session["canvas_authenticated"] = True
+                session["canvas_user"] = username
+                target = next_target if next_target.startswith("/canvas") else url_for("canvas_home")
+                return redirect(target)
+            error = "Incorrect username or password, or Canvas login is not configured."
+        return render_template("canvas_login.html", error=error, next=request.args.get("next", "") or request.form.get("next", "")), 401 if error else 200
+
+    @app.post("/canvas/logout")
+    @canvas_login_required
+    def canvas_logout():
+        if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("canvas_csrf", "")):
+            abort(400, "Invalid form token.")
+        session.clear()
+        return redirect(url_for("canvas_login"))
+
+    @app.route("/canvas", methods=["GET", "POST"])
+    @canvas_login_required
+    def canvas_home():
+        if request.method == "POST":
+            if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("canvas_csrf", "")):
+                abort(400, "Invalid form token.")
+            session["canvas_course"] = canvas_course_context(request.form.get("course_id", ""), request.form.get("connection_id", type=int))
+            return redirect(url_for("print_workspace"))
+        error = ""
+        connections = canvas_connection_list()
+        selected_connection = request.args.get("connection_id", type=int) or (connections[0]["id"] if connections else None)
+        try:
+            courses = canvas_courses(selected_connection) if selected_connection else []
+        except ValueError as exc:
+            courses, error = [], str(exc)
+        requested_course = request.args.get("course_id", "").strip()
+        if requested_course and selected_connection and not error:
+            session["canvas_course"] = canvas_course_context(requested_course, selected_connection)
+            return redirect(url_for("print_workspace"))
+        if "canvas_csrf" not in session:
+            session["canvas_csrf"] = secrets.token_urlsafe(32)
+        return render_template("canvas_courses.html", courses=courses, error=error,
+                               connections=connections, selected_connection=selected_connection)
 
     def admin_required(view):
         @wraps(view)
@@ -1060,8 +1296,8 @@ def create_app():
             if (secrets.compare_digest(request.form.get("username", ""), username) and
                     secrets.compare_digest(request.form.get("password", ""), password) and username and password):
                 session["lti_admin_authenticated"] = True
-                target = request.args.get("next") or request.form.get("next") or url_for("lti_admin")
-                return redirect(target if target.startswith("/") else url_for("lti_admin"))
+                target = request.args.get("next") or request.form.get("next") or url_for("canvas_admin")
+                return redirect(target if target.startswith("/") else url_for("canvas_admin"))
             return render_template("admin_login.html", error="Incorrect username or password.", next=request.form.get("next", "")), 401
         return render_template("admin_login.html", error="", next=request.args.get("next", ""))
 
@@ -1107,6 +1343,64 @@ def create_app():
             clients = [dict(row) for row in db.execute("SELECT * FROM lti_clients ORDER BY issuer, name")]
         return render_template("lti_admin.html", clients=clients)
 
+    @app.route("/admin/canvas", methods=["GET", "POST"])
+    @admin_required
+    def canvas_admin():
+        error = ""
+        if "canvas_admin_csrf" not in session:
+            session["canvas_admin_csrf"] = secrets.token_urlsafe(32)
+        if request.method == "POST":
+            if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("canvas_admin_csrf", "")):
+                abort(400, "Invalid form token.")
+            connection_id = request.form.get("id", "").strip()
+            name = request.form.get("name", "").strip()
+            base = request.form.get("base_url", "").strip().rstrip("/")
+            token = request.form.get("token", "")
+            parsed = urlparse(base)
+            if not name:
+                error = "Enter a name for this Canvas connection."
+            elif parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+                error = "Canvas URL must be a valid HTTPS origin."
+            elif not token and not connection_id:
+                error = "Enter a Canvas personal API token."
+            else:
+                try:
+                    cipher = canvas_cipher()
+                    previous = canvas_config(int(connection_id)) if connection_id else None
+                    if connection_id and not previous:
+                        abort(404)
+                    encrypted = cipher.encrypt((token or previous["token"]).encode())
+                    with connect() as db:
+                        if connection_id:
+                            db.execute("UPDATE canvas_connections SET name=?, base_url=?, token=?, updated_at=? WHERE id=?",
+                                       (name, base, encrypted, int(time.time()), connection_id))
+                        else:
+                            db.execute("INSERT INTO canvas_connections (name, base_url, token, updated_at) VALUES (?,?,?,?)",
+                                       (name, base, encrypted, int(time.time())))
+                    return redirect(url_for("canvas_admin"))
+                except ValueError as exc:
+                    error = str(exc)
+        connections = canvas_connection_list()
+        course_options, course_errors = {}, {}
+        for connection in connections:
+            try:
+                course_options[str(connection["id"])] = canvas_courses(connection["id"])
+            except ValueError as exc:
+                course_options[str(connection["id"])] = []
+                course_errors[str(connection["id"])] = str(exc)
+        return render_template("canvas_admin.html", connections=connections, error=error,
+                               course_options=course_options, course_errors=course_errors,
+                               app_base_url=base_url())
+
+    @app.post("/admin/canvas/<int:connection_id>/delete")
+    @admin_required
+    def canvas_connection_delete(connection_id):
+        if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("canvas_admin_csrf", "")):
+            abort(400, "Invalid form token.")
+        with connect() as db:
+            db.execute("DELETE FROM canvas_connections WHERE id=?", (connection_id,))
+        return redirect(url_for("canvas_admin"))
+
     @app.post("/admin/lti/<int:client_pk>/delete")
     @admin_required
     def delete_lti_client(client_pk):
@@ -1142,15 +1436,18 @@ def create_app():
         ), status
 
     @app.get("/print")
+    @canvas_login_required
     def print_workspace():
         return render_print_workspace(active_course_context())
 
     @app.get("/scan")
+    @canvas_login_required
     def scan_workspace():
         context = active_course_context()
         return render_template("scan.html", context=context)
 
     @app.post("/scan/render-page")
+    @canvas_login_required
     def render_scan_page():
         active_course_context()
         request.max_content_length = 64 * 1024 * 1024
@@ -1180,6 +1477,7 @@ def create_app():
         return response
 
     @app.get("/scan/forms.json")
+    @canvas_login_required
     def scan_forms_manifest():
         context = active_course_context()
         with connect() as db:
@@ -1201,6 +1499,7 @@ def create_app():
         return jsonify(scan_forms)
 
     @app.get("/scan/dummy-options.json")
+    @canvas_login_required
     def scan_dummy_options():
         context = active_course_context()
         with connect() as db:
@@ -1209,15 +1508,17 @@ def create_app():
                 (context["issuer"], context["context_id"]),
             ).fetchall()
         try:
-            learners = fetch_active_learners(context)
+            learners = course_learners(context, allow_synthetic_ids=True)
         except ValueError as error:
             return jsonify({"error": str(error), "forms": [], "student_count": 0}), 503
         return jsonify({
             "forms": [dict(row) for row in rows],
             "student_count": len(learners),
+            "synthetic_student_ids": any(learner.get("synthetic_student_id") for learner in learners),
         })
 
     @app.get("/grade")
+    @canvas_login_required
     def grade_workspace():
         context = active_course_context()
         with connect() as db:
@@ -1229,16 +1530,19 @@ def create_app():
         grade_forms = [dict(row) for row in rows]
         if request.args.get("format") != "json":
             return render_template("scan.html", context=context, initial_phase="grade")
-        roster_available = bool(
+        roster_available = bool(context.get("canvas") or (
             context.get("nrps_url") and
             (platform_client(context["issuer"], context.get("client_id")) or
              platforms().get(context["issuer"]) or {}).get("token_endpoint")
-        )
+        ))
         roster = []
         roster_error = ""
         if roster_available:
             try:
-                roster = fetch_active_learners(context)
+                # Keep usable Canvas enrollments available for cross-reference
+                # even when some students lack unique SIS numbers. Those rows
+                # receive temporary IDs that cannot match a scanned sheet.
+                roster = course_learners(context, allow_synthetic_ids=True)
             except ValueError as error:
                 roster_error = str(error)
         return jsonify({
@@ -1249,6 +1553,7 @@ def create_app():
         })
 
     @app.get("/scan/<form_id>/sample.pdf")
+    @canvas_login_required
     def download_sample_response(form_id):
         context = active_course_context()
         with connect() as db:
@@ -1263,7 +1568,7 @@ def create_app():
         if not design:
             abort(404)
         try:
-            learners = fetch_active_learners(context)
+            learners = course_learners(context)
         except ValueError as error:
             flash(str(error), "error")
             return redirect(url_for("scan_workspace"))
@@ -1280,6 +1585,7 @@ def create_app():
         )
 
     @app.get("/scan/<form_id>/dummy.zip")
+    @canvas_login_required
     def download_dummy_response_zip(form_id):
         context = active_course_context()
         try:
@@ -1306,7 +1612,7 @@ def create_app():
         if not design:
             abort(404)
         try:
-            learners = fetch_active_learners(context)
+            learners = course_learners(context, allow_synthetic_ids=True)
         except ValueError as error:
             abort(503, str(error))
         if not learners:
@@ -1476,6 +1782,7 @@ def create_app():
         )
 
     @app.post("/print/logo")
+    @canvas_login_required
     def update_course_logo():
         context = active_course_context()
         submitted_csrf = request.form.get("csrf_token", "")
@@ -1513,6 +1820,7 @@ def create_app():
         return redirect(url_for("print_workspace"))
 
     @app.post("/print/designs")
+    @canvas_login_required
     def create_exam_design():
         context = active_course_context()
         submitted_csrf = request.form.get("csrf_token", "")
@@ -1561,6 +1869,7 @@ def create_app():
         return redirect(url_for("print_workspace"))
 
     @app.get("/print/designs/<form_id>.pdf")
+    @canvas_login_required
     def download_exam_design(form_id):
         context = active_course_context()
         with connect() as db:
@@ -1581,6 +1890,7 @@ def create_app():
         )
 
     @app.post("/print/designs/<form_id>/delete")
+    @canvas_login_required
     def delete_exam_design(form_id):
         context = active_course_context()
         submitted_csrf = request.form.get("csrf_token", "")

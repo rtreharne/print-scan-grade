@@ -16,10 +16,14 @@ const dummyZipButtonText = dummyZipButton?.textContent || "Download dummy ZIP";
 const progressBox = $("#scan-progress");
 const progressBar = $("#progress-bar");
 const progressLabel = $("#progress-label");
+const progressStageBar = $("#progress-stage-bar");
+const progressStageLabel = $("#progress-stage-label");
 const rescanFileInput = $("#rescan-file");
 const rescanProgressBox = $("#rescan-progress");
 const rescanProgressBar = $("#rescan-progress-bar");
 const rescanProgressLabel = $("#rescan-progress-label");
+const rescanStageBar = $("#rescan-stage-bar");
+const rescanStageLabel = $("#rescan-stage-label");
 const rescanResultMessage = $("#rescan-result-message");
 const csvButton = $("#download-csv");
 const backToTopButton = $("#back-to-top");
@@ -121,7 +125,9 @@ async function initializeDummyZipForm() {
     }
     dummyStudentCount.max = String(options.student_count);
     dummyStudentCount.value = String(Math.min(options.student_count, 5));
-    dummyStudentLimit.textContent = `Choose from 1 to ${options.student_count} enrolled students.`;
+    dummyStudentLimit.textContent = options.synthetic_student_ids
+      ? `Choose from 1 to ${options.student_count} students. Missing Canvas IDs will use generated test IDs.`
+      : `Choose from 1 to ${options.student_count} enrolled students.`;
     dummyStudentCount.disabled = false;
     dummyZipButton.disabled = false;
   } catch (error) {
@@ -654,11 +660,15 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
     rescanProgressBox.hidden = false;
     rescanProgressBar.value = 0;
     rescanProgressBar.max = 1;
+    rescanStageBar.removeAttribute("value");
+    rescanStageLabel.textContent = "Preparing";
   } else {
     scanButton.disabled = true;
     progressBox.hidden = false;
     progressBar.value = 0;
     progressBar.max = 1;
+    progressStageBar.removeAttribute("value");
+    progressStageLabel.textContent = "Preparing";
   }
   setProgress(fileType === "pdf" ? "Preparing PDF…" : fileType === "zip" ? "Opening ZIP…" : "Checking file…");
 
@@ -703,15 +713,18 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
       try {
         bytes = await entry.async("uint8array");
         if (!hasPdfHeader(bytes)) throw new Error("The file does not contain a readable PDF.");
-        // PDF.js transfers its input buffer to a worker. Keep a separate copy
-        // for the page renderer, which needs the original PDF bytes.
-        const renderBytes = bytes.slice();
         loadingTask = pdfjsLib.getDocument({ data: bytes, isEvalSupported: false, useWorkerFetch: false });
         pdf = await loadingTask.promise;
+        if (!isRescan) progressBar.max += Math.max(0, pdf.numPages - 1);
+        else rescanProgressBar.max += Math.max(0, pdf.numPages - 1);
         for (let pageNo = 1; pageNo <= pdf.numPages; pageNo += 1) {
+          const pageProgress = fileIndex + pageNo - 1;
+          if (isRescan) rescanProgressBar.value = pageProgress;
+          else progressBar.value = pageProgress;
+          setStageProgress("Rendering and analyzing page");
           setProgress(`Scanning ${entry.name} · page ${pageNo} of ${pdf.numPages}`);
           try {
-            const result = await scanPage(pdf, pageNo, entry.name, renderBytes);
+            const result = await scanPage(pdf, pageNo, entry.name);
             if (result?.guidePage) guidePagesSkipped += 1;
             else {
               result.id = globalThis.crypto?.randomUUID?.() || `scan-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -742,6 +755,8 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
           } catch (error) {
             pageIssues.push({ file: entry.name, page: pageNo, reason: error.message || "Page could not be read" });
           }
+          if (isRescan) rescanProgressBar.value += 1;
+          else progressBar.value += 1;
         }
       } catch (error) {
         pageIssues.push({ file: entry.name, page: "—", reason: error.message || "PDF could not be opened" });
@@ -756,8 +771,8 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
         }
         bytes = null;
       }
-      progressBar.value = fileIndex + 1;
-      if (isRescan) rescanProgressBar.value = fileIndex + 1;
+      if (isRescan) rescanProgressBar.value = Math.max(rescanProgressBar.value, fileIndex + 1);
+      else progressBar.value = Math.max(progressBar.value, fileIndex + 1);
     }
   } catch (error) {
     pageIssues.push({ file: file.name, page: "—", reason: error.message || `${fileType === "pdf" ? "PDF" : "ZIP"} could not be read` });
@@ -800,11 +815,15 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
     return;
   }
   fileName.textContent = "Processing finished. Select another PDF or ZIP to start a new scan.";
-  progressBox.hidden = true;
   scanButton.disabled = true;
   finishScan();
+  setProgress("Saving scan results…");
+  setStageProgress("Writing results to this browser");
   await persistScanState();
+  setProgress("Loading course roster and grades…");
+  setStageProgress("Waiting for Canvas roster");
   await showGradeDashboard(true).catch(showGradeLoadError);
+  progressBox.hidden = true;
 }
 
 function getScanFileType(file) {
@@ -819,25 +838,24 @@ function hasPdfHeader(bytes) {
   return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2d;
 }
 
-async function scanPage(pdf, pageNo, sourceFile, pdfBytes) {
-  const response = await fetch(`/scan/render-page?page=${pageNo}`, {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/pdf", "X-Scan-Render": "1" },
-    body: pdfBytes,
-  });
-  if (!response.ok) throw new Error(`The PDF page could not be rendered (${response.status}).`);
-  const rawPage = await response.blob();
-  const bitmap = await createImageBitmap(rawPage);
+async function scanPage(pdf, pageNo, sourceFile) {
+  // Render with PDF.js in the browser. Uploads and scan results stay local,
+  // and each page avoids a PDF upload/render/PNG download round trip.
+  const page = await pdf.getPage(pageNo);
+  const baseViewport = page.getViewport({ scale: 1 });
+  const scale = Math.min(2.8, 1600 / Math.max(baseViewport.width, baseViewport.height));
+  const viewport = page.getViewport({ scale });
+  setStageProgress("Rendering page in browser");
   const sourceCanvas = document.createElement("canvas");
-  sourceCanvas.width = bitmap.width;
-  sourceCanvas.height = bitmap.height;
+  sourceCanvas.width = Math.ceil(viewport.width);
+  sourceCanvas.height = Math.ceil(viewport.height);
   const sourceContext = sourceCanvas.getContext("2d", { willReadFrequently: true });
-  sourceContext.drawImage(bitmap, 0, 0);
-  bitmap.close();
+  await page.render({ canvasContext: sourceContext, viewport }).promise;
+  page.cleanup();
   // This page never changes after it has been rendered. Keep one readback and
   // share it with structural detection and every rectification candidate.
   const sourceImage = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+  setStageProgress("Detecting answer and ID bubbles");
 
   // Scanner apps often produce a pale gray page. Use a maximally contrasted
   // black/white copy for structural detection, while retaining the original
@@ -928,6 +946,7 @@ async function scanPage(pdf, pageNo, sourceFile, pdfBytes) {
     const form = identifyScannedForm(qr);
     if (!form.ok) throw new Error(form.reason);
     setProgress(`Annotating raw scan circles - ${sourceFile} - page ${pageNo}`);
+    setStageProgress("Analyzing detected bubbles");
     const rawMapping = createTemplateToRawMapping(
       selectedRegistrationPoints,
       form.layoutVersion >= 4 ? CURRENT_MARK_MARGIN : MARK_MARGIN,
@@ -3183,6 +3202,13 @@ function csvCell(value) {
 function setProgress(message) {
   progressLabel.textContent = message;
   rescanProgressLabel.textContent = message;
+}
+
+function setStageProgress(message) {
+  progressStageLabel.textContent = message;
+  rescanStageLabel.textContent = message;
+  progressStageBar.removeAttribute("value");
+  rescanStageBar.removeAttribute("value");
 }
 
 async function refreshSavedAnnotations() {
