@@ -958,10 +958,12 @@ async function scanPage(pdf, pageNo, sourceFile) {
     // ID bubbles are analysed as part of the same raw-page pass. Do not read
     // the same 90 circles again from the rectified canvas.
     const bubbleIdentity = readStudentIdFromSignals(annotations.idSignals, form.layoutVersion);
+    const rawPage = await new Promise((resolve) => sourceCanvas.toBlob(resolve, "image/png"));
+    if (!rawPage) throw new Error("The scanned page image could not be saved in browser storage format.");
     let annotatedPage = null;
     try {
-      // The server-rendered PNG is saved unchanged as rawPage. Draw diagnostic
-      // overlays only on a separate copy of those pixels.
+      // Keep the raw browser-rendered PNG unchanged. Draw diagnostic overlays
+      // only on a separate copy of those pixels.
       annotatedPage = await createAnnotatedBubblePreview(
         sourceCanvas, annotations,
       );
