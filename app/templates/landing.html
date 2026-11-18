@@ -4,48 +4,98 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#101b2b">
-  <title>Print Scan Grade</title>
+  <meta name="description" content="PrintScanGrade helps you create paper MCQ answer sheets, scan completed exams, match students, review grades and analyse questions. Use standalone or through LTI.">
+  <title>PrintScanGrade · Paper exams, clear results</title>
   <link rel="icon" href="{{ url_for('static', filename='logo.svg') }}" type="image/svg+xml">
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='landing-3') }}">
 </head>
-<body>
-  <main class="page">
-    <div class="hero">
-      <img class="logo" src="{{ url_for('static', filename='logo.svg') }}" alt="" width="104" height="104">
+<body class="landing-page">
+  <a class="landing-skip" href="#main-content">Skip to content</a>
+  <header class="landing-header landing-container">
+    <a class="landing-brand" href="{{ url_for('home') }}" aria-label="PrintScanGrade home"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="42" height="42"><span>PrintScanGrade</span></a>
+    <nav class="landing-nav" aria-label="Main navigation"><a href="#how-it-works">How it works</a><a href="#review">Review &amp; analysis</a><a href="#lti">LTI setup</a></nav>
+    <a class="landing-github" href="https://github.com/rtreharne/print-scan-grade" target="_blank" rel="noopener noreferrer" aria-label="PrintScanGrade on GitHub (opens in a new tab)" title="View the GitHub repository">
+      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><path d="M12 .297C5.37.297 0 5.67 0 12.297c0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.043-1.61-4.043-1.61-.546-1.387-1.333-1.756-1.333-1.756-1.09-.745.083-.729.083-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.807 1.305 3.492.998.108-.776.418-1.305.762-1.605-2.665-.305-5.467-1.334-5.467-5.93 0-1.31.467-2.38 1.235-3.22-.135-.303-.54-1.524.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.652.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.609-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
+    </a>
+  </header>
+
+  <main id="main-content" class="landing-container">
+    <section class="landing-hero" aria-labelledby="landing-title">
       <p class="eyebrow">Paper exams, connected</p>
-      <h1>Print <span>Scan</span> Grade</h1>
-      <p class="lead">Create MCQ answer sheets, scan completed papers, and send results to your VLE.</p>
+      <h1 id="landing-title">Paper exams.<br><span>Clear results.</span></h1>
+      <p class="landing-lead">Create multiple-choice answer sheets, read completed scans, and turn them into student grades and question analysis.</p>
+      <p class="landing-intro">PrintScanGrade brings printing, scanning and grading into one workspace. Check what was read against the original page, resolve student matches, and export the results when you’re ready.</p>
+      <div class="landing-actions"><a class="landing-button" href="{{ url_for('standalone_home') }}">Create a standalone workspace <span aria-hidden="true">→</span></a><a class="landing-text-link" href="#how-it-works">See how it works <span aria-hidden="true">↓</span></a></div>
+      <p class="landing-caption">Use it on its own, embed it in your VLE, or launch it from a course through LTI 1.3.</p>
       {% if launched %}
-      <p class="course">Launched from <strong>{{ course }}</strong></p>
-      {% if is_staff %}
-      <p class="course"><a href="{{ url_for('print_workspace') }}">Open course answer sheets</a></p>
-      {% else %}
-      <p class="course">Answer-sheet design is available to course instructors.</p>
+      <aside class="landing-course" role="status">
+        <strong>Launched from {{ course }}</strong>
+        {% if is_staff %}<p><a href="{{ url_for('print_workspace') }}">Open your course workspace →</a></p>
+        {% else %}<p>Your instructor manages answer sheets and grading. This launch does not grant instructor access.</p>{% endif %}
+      </aside>
       {% endif %}
-      {% endif %}
-      <section class="registration" aria-labelledby="registration-title">
-        <div class="registration-copy">
-          <p class="registration-label" id="registration-title">Register this tool in MiniVLE</p>
-          <code class="registration-url" id="registration-url">Loading registration URL…</code>
-        </div>
+    </section>
+
+    <section id="how-it-works" class="landing-section" aria-labelledby="workflow-title">
+      <div class="landing-section-heading"><p class="eyebrow">From paper to results</p><h2 id="workflow-title">Three steps. One workspace.</h2><p>Start with an answer sheet, then follow the same Print, Scan and Grade steps for each assessment.</p></div>
+      <ol class="landing-workflow">
+        <li><span class="landing-step-number">01</span><h3>Print</h3><p>Name your assessment, choose 1–60 questions and 2–8 answer choices, and add an optional university logo.</p><p>Download the A4 answer sheet and student guide. Complete a master sheet with the correct answers, using student number <code>000000000</code> for a generated answer key.</p></li>
+        <li><span class="landing-step-number">02</span><h3>Scan</h3><p>Scan the completed papers to PDF. Upload one multi-page PDF or a ZIP containing several PDFs. Generated student-guide pages are skipped automatically.</p><p>Import a student roster CSV in standalone mode, or use your course roster through LTI. The scanner reads the answer bubbles and attempts to match nine-digit student IDs.</p></li>
+        <li><span class="landing-step-number">03</span><h3>Grade</h3><p>Select the master answer sheet and check the extracted responses. Student scores and percentages are calculated against the key.</p><p>Resolve unmatched students, inspect question analysis, and download the results as CSV. Export the analysis through the browser’s Save as PDF option.</p></li>
+      </ol>
+    </section>
+
+    <section id="review" class="landing-section" aria-labelledby="review-title">
+      <div class="landing-section-heading"><p class="eyebrow">See what was read</p><h2 id="review-title">Review the scan. Understand the result.</h2><p>Keep the original paper in view while you check the extracted answers and student matches.</p></div>
+      <div class="landing-feature-grid">
+        <article class="landing-card"><h3>Annotated student review</h3><p>Open a student’s page to compare detected responses with the answer key and the original scan. Check faint marks, corrections and uncertain responses before relying on the grades.</p></article>
+        <article class="landing-card"><h3>Quick roster matching</h3><p>Sort students by name, score or percentage. For unidentified pages, inspect the scanned name, search the roster, and press Enter to assign and advance. Skip pages you want to return to later.</p></article>
+        <article class="landing-card"><h3>Question and cohort analysis</h3><p>Explore score distributions, percentage correct by question, upper/lower 27% item discrimination, and answer-option choices. Summary statistics and UG/PG grade classes help you interpret the cohort’s results.</p></article>
+        <article class="landing-card"><h3>Results you can take away</h3><p>Download a results CSV for your records or a separate grade-import workflow. Produce a landscape analysis PDF for review and reporting. Automatic gradebook passback is not currently available.</p></article>
+      </div>
+    </section>
+
+    <section class="landing-section" aria-labelledby="workspace-title">
+      <div class="landing-section-heading"><p class="eyebrow">Choose your starting point</p><h2 id="workspace-title">Standalone or connected to your course.</h2></div>
+      <div class="landing-workspace-grid">
+        <article class="landing-card landing-workspace-card"><span class="landing-tag">No LTI registration needed</span><h3>Standalone workspace</h3><p>Create a design and get a reusable workspace URL. Copy the iframe code into your VLE so instructors can print, scan, import a roster, grade and analyse in one place.</p><p>Your imported roster is used to match scanned student numbers. Keep using the same browser and workspace to return to saved scan results.</p><a class="landing-button" href="{{ url_for('standalone_home') }}">Get started <span aria-hidden="true">→</span></a></article>
+        <article class="landing-card landing-workspace-card"><span class="landing-tag">LTI 1.3</span><h3>Launch from your VLE</h3><p>Register PrintScanGrade with your learning platform, then launch it from a course as an instructor or administrator. Answer-sheet designs are associated with that course.</p><p>Course roster access uses the platform’s LTI roster service. Canvas is supported through LTI, without a personal API token.</p><a class="landing-text-link" href="#lti">View LTI setup <span aria-hidden="true">→</span></a></article>
+      </div>
+      <aside class="landing-legacy"><div><h3>Already using University of Liverpool MCQ sheets?</h3><p>The dedicated UoL legacy workspace reads existing five-choice sheets with up to 120 questions, including colour and grayscale scans. Import your roster, upload the scans with their master sheet, then review and grade.</p></div><a class="landing-text-link" href="{{ url_for('standalone_uol_legacy') }}">Open UoL legacy <span aria-hidden="true">→</span></a></aside>
+    </section>
+
+    <section class="landing-section landing-storage" aria-labelledby="storage-title">
+      <div><p class="eyebrow">Know where your work lives</p><h2 id="storage-title">Scans and grades stay in your browser.</h2></div>
+      <div><p>The browser scan workflows read uploaded PDFs and ZIPs locally. Scan results, page previews, imported rosters and manual matches are saved in that browser. Normal scanning does not send your scan files or grades to the server.</p><p>The server stores answer-sheet designs, logos and LTI registrations. In LTI mode, it fetches the course roster from your learning platform to support student matching.</p><p class="landing-storage-note">Export your results before clearing browser data. Switching browser, device or site address does not transfer saved scans.</p></div>
+    </section>
+
+    <section id="lti" class="landing-section" aria-labelledby="lti-title">
+      <div class="landing-section-heading"><p class="eyebrow">For platform administrators</p><h2 id="lti-title">Connect PrintScanGrade through LTI.</h2><p>For platforms that support LTI dynamic registration, start the registration process in your VLE and use the URL below. Grant the requested roster-read permission to enable course student matching.</p></div>
+      <div class="registration">
+        <div class="registration-copy"><p class="registration-label">LTI dynamic registration URL</p><code class="registration-url" id="registration-url">Loading registration URL…</code></div>
         <button class="copy-button" id="copy-registration-url" type="button">Copy URL</button>
         <span class="copy-status" id="copy-status" role="status" aria-live="polite"></span>
-      </section>
-      <div class="steps" aria-label="Workflow">
-        <div><b>01</b><strong>Print</strong><small>Prepare answer sheets</small></div>
-        <div><b>02</b><strong>Scan</strong><small>Capture completed forms</small></div>
-        <div><b>03</b><strong>Grade</strong><small>Return scores to your VLE</small></div>
       </div>
-      <p class="coming">Coming soon</p>
-    </div>
+      <p class="landing-setup-links"><a href="{{ url_for('tool_config') }}">View LTI tool configuration</a><span aria-hidden="true"> · </span><a href="{{ url_for('admin_login') }}">Manage LTI registrations</a></p>
+      <p class="landing-caption">Launch course workspaces from your VLE after registration. Standalone workspaces can be used without this setup.</p>
+    </section>
+
+    <section class="landing-section landing-faq" aria-labelledby="questions-title">
+      <div class="landing-section-heading"><h2 id="questions-title">Before your first scan</h2></div>
+      <details><summary>Which files and sheets can I use?</summary><p>Generated sheets support 1–60 questions and 2–8 choices. Upload PDFs up to 64 MB each, or a ZIP up to 256 MB. The dedicated UoL legacy reader supports up to 120 questions on the existing A–E form, including colour and grayscale scans.</p></details>
+      <details><summary>How do I supply the correct answers?</summary><p>Complete and scan a master answer sheet, then select it as the key in Grade or Results. For generated sheets, use student ID <code>000000000</code>. The master is excluded from student grades. In the regular workspace, you can choose marking rules for questions with multiple keyed answers.</p></details>
+      <details><summary>What if a student cannot be identified?</summary><p>Use the unidentified-student dialog to inspect the name area and assign a roster student. Press Enter to assign and continue, or Skip to leave that page unassigned for later. Student matching works with nine-digit numbers. Handwriting without corresponding ID bubble marks may need manual review.</p></details>
+      <details><summary>Can I try the workflow before scanning an assessment?</summary><p>In a regular workspace, import or load a roster and use the dummy ZIP option to generate an answer key and example student sheets. Scan that ZIP to practise matching, review, grading and analysis.</p></details>
+    </section>
   </main>
+
+  <footer class="landing-footer landing-container"><a class="landing-brand" href="{{ url_for('home') }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="30" height="30"><span>PrintScanGrade</span></a><p>Print. Scan. Review. Grade.</p></footer>
   <script>
     (() => {
-      const registrationUrl = `${window.location.origin}/lti/config.json`;
+      const registrationUrl = `${window.location.origin}/lti/register`;
       const urlDisplay = document.getElementById("registration-url");
       const copyButton = document.getElementById("copy-registration-url");
       const copyStatus = document.getElementById("copy-status");
-
       urlDisplay.textContent = registrationUrl;
       copyButton.addEventListener("click", async () => {
         try {
@@ -65,7 +115,7 @@
           }
           copyStatus.textContent = "Copied";
         } catch (error) {
-          copyStatus.textContent = "Copy failed — select the URL to copy it.";
+          copyStatus.textContent = "Copy failed. Select the URL to copy it.";
         }
       });
     })();

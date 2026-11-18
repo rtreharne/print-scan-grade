@@ -2,3 +2,6 @@ __pycache__/
 .pytest_cache/
 data/
 .env
+
+# Assessment test archives contain student data.
+/BIOS101*-test-set.zip

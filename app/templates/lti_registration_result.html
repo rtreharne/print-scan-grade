@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b2b">
+  <title>LTI registration · Print Scan Grade</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <img class="logo" src="{{ url_for('static', filename='logo.svg') }}" alt="" width="104" height="104">
+      <p class="eyebrow">LTI registration</p>
+      <h1>{% if success %}Connected{% else %}Registration <span>issue</span>{% endif %}</h1>
+      <p class="lead">{{ message }}</p>
+      {% if success %}<p class="course"><a href="{{ url_for('home') }}">Return to Print Scan Grade</a></p>{% endif %}
+    </section>
+  </main>
+  {% if success %}
+  <script>
+    const message = {subject: "org.imsglobal.lti.close"};
+    if (window.opener) window.opener.postMessage(message, "*");
+    if (window.parent !== window) window.parent.postMessage(message, "*");
+  </script>
+  {% endif %}
+</body>
+</html>

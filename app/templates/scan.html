@@ -11,17 +11,24 @@
   <script src="{{ url_for('static', filename='vendor/jszip.min.js') }}"></script>
   <script src="{{ url_for('static', filename='vendor/jsQR.js') }}"></script>
 </head>
-<body>
+<body{% if standalone|default(false) %} class="standalone-embedded-workspace"{% endif %}>
   <main class="workspace">
     <script id="scan-course-key" type="application/json">{{ {'issuer': context.issuer, 'context_id': context.context_id}|tojson }}</script>
+    <script id="scan-runtime-config" type="application/json">{{ scan_runtime|default({})|tojson }}</script>
     <header class="workspace-header">
-      <a class="brand" href="/"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="42" height="42"><span>Print Scan Grade</span></a>
+      <a class="brand" href="{{ url_for('standalone_home') if standalone|default(false) else '/' }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="42" height="42"><span>Print Scan Grade</span></a>
       <span class="course-badge">{{ context.course_title }}</span>
     </header>
     <nav class="phase-nav" aria-label="Workspace phases">
+      {% if standalone|default(false) %}
+      <a href="{{ url_for('standalone_workspace', slug=standalone_design.slug, view='print') }}">1 · Print</a>
+      <a class="{{ 'active' if initial_phase|default('scan') == 'scan' else '' }}" href="{{ url_for('standalone_workspace', slug=standalone_design.slug, view='scan') }}" data-scan-link>2 · Scan</a>
+      <a class="{{ 'active' if initial_phase|default('scan') == 'grade' else '' }}" href="{{ url_for('standalone_workspace', slug=standalone_design.slug, view='grade') }}" data-grade-link>3 · Grade</a>
+      {% else %}
       <a href="{{ url_for('print_workspace') }}">1 · Print</a>
       <a class="{{ 'active' if initial_phase|default('scan') == 'scan' else '' }}" href="{{ url_for('scan_workspace') }}" {% if initial_phase|default('scan') == 'scan' %}aria-current="page"{% endif %} data-scan-link>2 · Scan</a>
       <a class="{{ 'active' if initial_phase|default('scan') == 'grade' else '' }}" href="{{ url_for('grade_workspace') }}" {% if initial_phase|default('scan') == 'grade' %}aria-current="page"{% endif %} data-grade-link>3 · Grade</a>
+      {% endif %}
     </nav>
 
     <div id="scan-dashboard">
@@ -30,6 +37,10 @@
       <h1>Scan answer sheets</h1>
       <p>Select a completed answer-sheet PDF or a ZIP of PDFs. Student guide pages are skipped automatically. PDFs stay local; detected results and compressed page previews are saved in this browser for this course.</p>
     </section>
+
+    {% if standalone|default(false) %}
+    <section class="panel scan-panel" aria-labelledby="roster-import-title"><div class="scan-heading"><div><p class="eyebrow">Optional roster</p><h2 id="roster-import-title">Import student enrollment CSV</h2></div></div><p class="muted">Map first name, last name, and the source value containing a nine-digit student number. IDs can appear within other text.</p><input id="standalone-roster-file" type="file" accept=".csv,text/csv"><div id="standalone-roster-mapping" hidden></div><div id="standalone-roster-message" class="scan-errors" hidden></div><button id="standalone-dummy-zip" class="primary-button" type="button" disabled>Download dummy ZIP</button></section>
+    {% endif %}
 
     <section class="panel scan-panel" aria-labelledby="scan-title">
       <div class="scan-heading">
@@ -54,23 +65,31 @@
       </div>
     </section>
 
+    {% if not standalone|default(false) %}
     <section class="panel dummy-zip-panel" aria-labelledby="dummy-zip-title">
       <div class="scan-heading">
         <div><p class="eyebrow">Optional test data</p><h2 id="dummy-zip-title">Generate dummy student sheets</h2></div>
       </div>
       <p class="muted">Download one answer sheet plus clean student sheets. The set includes a blank name, unfilled ID bubbles, crossed corrections, multiple marks and blank answers; see the ZIP notes for details.</p>
       <div id="dummy-zip-error" class="scan-errors" role="alert" hidden></div>
-      <form id="dummy-zip-form" class="dummy-zip-form">
+      <form id="dummy-zip-form" class="dummy-zip-form" data-enrollment-ready="{{ 'true' if dummy_student_count|default(0) else 'false' }}">
         <label for="dummy-form-select">Answer sheet
-          <select id="dummy-form-select" class="review-select" required><option value="">Loading answer sheets…</option></select>
+          <select id="dummy-form-select" class="review-select" required>
+            {% if dummy_forms %}
+              {% for form in dummy_forms %}<option value="{{ form.form_id }}">{{ form.title }}</option>{% endfor %}
+            {% else %}
+              <option value="">No saved answer sheets in this course</option>
+            {% endif %}
+          </select>
         </label>
         <label for="dummy-student-count">Number of students
-          <input id="dummy-student-count" class="review-select" type="number" min="1" value="1" required disabled>
-          <small id="dummy-student-limit" class="field-help">Loading course enrollment…</small>
+          <input id="dummy-student-count" class="review-select" type="number" min="1" max="{{ dummy_student_count if dummy_student_count|default(0) else 1 }}" value="{{ [dummy_student_count, 5]|min if dummy_student_count|default(0) else 1 }}" required {% if not dummy_student_count|default(0) %}disabled{% endif %}>
+          <small id="dummy-student-limit" class="field-help">{% if dummy_enrollment_error|default('') %}{{ dummy_enrollment_error }}{% elif dummy_student_count|default(0) %}{% if dummy_synthetic_student_ids|default(false) %}Choose from 1 to {{ dummy_student_count }} students. Missing student IDs will use generated test IDs.{% else %}Choose from 1 to {{ dummy_student_count }} enrolled students.{% endif %}{% else %}No enrolled students were found for this course.{% endif %}</small>
         </label>
-        <button id="dummy-zip-button" class="primary-button" type="submit" disabled>Download dummy ZIP</button>
+        <button id="dummy-zip-button" class="primary-button" type="submit" {% if not dummy_student_count|default(0) or not dummy_forms|default([]) %}disabled{% endif %}>Download dummy ZIP</button>
       </form>
     </section>
+    {% endif %}
 
     </div>
 
@@ -100,7 +119,11 @@
         </div>
         <div id="grade-roster-message" class="scan-errors roster-error" hidden></div>
         <label id="set-key-field" class="scan-key-field" for="set-key-select" hidden><span>Answer sheet for this scan set</span><select id="set-key-select" class="review-select"></select></label>
-        <p class="scan-key-help">An answer sheet must contain exactly one detected answer for every question before it can be used as the key. In student previews, green filled circles are selected, solid blue circles show the correct answer, blue outlines are blank, and red Xs are excluded crossed-out selections.</p>
+        <p class="scan-key-help">An answer sheet must contain at least one detected answer for every question before it can be used as the key. In student previews, green filled circles are selected, solid blue circles show keyed answers, blue outlines are blank, and red Xs are excluded crossed-out selections.</p>
+        <section id="answer-key-rules" class="answer-key-rules" aria-labelledby="answer-key-rules-title" hidden>
+          <div><p class="eyebrow">Multiple-answer scoring</p><h3 id="answer-key-rules-title">Set the marking rule</h3><p class="muted">Each question is worth one mark. Extra uncrossed answers outside the key are always incorrect.</p></div>
+          <div id="answer-key-rule-list" class="answer-key-rule-list"></div>
+        </section>
         <div class="grade-tabs" role="tablist" aria-label="Scan set review views">
           <button id="students-tab" class="grade-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="students-panel">Students</button>
           <button id="analysis-tab" class="grade-tab" type="button" role="tab" aria-selected="false" aria-controls="analysis-panel">Analysis</button>
@@ -113,13 +136,13 @@
           </table>
         </div>
         <dialog id="scan-preview-dialog" class="scan-preview-dialog" aria-labelledby="scan-preview-title">
-          <div class="scan-preview-heading"><div><p class="eyebrow">Saved scan results</p><h2 id="scan-preview-title">Scanned answer sheet</h2><p id="scan-preview-meta" class="muted"></p></div><div class="scan-preview-actions"><button id="scan-preview-close" class="download-button" type="button">Close</button></div></div>
+          <div class="scan-preview-heading"><div><p class="eyebrow">Saved scan results</p><h2 id="scan-preview-title">Scanned answer sheet</h2><p id="scan-preview-meta" class="muted"></p></div><div class="scan-preview-actions"><button id="scan-preview-previous" class="download-button" type="button">← Previous student</button><button id="scan-preview-next" class="download-button" type="button">Next student →</button><button id="scan-preview-close" class="download-button" type="button">Close</button></div></div>
           <button id="original-scan-toggle" class="download-button original-scan-toggle" type="button" hidden>View raw annotated scan</button>
           <section id="original-scan-panel" class="original-scan-panel" hidden><p class="field-help">This is the original scan with diagnostic circle overlays only. Green indicates filled, blue indicates blank, and a red X marks a crossed-out response.</p><img id="original-scan-image" alt="Raw annotated scanned answer sheet page"></section>
           <div id="scan-preview-content" class="scan-preview-content"></div>
         </dialog>
         <dialog id="unidentified-dialog" class="scan-preview-dialog unidentified-dialog" aria-labelledby="unidentified-dialog-title">
-          <div class="scan-preview-heading"><div><p class="eyebrow">Student identification</p><h2 id="unidentified-dialog-title">Student not identified</h2><p id="unidentified-dialog-meta" class="muted"></p></div><div class="scan-preview-actions"><button id="unidentified-dialog-close" class="download-button" type="button">Close</button></div></div>
+          <div class="scan-preview-heading"><div><p class="eyebrow">Student identification</p><h2 id="unidentified-dialog-title">Student not identified</h2><p id="unidentified-dialog-meta" class="muted"></p></div><div class="scan-preview-actions"><button id="unidentified-skip" class="download-button" type="button" title="Leave this scan unassigned and continue">Skip</button><button id="unidentified-dialog-close" class="download-button" type="button">Close</button></div></div>
           <p class="field-help">Check the scanned name area, then type a name, login or student number. Press Enter to assign and move to the next unidentified scan.</p>
           <div class="unidentified-name-preview"><img id="unidentified-name-image" alt="Name area from unidentified scanned sheet"><p id="unidentified-name-status" class="field-help" hidden></p></div>
           <div class="unidentified-assignment"><label for="unidentified-search">Search roster<input id="unidentified-search" class="review-select" type="search" placeholder="Type to search…" autocomplete="off"></label><select id="unidentified-match" class="review-select" aria-label="Matching roster student"></select><button id="unidentified-assign" class="primary-button" type="button">Assign and next</button></div>
@@ -134,19 +157,23 @@
             </div>
             <div id="analysis-summary-cards" class="analysis-summary-cards"></div>
             <article class="analysis-card"><div class="analysis-card-heading"><div><h4>Score distribution</h4><p class="muted">Overall correct answers divided by total questions.</p></div><label>Scale <select id="score-scale-select" class="review-select"><option value="fit">Fitted</option><option value="cohort">Cohort maximum</option></select></label></div><div id="score-distribution-chart" class="analysis-chart" tabindex="0" aria-label="Score distribution chart"></div></article>
-            <article class="analysis-card"><div class="analysis-card-heading"><div><h4>Percentage correct by question</h4><p class="muted">Valid single selections only; line shows the mean item percentage.</p></div><label>Scale <select id="item-scale-select" class="review-select"><option value="fit">Fitted</option><option value="full">0–100%</option></select></label></div><div id="item-correct-chart" class="analysis-chart analysis-chart-scroll" tabindex="0" aria-label="Percentage correct by question chart"></div></article>
+            <article class="analysis-card"><div class="analysis-card-heading"><div><h4>Percentage correct by question</h4><p class="muted">Uses each question’s selected answer-set rule; line shows the mean item percentage.</p></div><label>Scale <select id="item-scale-select" class="review-select"><option value="fit">Fitted</option><option value="full">0–100%</option></select></label></div><div id="item-correct-chart" class="analysis-chart analysis-chart-scroll" tabindex="0" aria-label="Percentage correct by question chart"></div></article>
             <article class="analysis-card"><div class="analysis-card-heading"><div><h4>Kelley upper/lower 27% discrimination</h4><p class="muted">Upper and lower groups are ranked by total-question score.</p><div class="analysis-legend" aria-label="Discrimination quality bands"><span class="excellent">Excellent ≥ .35</span><span class="good">Good .25–.349</span><span class="acceptable">Acceptable .20–.249</span><span class="poor">Poor &lt; .20</span></div></div><label>Scale <select id="discrimination-scale-select" class="review-select"><option value="fit">Fitted</option><option value="full">−1 to 1</option></select></label></div><div id="discrimination-chart" class="analysis-chart analysis-chart-scroll" tabindex="0" aria-label="Item discrimination chart"></div></article>
-            <article class="analysis-card"><div class="analysis-card-heading"><div><h4>Answer-option distribution</h4><p class="muted">Valid single selections only. The keyed answer is outlined.</p></div><label>Scale <select id="option-scale-select" class="review-select"><option value="fit">Fitted</option><option value="full">0–100%</option></select></label></div><div id="option-distribution-chart" class="analysis-chart analysis-chart-scroll" tabindex="0" aria-label="Answer option distribution chart"></div></article>
-            <aside class="analysis-method-note"><strong>How item statistics are calculated</strong><p>Item statistics use valid single selections. Blank, crossed and multiple responses are excluded from item denominators but remain unearned in total scores.</p></aside>
+            <article class="analysis-card"><div class="analysis-card-heading"><div><h4>Answer-option distribution</h4><p class="muted">Each active selected option is counted. Keyed answers are outlined.</p></div><label>Scale <select id="option-scale-select" class="review-select"><option value="fit">Fitted</option><option value="full">0–100%</option></select></label></div><div id="option-distribution-chart" class="analysis-chart analysis-chart-scroll" tabindex="0" aria-label="Answer option distribution chart"></div></article>
+            <aside class="analysis-method-note"><strong>How item statistics are calculated</strong><p>Item statistics use complete detected answer sets and the marking rule chosen for each key question. Blank, crossed-only and uncertain responses remain unearned in total scores.</p></aside>
           </div>
           <div id="analysis-tooltip" class="analysis-tooltip" role="tooltip" hidden></div>
         </section>
     </section>
 
     <button id="back-to-top" class="back-to-top" type="button" aria-label="Back to top" hidden>↑ <span>Back to top</span></button>
+    {% if standalone|default(false) %}
+    <footer class="standalone-footer"><hr><span>© Print Scan Grade {{ current_year }}</span></footer>
+    {% else %}
     <footer>printscangrade.com</footer>
+    {% endif %}
   </main>
 
-<script type="module" src="{{ url_for('static', filename='scan.js', v=72) }}"></script>
+<script type="module" src="{{ url_for('static', filename='scan.js', v=95) }}"></script>
 </body>
 </html>

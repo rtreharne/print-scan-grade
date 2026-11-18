@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="1">
+  <title>Loading course roster · Print Scan Grade</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='print.css') }}">
+  <style>
+    .loading-page{min-height:100svh;display:grid;place-items:center;padding:24px;background:#101b2b}
+    .loading-card{width:min(100%,560px);padding:40px;border:1px solid #35505b;border-radius:20px;background:#17283a;color:#f7f6f2}
+    .loading-card h1{font-size:clamp(2rem,5vw,3rem);line-height:1.1;letter-spacing:-.04em;margin:8px 0 14px}
+    .loading-card p{color:#c4d2d5;line-height:1.6}.loader{display:flex;gap:8px;margin:28px 0 12px}.loader i{width:11px;height:11px;border-radius:50%;background:#75ddca;animation:pulse 1s ease-in-out infinite}.loader i:nth-child(2){animation-delay:.15s}.loader i:nth-child(3){animation-delay:.3s}@keyframes pulse{50%{opacity:.28;transform:translateY(-5px)}}
+  </style>
+</head>
+<body>
+  <main class="loading-page">
+    <section class="loading-card" aria-live="polite">
+      <p class="eyebrow">Print Scan Grade</p>
+      <h1>Loading course roster</h1>
+      <p>Preparing the Scan workspace for <strong>{{ context.course_title }}</strong>.</p>
+      <div class="loader" aria-label="Loading"><i></i><i></i><i></i></div>
+      <p>This normally takes a few seconds.</p>
+    </section>
+  </main>
+</body>
+</html>

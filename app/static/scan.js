@@ -1,4 +1,5 @@
 import * as pdfjsLib from "./vendor/pdf.min.mjs";
+import { readLegacyAnswerImage, mapLegacyPoint } from "./legacy-reader.mjs";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("./vendor/pdf.worker.min.mjs", import.meta.url).toString();
 
@@ -30,6 +31,8 @@ const backToTopButton = $("#back-to-top");
 const courseRoster = [];
 const setKeyField = $("#set-key-field");
 const setKeySelect = $("#set-key-select");
+const answerKeyRules = $("#answer-key-rules");
+const answerKeyRuleList = $("#answer-key-rule-list");
 const rosterRows = $("#roster-rows");
 const rosterSortButtons = [...document.querySelectorAll("[data-roster-sort]")];
 let rosterSortKey = "name";
@@ -64,6 +67,8 @@ const scanPreviewDialog = $("#scan-preview-dialog");
 const scanPreviewTitle = $("#scan-preview-title");
 const scanPreviewMeta = $("#scan-preview-meta");
 const scanPreviewContent = $("#scan-preview-content");
+const scanPreviewPrevious = $("#scan-preview-previous");
+const scanPreviewNext = $("#scan-preview-next");
 const originalScanToggle = $("#original-scan-toggle");
 const originalScanPanel = $("#original-scan-panel");
 const originalScanImage = $("#original-scan-image");
@@ -81,8 +86,12 @@ let unidentifiedNameObjectUrl = "";
 const scanDashboard = $("#scan-dashboard");
 const gradeDashboard = $("#grade-dashboard");
 const gradeLink = document.querySelector("[data-grade-link]");
+const scanLink = document.querySelector("[data-scan-link]");
 const courseKeyElement = document.querySelector("#scan-course-key");
 const courseKeyData = JSON.parse(courseKeyElement?.textContent || "{}");
+const runtimeElement = document.querySelector("#scan-runtime-config");
+const scanRuntime = JSON.parse(runtimeElement?.textContent || "{}");
+const standaloneMode = Boolean(scanRuntime.standalone);
 const scanStorageKey = `${courseKeyData.issuer || "unknown"}::${courseKeyData.context_id || "unknown"}`;
 const scanDatabaseName = "print-scan-grade-browser-data";
 let originalScanObjectUrl = "";
@@ -98,27 +107,239 @@ const REGISTRATION_MARK_THRESHOLD = 160;
 const MAX_PDF_BYTES = 64 * 1024 * 1024;
 const MAX_ZIP_BYTES = 256 * 1024 * 1024;
 const formsById = new Map();
+let genericScanTitle = "";
+const standaloneRosterFile = $("#standalone-roster-file");
+const standaloneRosterMapping = $("#standalone-roster-mapping");
+const standaloneRosterMessage = $("#standalone-roster-message");
+const copyStandaloneIframe = $("#copy-standalone-iframe");
+const standaloneIframeCode = $("#standalone-iframe-code");
+const standaloneDummyZip = $("#standalone-dummy-zip");
+const legacyScanFile = $("#legacy-scan-file");
+const legacyScanButton = $("#legacy-scan-button");
+const legacyFileName = $("#legacy-file-name");
+const legacyProgress = $("#legacy-scan-progress");
+const legacyProgressBar = $("#legacy-progress-bar");
+const legacyProgressLabel = $("#legacy-progress-label");
+const legacyMessage = $("#legacy-scan-message");
+const legacyResults = $("#legacy-results");
+const legacyKeySelect = $("#legacy-key-select");
+const legacyKeySummary = $("#legacy-key-summary");
+const legacyKeyAnswerPreview = $("#legacy-key-answer-preview");
+const legacySummary = $("#legacy-summary");
+const legacyResultRows = $("#legacy-result-rows");
+const legacyCsvButton = $("#legacy-download-csv");
+let legacyPages = [];
+let legacyBatchName = "";
+let legacyKeyPageId = "";
+
+function parseCsv(text) {
+  const rows = []; let row = []; let value = ""; let quoted = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quoted) {
+      if (char === '"' && text[index + 1] === '"') { value += '"'; index += 1; }
+      else if (char === '"') quoted = false;
+      else value += char;
+    } else if (char === '"') quoted = true;
+    else if (char === ',') { row.push(value.trim()); value = ""; }
+    else if (char === '\n' || char === '\r') {
+      if (char === '\r' && text[index + 1] === '\n') index += 1;
+      row.push(value.trim()); value = "";
+      if (row.some(Boolean)) rows.push(row);
+      row = [];
+    } else value += char;
+  }
+  row.push(value.trim()); if (row.some(Boolean)) rows.push(row);
+  return rows;
+}
+
+function rosterHeaderScore(header, kinds) {
+  const normalized = String(header || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return kinds.some((kind) => normalized === kind || normalized.includes(kind));
+}
+
+function extractNineDigitId(value) {
+  return String(value || "").match(/(?<!\d)(\d{9})(?!\d)/)?.[1] || "";
+}
+
+function rosterNamePartsFromValue(value) {
+  const name = String(value || "").trim().replace(/\s+/g, " ");
+  if (!name) return { first: "", last: "" };
+  if (name.includes(",")) {
+    const [last, ...firstParts] = name.split(",");
+    return { first: firstParts.join(",").trim(), last: last.trim() };
+  }
+  const parts = name.split(" ");
+  return { first: parts.slice(0, -1).join(" "), last: parts.at(-1) };
+}
+
+function showStandaloneRosterMapping(rows) {
+  if (!standaloneRosterMapping || !rows.length) return;
+  const headers = rows[0]; const dataRows = rows.slice(1).filter((row) => row.some(Boolean));
+  const suggestion = (kinds) => Math.max(0, headers.findIndex((header) => rosterHeaderScore(header, kinds)));
+  const fullNameSuggestion = headers.findIndex((header) => ["fullname", "studentname", "learnername", "name"].includes(String(header || "").toLowerCase().replace(/[^a-z0-9]/g, "")));
+  const fields = [["first", "First name", ["firstname", "givenname", "forename", "first"]], ["last", "Last name", ["lastname", "surname", "familyname", "last"]], ["id", "Student ID", ["studentid", "studentnumber", "sisid", "candidateid", "idnumber", "id"]]];
+  standaloneRosterMapping.replaceChildren();
+  const selects = {}; const mappingFields = {};
+  const nameModeField = document.createElement("label"); nameModeField.className = "scan-key-field";
+  nameModeField.append(document.createTextNode("Name format"));
+  const nameMode = document.createElement("select"); nameMode.className = "review-select";
+  nameMode.add(new Option("Separate first name and last name columns", "separate"));
+  nameMode.add(new Option("One full-name column", "full"));
+  nameMode.value = fullNameSuggestion >= 0 ? "full" : "separate";
+  nameModeField.append(nameMode); standaloneRosterMapping.append(nameModeField);
+  for (const [key, label, names] of fields) {
+    const field = document.createElement("label"); field.className = "scan-key-field";
+    field.append(document.createTextNode(label));
+    const select = document.createElement("select"); select.className = "review-select";
+    headers.forEach((header, index) => select.add(new Option(header || `Column ${index + 1}`, String(index))));
+    select.value = String(suggestion(names)); selects[key] = select; mappingFields[key] = field; field.append(select); standaloneRosterMapping.append(field);
+  }
+  const fullNameField = document.createElement("label"); fullNameField.className = "scan-key-field";
+  fullNameField.append(document.createTextNode("Full name in one column (optional)"));
+  const fullNameSelect = document.createElement("select"); fullNameSelect.className = "review-select";
+  fullNameSelect.add(new Option("Use separate first and last name columns", ""));
+  headers.forEach((header, index) => fullNameSelect.add(new Option(header || `Column ${index + 1}`, String(index))));
+  fullNameSelect.value = fullNameSuggestion >= 0 ? String(fullNameSuggestion) : "";
+  selects.full = fullNameSelect; fullNameField.append(fullNameSelect); standaloneRosterMapping.append(fullNameField);
+  const applyNameMode = () => {
+    const useFullName = nameMode.value === "full";
+    mappingFields.first.hidden = useFullName; mappingFields.last.hidden = useFullName;
+    fullNameField.hidden = !useFullName;
+    selects.first.disabled = useFullName; selects.last.disabled = useFullName; selects.full.disabled = !useFullName;
+  };
+  const nameParts = (row) => nameMode.value === "full"
+    ? rosterNamePartsFromValue(row[Number(selects.full.value)])
+    : { first: String(row[Number(selects.first.value)] || "").trim(), last: String(row[Number(selects.last.value)] || "").trim() };
+  const preview = document.createElement("div"); preview.className = "field-help";
+  const updatePreview = () => {
+    const samples = dataRows.slice(0, 5).map((row) => {
+      const { first, last } = nameParts(row);
+      const studentId = extractNineDigitId(row[Number(selects.id.value)]);
+      return `${[first, last].filter(Boolean).join(" ") || "Unnamed"} · ${studentId || "no nine-digit ID found"}`;
+    });
+    preview.textContent = `Preview: ${samples.join(" | ")}`;
+  };
+  Object.values(selects).forEach((select) => select.addEventListener("change", updatePreview));
+  nameMode.addEventListener("change", () => { applyNameMode(); updatePreview(); });
+  const confirm = document.createElement("button"); confirm.type = "button"; confirm.className = "primary-button"; confirm.textContent = "Confirm roster import";
+  confirm.addEventListener("click", async () => {
+    const duplicateIds = new Set(); const seen = new Set(); const roster = [];
+    for (const row of dataRows) {
+      const student_id = extractNineDigitId(row[Number(selects.id.value)]);
+      if (!student_id) continue;
+      if (seen.has(student_id)) { duplicateIds.add(student_id); continue; }
+      seen.add(student_id);
+      const { first, last } = nameParts(row);
+      roster.push({ student_id, name: [first, last].filter(Boolean).join(" ") || student_id, first_name: first, last_name: last });
+    }
+    if (duplicateIds.size || !roster.length) {
+      standaloneRosterMessage.textContent = duplicateIds.size ? `Cannot import: duplicate IDs ${[...duplicateIds].join(", ")}.` : "No nine-digit student IDs were found with this mapping.";
+      standaloneRosterMessage.hidden = false; return;
+    }
+    courseRoster.splice(0, courseRoster.length, ...roster);
+    await persistScanState();
+    if (standaloneDummyZip) standaloneDummyZip.disabled = false;
+    standaloneRosterMessage.textContent = `Imported ${roster.length} students. ${dataRows.length - roster.length} row(s) without a unique nine-digit ID were skipped.`;
+    standaloneRosterMessage.hidden = false;
+    renderRosterTable();
+    renderLegacyResults();
+  });
+  applyNameMode(); updatePreview();
+  standaloneRosterMapping.append(preview, confirm); standaloneRosterMapping.hidden = false;
+}
+
+standaloneRosterFile?.addEventListener("change", async () => {
+  const file = standaloneRosterFile.files?.[0]; if (!file) return;
+  if (file.size > 4 * 1024 * 1024) { standaloneRosterMessage.textContent = "CSV files must be 4 MB or smaller."; standaloneRosterMessage.hidden = false; return; }
+  const rows = parseCsv(await file.text());
+  if (rows.length < 2) { standaloneRosterMessage.textContent = "Choose a CSV with a header row and at least one student."; standaloneRosterMessage.hidden = false; return; }
+  standaloneRosterMessage.hidden = true; showStandaloneRosterMapping(rows);
+});
+
+copyStandaloneIframe?.addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(standaloneIframeCode.value); copyStandaloneIframe.textContent = "Iframe code copied"; }
+  catch (_) { standaloneIframeCode.focus(); standaloneIframeCode.select(); document.execCommand("copy"); copyStandaloneIframe.textContent = "Iframe code copied"; }
+});
+
+standaloneDummyZip?.addEventListener("click", async () => {
+  if (!courseRoster.length || !scanRuntime.dummy_url) return;
+  standaloneDummyZip.disabled = true;
+  const originalText = standaloneDummyZip.textContent;
+  standaloneDummyZip.textContent = "Generating dummy ZIP…";
+  try {
+    const response = await fetch(scanRuntime.dummy_url, {
+      method: "POST", headers: { "Content-Type": "application/json", Accept: "application/zip" },
+      body: JSON.stringify({ roster: courseRoster }),
+    });
+    if (!response.ok) throw new Error(await response.text() || "Could not generate the dummy ZIP.");
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a"); link.href = url; link.download = "dummy-student-sheets.zip";
+    document.body.append(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    standaloneRosterMessage.textContent = error.message || "Could not generate the dummy ZIP.";
+    standaloneRosterMessage.hidden = false;
+  } finally {
+    standaloneDummyZip.disabled = false;
+    standaloneDummyZip.textContent = originalText;
+  }
+});
 
 async function initializeDummyZipForm() {
   if (!dummyZipForm) return;
+  let genericLayout = null;
+  try { genericLayout = JSON.parse(localStorage.getItem("print-scan-grade-generic-layout") || "null"); } catch { genericLayout = null; }
+  const hasGenericLayout = Number.isInteger(Number(genericLayout?.question_count)) &&
+    Number.isInteger(Number(genericLayout?.choice_count));
+  if (hasGenericLayout && ![...dummyFormSelect.options].some((option) => option.value === "generic")) {
+    dummyFormSelect.add(new Option(`Generic sheet · ${genericLayout.question_count} questions · ${genericLayout.choice_count} choices`, "generic"));
+  }
+  if (dummyZipForm.dataset.enrollmentReady === "true") return;
   try {
-    const response = await fetch("/scan/dummy-options.json", {
-      headers: { Accept: "application/json" }, credentials: "same-origin"
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 10000);
+    const response = await fetch("/scan/dummy-forms.json", {
+      headers: { Accept: "application/json" }, credentials: "same-origin", signal: controller.signal,
     });
+    window.clearTimeout(timeout);
     const options = await response.json();
-    if (!response.ok) throw new Error(options.error || "Could not load course enrollment.");
-    dummyFormSelect.replaceChildren();
-    for (const form of options.forms) {
-      const option = document.createElement("option");
-      option.value = form.form_id;
-      option.textContent = form.title;
-      dummyFormSelect.append(option);
+    if (!response.ok) throw new Error(options.error || "Could not load saved answer sheets.");
+    const existingFormIds = new Set([...dummyFormSelect.options].map((option) => option.value));
+    if (!existingFormIds.size || (existingFormIds.size === 1 && !dummyFormSelect.value)) {
+      dummyFormSelect.replaceChildren();
+      for (const form of options.forms) {
+        const option = document.createElement("option");
+        option.value = form.form_id;
+        option.textContent = form.title;
+        dummyFormSelect.append(option);
+      }
     }
-    if (!options.forms.length) {
-      dummyFormSelect.add(new Option("No saved answer sheets", ""));
-      dummyStudentLimit.textContent = "Create an answer sheet in Print first.";
+    if (hasGenericLayout && ![...dummyFormSelect.options].some((option) => option.value === "generic")) {
+      dummyFormSelect.add(new Option(`Generic sheet · ${genericLayout.question_count} questions · ${genericLayout.choice_count} choices`, "generic"));
+    }
+    if (!options.forms.length && !genericLayout) {
+      dummyFormSelect.add(new Option("No answer sheets available", ""));
+      dummyStudentLimit.textContent = "Create or download an answer sheet in Print first.";
       return;
     }
+  } catch (error) {
+    dummyFormSelect.replaceChildren(new Option("Answer sheets unavailable", ""));
+    dummyStudentLimit.textContent = "Saved answer sheets could not be loaded.";
+    dummyZipError.textContent = error.name === "AbortError"
+      ? "Saved answer sheets did not respond within 10 seconds. Reload the course page and try again."
+      : (error.message || "Could not load saved answer sheets.");
+    dummyZipError.hidden = false;
+    return;
+  }
+  try {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 20000);
+    const response = await fetch("/scan/dummy-options.json", {
+      headers: { Accept: "application/json" }, credentials: "same-origin", signal: controller.signal,
+    });
+    window.clearTimeout(timeout);
+    const options = await response.json();
+    if (!response.ok) throw new Error(options.error || "Could not load course enrollment.");
     if (options.student_count < 1) {
       dummyStudentLimit.textContent = "No enrolled students were found for this course.";
       return;
@@ -126,14 +347,15 @@ async function initializeDummyZipForm() {
     dummyStudentCount.max = String(options.student_count);
     dummyStudentCount.value = String(Math.min(options.student_count, 5));
     dummyStudentLimit.textContent = options.synthetic_student_ids
-      ? `Choose from 1 to ${options.student_count} students. Missing Canvas IDs will use generated test IDs.`
+      ? `Choose from 1 to ${options.student_count} students. Missing student IDs will use generated test IDs.`
       : `Choose from 1 to ${options.student_count} enrolled students.`;
     dummyStudentCount.disabled = false;
     dummyZipButton.disabled = false;
   } catch (error) {
-    dummyFormSelect.replaceChildren(new Option("Answer sheets unavailable", ""));
     dummyStudentLimit.textContent = "Course enrollment could not be loaded.";
-    dummyZipError.textContent = error.message;
+    dummyZipError.textContent = error.name === "AbortError"
+      ? "Course roster lookup took more than 20 seconds. Reload and try again."
+      : (error.message || "Could not load course enrollment.");
     dummyZipError.hidden = false;
   }
 }
@@ -152,7 +374,7 @@ function downloadFilename(response) {
   return match?.[1] || "dummy-student-sheets.zip";
 }
 
-dummyZipForm?.addEventListener("submit", async (event) => {
+dummyZipForm?.addEventListener("submit", (event) => {
   event.preventDefault();
   const formId = dummyFormSelect.value;
   const count = Number(dummyStudentCount.value);
@@ -165,25 +387,22 @@ dummyZipForm?.addEventListener("submit", async (event) => {
   dummyZipError.hidden = true;
   setDummyZipDownloadState(true);
   try {
-    const response = await fetch(`/scan/${encodeURIComponent(formId)}/dummy.zip?count=${count}` +
-      `&scanner_layout_version=${CURRENT_SHEET_LAYOUT_VERSION}`, { credentials: "same-origin" });
-    if (!response.ok) {
-      const message = await response.text();
-      throw new Error(message || "Could not create the dummy ZIP.");
+    let url = `/scan/${encodeURIComponent(formId)}/dummy.zip?count=${count}` +
+      `&scanner_layout_version=${CURRENT_SHEET_LAYOUT_VERSION}`;
+    if (formId === "generic") {
+      const layout = JSON.parse(localStorage.getItem("print-scan-grade-generic-layout") || "null");
+      url += `&question_count=${encodeURIComponent(layout.question_count)}&choice_count=${encodeURIComponent(layout.choice_count)}`;
     }
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = downloadFilename(response);
+    link.download = "";
     document.body.append(link);
     link.click();
     link.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    window.setTimeout(() => setDummyZipDownloadState(false), 2500);
   } catch (error) {
     dummyZipError.textContent = error.message || "Could not create the dummy ZIP.";
     dummyZipError.hidden = false;
-  } finally {
     setDummyZipDownloadState(false);
   }
 });
@@ -195,6 +414,9 @@ let pageIssues = [];
 let guidePagesSkipped = 0;
 let scanSets = [];
 let answerKeyByScanSet = {};
+let answerRulesByScanSet = {};
+let answerRulesByAnswerKey = {};
+let questionDiscountsByScanSet = {};
 let analysisConfigByForm = {};
 const DEFAULT_ANALYSIS_CLASSES = { first: 70, upperSecond: 60, lowerSecond: 50, third: 40, compensatory: 35 };
 const DEFAULT_MASTERS_CLASSES = { scheme: "masters", first: 70, upperSecond: 60, lowerSecond: 50, third: 0, compensatory: 0 };
@@ -228,7 +450,7 @@ async function loadFormsManifest() {
   if (formsManifestLoaded) return;
   if (formsManifestPromise) return formsManifestPromise;
   formsManifestPromise = (async () => {
-    const response = await fetch("/scan/forms.json", {
+    const response = await fetch(scanRuntime.forms_url || "/scan/forms.json", {
       headers: { Accept: "application/json" }, credentials: "same-origin"
     });
     if (!response.ok) throw new Error("Saved sheet settings could not be loaded. Reopen the app from the course and try again.");
@@ -278,8 +500,23 @@ async function loadPersistedScanStateOnce() {
       scanSets = Array.isArray(state.scanSets) ? state.scanSets : [];
       answerKeyByScanSet = state.answerKeyByScanSet && typeof state.answerKeyByScanSet === "object"
         ? state.answerKeyByScanSet : {};
+      answerRulesByScanSet = state.answerRulesByScanSet && typeof state.answerRulesByScanSet === "object"
+        ? state.answerRulesByScanSet : {};
+      answerRulesByAnswerKey = state.answerRulesByAnswerKey && typeof state.answerRulesByAnswerKey === "object"
+        ? state.answerRulesByAnswerKey : {};
+      questionDiscountsByScanSet = state.questionDiscountsByScanSet && typeof state.questionDiscountsByScanSet === "object"
+        ? state.questionDiscountsByScanSet : {};
       analysisConfigByForm = state.analysisConfigByForm && typeof state.analysisConfigByForm === "object"
         ? state.analysisConfigByForm : {};
+      if (standaloneMode && Array.isArray(state.standaloneRoster)) {
+        courseRoster.splice(0, courseRoster.length, ...state.standaloneRoster);
+        if (standaloneDummyZip && courseRoster.length) standaloneDummyZip.disabled = false;
+      }
+      if (standaloneMode) {
+        legacyPages = Array.isArray(state.legacyPages) ? state.legacyPages : [];
+        legacyBatchName = String(state.legacyBatchName || "");
+        legacyKeyPageId = String(state.legacyKeyPageId || "");
+      }
       const legacyKeyByScan = state.gradeKeyByScan && typeof state.gradeKeyByScan === "object"
         ? state.gradeKeyByScan : {};
       for (const [index, sheet] of sheetResults.entries()) {
@@ -308,8 +545,17 @@ async function loadPersistedScanStateOnce() {
           answerKeyByScanSet[scanSet.id] = legacyKey;
         }
       }
+      for (const scanSet of scanSets) {
+        const keyId = answerKeyByScanSet[scanSet.id];
+        const legacyRules = answerRulesByScanSet[scanSet.id];
+        if (keyId && legacyRules && !answerRulesByAnswerKey[keyId] &&
+            Object.values(legacyRules).every((rule) => rule === "all" || rule === "any")) {
+          answerRulesByAnswerKey[keyId] = { ...legacyRules };
+        }
+      }
     }
     persistenceReady = true;
+    if (standaloneMode) renderLegacyResults();
   } catch (error) {
     persistenceWarning = "Browser storage is unavailable; scan results will last only until this page is closed.";
     persistenceReady = true;
@@ -328,6 +574,13 @@ async function persistScanState() {
       pageIssues,
       guidePagesSkipped,
       answerKeyByScanSet,
+      answerRulesByScanSet,
+      answerRulesByAnswerKey,
+      standaloneRoster: standaloneMode ? courseRoster : undefined,
+      legacyPages: standaloneMode ? legacyPages : undefined,
+      legacyBatchName: standaloneMode ? legacyBatchName : undefined,
+      legacyKeyPageId: standaloneMode ? legacyKeyPageId : undefined,
+      questionDiscountsByScanSet,
       analysisConfigByForm,
       savedAt: Date.now(),
     };
@@ -355,7 +608,7 @@ document.querySelectorAll("[data-scan-link]").forEach((link) => link.addEventLis
   showScanDashboard(true);
 }));
 window.addEventListener("popstate", () => {
-  if (window.location.pathname.replace(/\/$/, "").endsWith("/grade")) {
+  if (standaloneMode ? new URLSearchParams(window.location.search).get("view") === "grade" : window.location.pathname.replace(/\/$/, "").endsWith("/grade")) {
     showGradeDashboard(false).catch((error) => showGradeLoadError(error));
   } else {
     showScanDashboard(false);
@@ -366,10 +619,10 @@ async function showGradeDashboard(pushHistory) {
   await loadPersistedScanState();
   if (!gradeDashboardData) {
     gradeSummary.textContent = "Loading the course roster and saved sheets…";
-    const response = await fetch("/grade?format=json", { headers: { Accept: "application/json" }, credentials: "same-origin" });
+    const response = await fetch(scanRuntime.grade_url || "/grade?format=json", { headers: { Accept: "application/json" }, credentials: "same-origin" });
     if (!response.ok) throw new Error(`Grade dashboard could not load (${response.status}). Reopen the app from the course and try again.`);
     gradeDashboardData = await response.json();
-    courseRoster.splice(0, courseRoster.length, ...(gradeDashboardData.roster || []));
+    if (!standaloneMode) courseRoster.splice(0, courseRoster.length, ...(gradeDashboardData.roster || []));
     renderGradeDashboardSheets(gradeDashboardData.forms || []);
     if (!gradeDashboardData.roster_available || gradeDashboardData.roster_error) {
       gradeRosterMessage.replaceChildren();
@@ -396,17 +649,15 @@ async function showGradeDashboard(pushHistory) {
   scanDashboard.hidden = true;
   gradeDashboard.hidden = false;
   updatePhaseNavigation("grade");
-  if (pushHistory && window.location.pathname !== "/grade") window.history.pushState({}, "", "/grade");
+  if (pushHistory) window.history.pushState({}, "", scanRuntime.grade_path || "/grade");
   window.scrollTo(0, 0);
-  refreshSavedAnnotationsInBackground().then(() => {
-    if (window.location.pathname.replace(/\/$/, "").endsWith("/grade")) {
-      renderGradeDashboardSheets(gradeDashboardData?.forms || []);
-      renderGradeWorkspace();
-    }
-  });
 }
 
-function refreshSavedAnnotationsInBackground() {
+function refreshSavedAnnotationsInBackground(sheetIds = null) {
+  if (sheetIds) {
+    return refreshSavedAnnotations(sheetIds)
+      .catch((error) => console.warn("Saved raw scan annotations could not be refreshed", error));
+  }
   if (annotationRefreshPromise) return annotationRefreshPromise;
   annotationRefreshPromise = refreshSavedAnnotations()
     .catch((error) => console.warn("Saved raw scan annotations could not be refreshed", error))
@@ -428,13 +679,13 @@ function showScanDashboard(pushHistory) {
       panel.prepend(notice);
     }
   }
-  if (pushHistory && window.location.pathname !== "/scan") window.history.pushState({}, "", "/scan");
+  if (pushHistory) window.history.pushState({}, "", scanRuntime.scan_url || "/scan");
   window.scrollTo(0, 0);
 }
 
 function updatePhaseNavigation(activePhase) {
   document.querySelectorAll(".phase-nav a").forEach((link) => {
-    const active = activePhase === "grade" ? link === gradeLink : link.getAttribute("href") === "/scan";
+    const active = activePhase === "grade" ? link === gradeLink : link === scanLink;
     link.classList.toggle("active", active);
     if (active) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
@@ -443,7 +694,14 @@ function updatePhaseNavigation(activePhase) {
 
 function renderGradeDashboardSheets(forms) {
   gradeFormList.replaceChildren();
-  const scannedForms = forms.filter((form) => scanSets.some((scanSet) => scanSet.formId === form.form_id));
+  const scannedIds = new Set(scanSets.map((scanSet) => scanSet.formId));
+  const scannedForms = forms.filter((form) => scannedIds.has(form.form_id));
+  for (const sheet of sheetResults) {
+    if (sheet.generic && !scannedForms.some((form) => form.form_id === sheet.formId)) {
+      scannedForms.push({ form_id: sheet.formId, title: sheet.formTitle,
+        question_count: sheet.questionCount, choice_count: sheet.choiceCount, generic: true });
+    }
+  }
   if (!scannedForms.length) {
     const empty = document.createElement("div");
     empty.className = pageIssues.length ? "scan-errors" : "field-help";
@@ -582,6 +840,8 @@ async function deleteScanSet(scanSetId) {
   sheetResults = sheetResults.filter((sheet) => sheet.scanSetId !== scanSetId);
   scanSets = scanSets.filter((item) => item.id !== scanSetId);
   delete answerKeyByScanSet[scanSetId];
+  delete answerRulesByScanSet[scanSetId];
+  delete questionDiscountsByScanSet[scanSetId];
   for (const [setId, keyId] of Object.entries(answerKeyByScanSet)) {
     if (removedIds.has(keyId)) delete answerKeyByScanSet[setId];
   }
@@ -597,6 +857,8 @@ async function deleteScanSet(scanSetId) {
 }
 
 $("#scan-preview-close").addEventListener("click", () => scanPreviewDialog.close());
+scanPreviewPrevious?.addEventListener("click", () => moveScanPreview(-1));
+scanPreviewNext?.addEventListener("click", () => moveScanPreview(1));
 originalScanToggle.addEventListener("click", () => {
   originalScanPanel.hidden = !originalScanPanel.hidden;
   originalScanToggle.textContent = originalScanPanel.hidden ? "View raw annotated scan" : "Hide raw annotated scan";
@@ -717,6 +979,10 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
         pdf = await loadingTask.promise;
         if (!isRescan) progressBar.max += Math.max(0, pdf.numPages - 1);
         else rescanProgressBar.max += Math.max(0, pdf.numPages - 1);
+        // A downloaded batch normally contains one form repeated for every
+        // student. Keep a cheap QR fingerprint so only the first page needs
+        // full QR decoding; a changed, rotated, or skewed page falls back.
+        const qrCache = {};
         for (let pageNo = 1; pageNo <= pdf.numPages; pageNo += 1) {
           const pageProgress = fileIndex + pageNo - 1;
           if (isRescan) rescanProgressBar.value = pageProgress;
@@ -724,7 +990,7 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
           setStageProgress("Rendering and analyzing page");
           setProgress(`Scanning ${entry.name} · page ${pageNo} of ${pdf.numPages}`);
           try {
-            const result = await scanPage(pdf, pageNo, entry.name);
+            const result = await scanPage(pdf, pageNo, entry.name, qrCache);
             if (result?.guidePage) guidePagesSkipped += 1;
             else {
               result.id = globalThis.crypto?.randomUUID?.() || `scan-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -800,6 +1066,8 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
       for (const [setId, keyId] of Object.entries(answerKeyByScanSet)) {
         if (removedIds.has(keyId)) delete answerKeyByScanSet[setId];
       }
+      delete answerRulesByScanSet[targetScanSet.id];
+      delete questionDiscountsByScanSet[targetScanSet.id];
       const issue = pageIssues.length > issueCountBefore ? ` Some pages were skipped: ${pageIssues[issueCountBefore].reason}` : "";
       rescanResultMessage.textContent = `Re-scanned ${rescannedSheets.length} page${rescannedSheets.length === 1 ? "" : "s"} into “${file.name}”.${issue} Select an answer sheet for this updated set again if needed.`;
       rescanResultMessage.hidden = false;
@@ -821,7 +1089,7 @@ async function scanFile(file = fileInput.files?.[0], targetScanSetId = "", sourc
   setStageProgress("Writing results to this browser");
   await persistScanState();
   setProgress("Loading course roster and grades…");
-  setStageProgress("Waiting for Canvas roster");
+  setStageProgress("Waiting for course roster");
   await showGradeDashboard(true).catch(showGradeLoadError);
   progressBox.hidden = true;
 }
@@ -838,12 +1106,229 @@ function hasPdfHeader(bytes) {
   return bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2d;
 }
 
-async function scanPage(pdf, pageNo, sourceFile) {
+// The legacy Liverpool form has no QR code. Its A4 artwork uses a fixed,
+// four-column 120 × 5 answer grid and a separate 9-column student-number grid.
+// Render each PDF page to the form's reference dimensions and sample the
+// printed response locations directly; the normal QR/form scanner is untouched.
+legacyScanFile?.addEventListener("change", () => {
+  const file = legacyScanFile.files?.[0];
+  legacyFileName.textContent = file ? `${file.name} · ${formatBytes(file.size)}` : "PDF pages are read locally and saved in this browser.";
+  legacyScanButton.disabled = !file;
+});
+legacyScanButton?.addEventListener("click", () => scanLegacyFile());
+legacyKeySelect?.addEventListener("change", async () => {
+  legacyKeyPageId = legacyKeySelect.value;
+  await persistScanState();
+  renderLegacyResults();
+});
+legacyCsvButton?.addEventListener("click", downloadLegacyCsv);
+
+async function scanLegacyFile(file = legacyScanFile?.files?.[0]) {
+  if (!file || scanInProgress) return;
+  const fileType = getScanFileType(file);
+  if (!fileType) return showLegacyMessage("Choose a PDF or ZIP containing legacy answer-sheet PDFs.");
+  if (fileType === "zip" && file.size > MAX_ZIP_BYTES) return showLegacyMessage(`This ZIP is larger than the ${formatBytes(MAX_ZIP_BYTES)} browser limit.`);
+  scanInProgress = true;
+  legacyScanButton.disabled = true;
+  legacyProgress.hidden = false;
+  legacyProgressLabel.textContent = "Opening legacy sheets…";
+  legacyMessage.hidden = true;
+  legacyProgressBar.value = 0;
+  legacyProgressBar.max = 1;
+  const pages = [];
+  const issues = [];
+  try {
+    let entries;
+    if (fileType === "pdf") {
+      entries = [{ name: file.name, size: file.size, read: async () => new Uint8Array(await file.arrayBuffer()) }];
+    } else {
+      const zip = await window.JSZip.loadAsync(file, { checkCRC32: false, createFolders: false });
+      entries = Object.values(zip.files).filter((entry) => !entry.dir && entry.name.toLowerCase().endsWith(".pdf"))
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((entry) => ({ name: entry.name, size: entry._data?.uncompressedSize || 0, read: () => entry.async("uint8array") }));
+      if (!entries.length) throw new Error("No PDF files were found in this ZIP.");
+    }
+    let totalPages = 0;
+    const documents = [];
+    for (const entry of entries) {
+      if (entry.size > MAX_PDF_BYTES) { issues.push(`${entry.name}: file exceeds ${formatBytes(MAX_PDF_BYTES)}`); continue; }
+      const bytes = await entry.read();
+      if (!hasPdfHeader(bytes)) { issues.push(`${entry.name}: not a readable PDF`); continue; }
+      const loadingTask = pdfjsLib.getDocument({ data: bytes, isEvalSupported: false, useWorkerFetch: false });
+      const pdf = await loadingTask.promise;
+      documents.push({ name: entry.name, pdf, loadingTask });
+      totalPages += pdf.numPages;
+    }
+    if (!totalPages) throw new Error(issues[0] || "No readable PDF pages were found.");
+    legacyProgressBar.max = totalPages;
+    let done = 0;
+    for (const document of documents) {
+      for (let pageNo = 1; pageNo <= document.pdf.numPages; pageNo += 1) {
+        done += 1;
+        legacyProgressBar.value = done;
+        legacyProgressLabel.textContent = `Reading ${document.name} · page ${pageNo} of ${document.pdf.numPages}`;
+        try {
+          const record = await readLegacyPage(document.pdf, pageNo, document.name);
+          pages.push(record);
+        } catch (error) {
+          issues.push(`${document.name} · page ${pageNo}: ${error.message || "page could not be read"}`);
+        }
+      }
+      await document.loadingTask.destroy().catch(() => {});
+    }
+    if (!pages.length) throw new Error(issues[0] || "No legacy answer sheets could be read.");
+    legacyPages = pages;
+    legacyBatchName = file.name;
+    legacyKeyPageId = "";
+    await persistScanState();
+    renderLegacyResults();
+    showLegacyMessage(`Read ${pages.length} page${pages.length === 1 ? "" : "s"}.${issues.length ? ` ${issues.length} page/file issue(s): ${issues.slice(0, 3).join("; ")}${issues.length > 3 ? "…" : ""}` : ""}`, Boolean(issues.length));
+  } catch (error) {
+    showLegacyMessage(error.message || "The legacy scan could not be processed.");
+  } finally {
+    scanInProgress = false;
+    legacyProgress.hidden = true;
+    legacyScanButton.disabled = !legacyScanFile?.files?.length;
+    if (legacyScanFile) legacyScanFile.value = "";
+  }
+}
+
+async function readLegacyPage(pdf, pageNo, sourceFile) {
+  const page = await pdf.getPage(pageNo);
+  const base = page.getViewport({ scale: 1 });
+  const scale = 703 / base.width;
+  const viewport = page.getViewport({ scale });
+  if (Math.abs(viewport.width / viewport.height - 704 / 996) > 0.015) {
+    page.cleanup();
+    throw new Error("Expected an upright A4 portrait page.");
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  await page.render({ canvasContext: context, viewport }).promise;
+  page.cleanup();
+  const image = context.getImageData(0, 0, canvas.width, canvas.height);
+  const { answers, questionCount, frame } = readLegacyAnswerImage(image);
+  const idXs = Array.from({ length: 9 }, (_, column) => 517 + column * 16.8);
+  const idYs = Array.from({ length: 10 }, (_, row) => 137 + row * 13.0);
+  let studentId = "";
+  let partialId = "";
+  const uncertainColumns = [];
+  for (let column = 0; column < 9; column += 1) {
+    const signals = idYs.map((y, digit) => {
+      const point = mapLegacyPoint(frame, idXs[column], y);
+      const analysis = analyzeCircle(image, canvas.width, canvas.height, point.x, point.y, 3.9, 0.12);
+      return { digit, fill: analysis.fillRatio, contrast: analysis.normalizedContrast };
+    });
+    const marked = signals.filter((signal) => signal.fill >= 0.25 && signal.contrast >= 0.15);
+    const strongest = [...signals].sort((a, b) => b.fill - a.fill)[0];
+    if (marked.length === 1) partialId += String(marked[0].digit);
+    else {
+      partialId += "?";
+      if (marked.length > 1 || strongest.fill >= 0.14) uncertainColumns.push(column + 1);
+    }
+  }
+  if (!partialId.includes("?") && /^\d{9}$/.test(partialId)) studentId = partialId;
+  const rawPage = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));
+  canvas.width = 0;
+  canvas.height = 0;
+  if (!rawPage) throw new Error("Could not save the local page preview.");
+  return { id: globalThis.crypto?.randomUUID?.() || `legacy-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    sourceFile, pageNo, answers, questionCount, readerVersion: 2, studentId, partialId, uncertainColumns, rawPage };
+}
+
+function showLegacyMessage(message, issue = false) {
+  if (!legacyMessage) return;
+  legacyMessage.textContent = message;
+  legacyMessage.hidden = false;
+  legacyMessage.classList.toggle("legacy-scan-warning", issue);
+}
+
+function legacyKeyInfo(key) {
+  const count = Number(key?.questionCount);
+  const ready = key?.readerVersion === 2 && Number.isInteger(count) && count > 0 && count <= 120 &&
+    key.answers?.length === 120 && key.answers.slice(0, count).every((answer) => answer.selected.length === 1);
+  return { count: ready ? count : 0, ready };
+}
+
+function legacyScore(student, key, count) {
+  return student.answers.slice(0, count).reduce((sum, answer, index) =>
+    sum + (answer.selected.length === 1 && answer.selected[0] === key.answers[index].selected[0] ? 1 : 0), 0);
+}
+
+function renderLegacyResults() {
+  if (!legacyResults || !legacyKeySelect || !legacyResultRows) return;
+  legacyResults.hidden = !legacyPages.length;
+  legacyKeySelect.replaceChildren();
+  for (const page of legacyPages) {
+    const label = `${page.sourceFile} · page ${page.pageNo}${page.studentId ? ` · ${page.studentId}` : ""}`;
+    legacyKeySelect.add(new Option(label, page.id));
+  }
+  if (legacyPages.length) {
+    if (!legacyPages.some((page) => page.id === legacyKeyPageId)) legacyKeyPageId = legacyPages[0].id;
+    legacyKeySelect.value = legacyKeyPageId;
+  }
+  const key = legacyPages.find((page) => page.id === legacyKeyPageId);
+  const { count, ready: keyReady } = legacyKeyInfo(key);
+  const keyFlags = key?.answers?.slice(0, count || 120).filter((answer) => answer.status !== "marked").length || 0;
+  legacyKeySummary.textContent = `Preview master answers · ${count || "?"} test questions · ${keyFlags} item${keyFlags === 1 ? "" : "s"} to check`;
+  legacyKeyAnswerPreview.textContent = key?.answers?.map((answer) => `${answer.question}:${answer.selected.join("") || (answer.status === "uncertain" ? "?" : "–")}`).join(" · ") || "";
+  const students = legacyPages.filter((page) => page.id !== legacyKeyPageId);
+  legacySummary.textContent = `${legacyBatchName || "Legacy batch"} · ${students.length} student page${students.length === 1 ? "" : "s"}${keyReady ? ` · ${count}-question key complete` : key?.readerVersion !== 2 ? " · rescan with updated reader" : " · key needs review"}`;
+  legacyResultRows.replaceChildren();
+  for (const student of students) {
+    const learner = courseRoster.find((item) => item.student_id === student.studentId);
+    const score = keyReady ? legacyScore(student, key, count) : null;
+    const flags = student.answers.slice(0, count || 120).filter((answer) => answer.status === "multiple" || answer.status === "uncertain").length;
+    const tr = document.createElement("tr");
+    const pageCell = document.createElement("th"); pageCell.scope = "row"; pageCell.textContent = `${student.sourceFile} · ${student.pageNo}`;
+    const nameCell = document.createElement("td");
+    if (courseRoster.length) {
+      const select = document.createElement("select"); select.className = "review-select legacy-roster-select";
+      select.add(new Option(learner ? rosterDisplayName(learner) : "Assign from roster…", ""));
+      for (const person of courseRoster) select.add(new Option(rosterDisplayName(person), person.student_id));
+      select.value = learner?.student_id || "";
+      select.addEventListener("change", async () => { student.studentId = select.value; student.partialId = select.value || student.partialId; await persistScanState(); renderLegacyResults(); });
+      nameCell.append(select);
+    } else nameCell.textContent = learner ? rosterDisplayName(learner) : "Roster not imported";
+    const idCell = document.createElement("td"); idCell.textContent = student.studentId || student.partialId || "Not read";
+    const scoreCell = document.createElement("td"); scoreCell.textContent = score === null ? "Key incomplete" : `${score}/${count} (${(score / count * 100).toFixed(1)}%)`;
+    const answerCell = document.createElement("td");
+    const details = document.createElement("details");
+    const summary = document.createElement("summary"); summary.textContent = `${flags} answer flag${flags === 1 ? "" : "s"} · view answers`;
+    const answerText = document.createElement("small"); answerText.className = "legacy-answer-preview";
+    answerText.textContent = student.answers.slice(0, count || 120).map((answer) => `${answer.question}:${answer.selected.join("") || (answer.status === "uncertain" ? "?" : "–")}`).join(" · ");
+    details.append(summary, answerText); answerCell.append(details);
+    tr.append(pageCell, nameCell, idCell, scoreCell, answerCell); legacyResultRows.append(tr);
+  }
+}
+
+async function downloadLegacyCsv() {
+  const key = legacyPages.find((page) => page.id === legacyKeyPageId);
+  const { count, ready: keyReady } = legacyKeyInfo(key);
+  const rows = [["student_id", "student_name", "score", "total", "percentage", "review_flags", ...Array.from({ length: count || 120 }, (_, i) => `Q${i + 1}`)]];
+  for (const student of legacyPages.filter((page) => page.id !== legacyKeyPageId)) {
+    const learner = courseRoster.find((item) => item.student_id === student.studentId);
+    const score = keyReady ? legacyScore(student, key, count) : "";
+    const flags = student.answers.slice(0, count || 120).filter((answer) => answer.status === "multiple" || answer.status === "uncertain").length;
+    rows.push([student.studentId || student.partialId, learner ? rosterDisplayName(learner) : "", score, keyReady ? count : "", keyReady ? (score / count * 100).toFixed(1) : "", flags,
+      ...student.answers.slice(0, count || 120).map((answer) => answer.selected.join("+") || (answer.status === "uncertain" ? "?" : ""))]);
+  }
+  const csv = rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
+  const blobUrl = URL.createObjectURL(new Blob(["\ufeff", csv], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a"); link.href = blobUrl; link.download = "legacy-mcq-results.csv"; link.click();
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+}
+
+async function scanPage(pdf, pageNo, sourceFile, qrCache = null) {
   // Render with PDF.js in the browser. Uploads and scan results stay local,
   // and each page avoids a PDF upload/render/PNG download round trip.
   const page = await pdf.getPage(pageNo);
   const baseViewport = page.getViewport({ scale: 1 });
-  const scale = Math.min(2.8, 1600 / Math.max(baseViewport.width, baseViewport.height));
+  // A 1,350 px A4 height keeps an answer-bubble radius above 10 px while
+  // cutting per-page raster work by roughly 29% versus the previous 1,600 px.
+  const scale = Math.min(2.8, 1350 / Math.max(baseViewport.width, baseViewport.height));
   const viewport = page.getViewport({ scale });
   setStageProgress("Rendering page in browser");
   const sourceCanvas = document.createElement("canvas");
@@ -857,25 +1342,40 @@ async function scanPage(pdf, pageNo, sourceFile) {
   const sourceImage = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
   setStageProgress("Detecting answer and ID bubbles");
 
-  // Scanner apps often produce a pale gray page. Use a maximally contrasted
-  // black/white copy for structural detection, while retaining the original
-  // grayscale page for bubble analysis and the saved preview.
-  const detectionCanvas = createBinarizedCanvas(sourceCanvas, sourceImage);
-  const marks = findRegistrationMarks(detectionCanvas);
-  detectionCanvas.width = 0;
-  detectionCanvas.height = 0;
+  // The normal case has clear black registration marks, so inspect the source
+  // directly. Only pale scans need a second, binarized full-page canvas.
+  let marks = findRegistrationMarks(sourceCanvas);
+  if (marks.some((mark) => mark.inferred)) {
+    const detectionCanvas = createBinarizedCanvas(sourceCanvas, sourceImage);
+    marks = findRegistrationMarks(detectionCanvas);
+    detectionCanvas.width = 0;
+    detectionCanvas.height = 0;
+  }
   if (!marks) {
+    let genericLayout = null;
+    try { genericLayout = JSON.parse(localStorage.getItem("print-scan-grade-generic-layout") || "null"); } catch { genericLayout = null; }
+    if (pageNo > 1 && genericLayout) {
+      sourceCanvas.width = 0;
+      sourceCanvas.height = 0;
+      return { guidePage: true };
+    }
     sourceCanvas.width = 0;
     sourceCanvas.height = 0;
     throw new Error("The four page-registration marks could not be found. Check that the page is not cropped.");
   }
   let alignedCanvas = null;
   let singleFormFallbackCanvas = null;
-  let selectedRegistrationPoints = null;
-  let qr = null;
+  // Most PDFs are already upright. Reading their QR directly avoids creating
+  // a large rectified canvas for every page. Rotated or skewed pages retain
+  // the rectification fallback below.
+  const qrFingerprint = createQrFingerprint(sourceImage, sourceCanvas.width, sourceCanvas.height);
+  const cachedQrMatches = qrCache?.fingerprint && qrCache?.qr &&
+    qrFingerprintsMatch(qrFingerprint, qrCache.fingerprint);
+  let qr = cachedQrMatches ? { ...qrCache.qr } : decodeFormQr(sourceCanvas);
+  let selectedRegistrationPoints = qr ? marks : null;
   // Registration marks are symmetric, so try each physical page orientation.
   // A valid form QR in the expected top-right area identifies the upright one.
-  for (let rotation = 0; rotation < 4; rotation += 1) {
+  for (let rotation = 0; !qr && rotation < 4; rotation += 1) {
     const points = marks.map((_, index) => marks[(index + rotation) % marks.length]);
     let candidate = rectifyPage(sourceCanvas, points, MARK_MARGIN, sourceImage);
     if (!candidate) continue;
@@ -908,7 +1408,7 @@ async function scanPage(pdf, pageNo, sourceFile) {
       selectedRegistrationPoints = points;
       break;
     }
-    if (rotation === 0 && formsById.size === 1) {
+    if (rotation === 0 && (formsById.size === 1 || localStorage.getItem("print-scan-grade-generic-layout"))) {
       singleFormFallbackCanvas = candidate;
     } else {
       candidate.width = 0;
@@ -919,23 +1419,53 @@ async function scanPage(pdf, pageNo, sourceFile) {
     singleFormFallbackCanvas.width = 0;
     singleFormFallbackCanvas.height = 0;
   }
-  if (!alignedCanvas && singleFormFallbackCanvas) {
-    const design = formsById.values().next().value;
+  if (!qr && singleFormFallbackCanvas) {
+    let layout;
+    try { layout = JSON.parse(localStorage.getItem("print-scan-grade-generic-layout") || "null"); } catch { layout = null; }
+    let design = layout ? null : (formsById.size === 1 ? formsById.values().next().value : null);
+    if (!design) {
+      const q = Number(layout?.question_count), c = Number(layout?.choice_count);
+      if (!Number.isInteger(q) || q < 1 || q > 60 || !Number.isInteger(c) || c < 2 || c > 8) {
+        singleFormFallbackCanvas.width = 0;
+        singleFormFallbackCanvas.height = 0;
+        throw new Error("No QR code was found. Open Print in this browser to set up a generic sheet, or scan a saved answer sheet.");
+      }
+      const formId = `generic-${q}-${c}`;
+      design = formsById.get(formId);
+      if (!design) {
+        genericScanTitle = window.prompt("This generic sheet is not linked to a saved answer sheet. Enter a title for these grades:", genericScanTitle || "");
+        if (!genericScanTitle?.trim()) {
+          singleFormFallbackCanvas.width = 0;
+          singleFormFallbackCanvas.height = 0;
+          throw new Error("A title is required to save grades for a generic answer sheet.");
+        }
+        genericScanTitle = genericScanTitle.trim();
+        design = { form_id: formId, title: genericScanTitle, question_count: q, choice_count: c,
+          generic: true, legacy_layout_version: 7 };
+        formsById.set(formId, design);
+      }
+    }
     alignedCanvas = singleFormFallbackCanvas;
     selectedRegistrationPoints = marks;
     // Layout 3 and 4 share answer and ID geometry. Existing pale sheets use
     // layout 3; clean layout-4 sheets remain identified from their QR above.
+    const fallbackLayout = design.generic ? 7 : 3;
     qr = {
-      data: `PSG1|${design.form_id}|${design.question_count}|${design.choice_count}|3`,
+      data: `PSG1|${design.form_id}|${design.question_count}|${design.choice_count}|${fallbackLayout}`,
       pageTopRatio: 0.28,
     };
   }
-  if (!alignedCanvas) {
+  if (!qr) {
     sourceCanvas.width = 0;
     sourceCanvas.height = 0;
     throw new Error("The page could not be aligned or its form QR code could not be read.");
   }
   try {
+    const cachedForm = !qr.data.startsWith("PSGGUIDE|") ? identifyScannedForm(qr) : null;
+    if (qrCache && cachedForm?.ok) {
+      qrCache.qr = { data: qr.data, pageTopRatio: qr.pageTopRatio };
+      qrCache.fingerprint = qrFingerprint;
+    }
     if (qr.data.startsWith("PSGGUIDE|")) {
       const guideFormId = qr.data.split("|")[1]?.toLowerCase();
       if (!formsById.has(guideFormId)) {
@@ -958,29 +1488,26 @@ async function scanPage(pdf, pageNo, sourceFile) {
     // ID bubbles are analysed as part of the same raw-page pass. Do not read
     // the same 90 circles again from the rectified canvas.
     const bubbleIdentity = readStudentIdFromSignals(annotations.idSignals, form.layoutVersion);
-    const rawPage = await new Promise((resolve) => sourceCanvas.toBlob(resolve, "image/png"));
+    // This is a preview/archive image only: answers above have already been
+    // read from the lossless in-memory canvas. JPEG avoids PNG compression
+    // becoming a per-page bottleneck on large scanned batches.
+    const rawPage = await new Promise((resolve) => sourceCanvas.toBlob(resolve, "image/jpeg", 0.88));
     if (!rawPage) throw new Error("The scanned page image could not be saved in browser storage format.");
-    let annotatedPage = null;
-    try {
-      // Keep the raw browser-rendered PNG unchanged. Draw diagnostic overlays
-      // only on a separate copy of those pixels.
-      annotatedPage = await createAnnotatedBubblePreview(
-        sourceCanvas, annotations,
-      );
-    } catch (error) {
-      console.warn("Could not create a locally annotated scan preview", error);
-    }
     const idMatch = resolveStudentIdentity(bubbleIdentity);
     return {
       sourceFile,
       pageNo,
       rawPage,
-      annotatedPage,
+      // The overlay is generated only when this saved scan is opened. Making
+      // it for every page during upload doubled image encoding work.
+      annotatedPage: null,
       rawScanVersion: RAW_SCAN_VERSION,
       annotationVersion: ANNOTATION_VERSION,
       annotationKeyId: "",
       formId: form.design.form_id,
       formTitle: form.design.title,
+      generic: Boolean(form.design.generic),
+      choiceCount: form.design.choice_count,
       layoutVersion: form.layoutVersion,
       questionCount: form.design.question_count,
       studentId: idMatch.studentId,
@@ -996,8 +1523,10 @@ async function scanPage(pdf, pageNo, sourceFile) {
   } finally {
     sourceCanvas.width = 0;
     sourceCanvas.height = 0;
-    alignedCanvas.width = 0;
-    alignedCanvas.height = 0;
+    if (alignedCanvas && alignedCanvas !== sourceCanvas) {
+      alignedCanvas.width = 0;
+      alignedCanvas.height = 0;
+    }
   }
 }
 
@@ -1217,7 +1746,7 @@ function resolveTemplateAnswers(annotations, questionCount) {
     }
     const corrected = status === "selected" && green.some((bubble) => bubble.crossed);
     counts[status] += 1;
-    answers.push({ question, response, status, corrected, reason,
+    answers.push({ question, response, selectedLabels: uncrossedGreen.map((bubble) => bubble.label), status, corrected, reason,
       bubbles: row.map((bubble) => ({ label: bubble.label, status: bubble.status,
         crossed: Boolean(bubble.crossed), crossScore: bubble.crossScore || 0 })) });
   }
@@ -1240,7 +1769,7 @@ async function createAnnotatedBubblePreview(sourceCanvas, annotationData, correc
     // green, everything else is blue. Keep the preview binary too, so stale
     // or imported metadata can never introduce an amber diagnostic circle.
     const isExpectedAnswer = bubble.kind === "answer" &&
-      correctAnswers?.get(bubble.question) === bubble.label;
+      correctAnswers?.get(bubble.question)?.includes(bubble.label);
     const color = bubble.status === "filled" ? "#00a878" : "#2878c8";
     context.beginPath();
     context.arc(bubble.x * scale, bubble.y * scale, bubble.radius * scale, 0, Math.PI * 2);
@@ -1472,7 +2001,10 @@ function rawBubbleGeometry(mapping, x, y, radius, scale) {
 }
 
 function rectifyPage(sourceCanvas, registrationPoints, markMargin = MARK_MARGIN, suppliedImage = null) {
-  const outputWidth = 1500;
+  // This canvas is used only to locate and read the QR code. Answer analysis
+  // maps directly onto the original page, so 960 px is ample for QR modules
+  // and avoids repeatedly sampling a 3.2-megapixel temporary image.
+  const outputWidth = 960;
   const outputHeight = Math.round(outputWidth * A4.height / A4.width);
   const scale = outputWidth / A4.width;
   const inset = markMargin * scale;
@@ -1632,6 +2164,44 @@ function decodeFormQr(canvas) {
     decoded.pageTopRatio = (top + Math.min(...corners.map((point) => point.y))) / canvas.height;
   }
   return decoded;
+}
+
+function createQrFingerprint(image, width, height) {
+  // This low-detail QR-region fingerprint does not score answers. It only
+  // proves that a cached, already decoded QR belongs to the current page.
+  const columns = 20;
+  const rows = 20;
+  const left = Math.floor(width * 0.8);
+  const top = Math.floor(height * 0.23);
+  const regionWidth = Math.max(columns, Math.ceil(width * 0.19));
+  const regionHeight = Math.max(rows, Math.ceil(height * 0.15));
+  const fingerprint = new Uint8Array(columns * rows);
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      const startX = left + Math.floor(column * regionWidth / columns);
+      const endX = Math.min(width, left + Math.ceil((column + 1) * regionWidth / columns));
+      const startY = top + Math.floor(row * regionHeight / rows);
+      const endY = Math.min(height, top + Math.ceil((row + 1) * regionHeight / rows));
+      let total = 0;
+      let samples = 0;
+      for (let y = startY; y < endY; y += 1) {
+        for (let x = startX; x < endX; x += 1) {
+          const offset = (y * width + x) * 4;
+          total += image.data[offset] * 299 + image.data[offset + 1] * 587 + image.data[offset + 2] * 114;
+          samples += 1;
+        }
+      }
+      fingerprint[row * columns + column] = samples && total / samples / 1000 < 190 ? 1 : 0;
+    }
+  }
+  return fingerprint;
+}
+
+function qrFingerprintsMatch(left, right) {
+  if (!(left instanceof Uint8Array) || !(right instanceof Uint8Array) || left.length !== right.length) return false;
+  let differences = 0;
+  for (let index = 0; index < left.length; index += 1) differences += left[index] === right[index] ? 0 : 1;
+  return differences <= left.length * 0.14;
 }
 
 function identifyScannedForm(qr) {
@@ -1867,11 +2437,14 @@ function analyzeCircle(image, width, height, expectedX, expectedY, radius, searc
   const outline = histogramPercentile(best.edgeSamples.ringHistogram,
     best.edgeSamples.ringCount, 0.2) || Math.max(0, paper - 16);
   const outlineSpan = Math.max(2, paper - outline);
-  // The calibration set succeeds with an ink ceiling of 140. Keep that hard
-  // ceiling on normal/bright paper and only lower it for dark photocopies.
-  // This is deliberately conservative: a faint guide glyph must never become
-  // a student response.
-  const darkThreshold = Math.max(70, Math.min(140, paper - 50));
+  // Judge ink against the local paper and the printed bubble outline. This
+  // keeps a native black PDF and a PaperCut-style charcoal scan comparable
+  // without changing either page's pixels. A guide letter remains much closer
+  // to the paper than a shaded response, even when a scanner has softened all
+  // of the printed ink.
+  const outlineContrast = Math.max(0, paper - outline);
+  const darkThreshold = Math.max(70, Math.min(paper - 24,
+    paper - Math.max(38, outlineContrast * 0.56)));
   const darkPixels = histogramCountBelow(inside.histogram, darkThreshold);
   const fillRatio = darkPixels / Math.max(1, inside.count);
   const insideMean = inside.sum / Math.max(1, inside.count);
@@ -2113,10 +2686,14 @@ function resolveQuestion(question, bubbles) {
   let response = "";
   let status = "incorrect_blank";
   let reason = "No answer bubble was shaded.";
-  if (uncertain.length || active.length > 1) {
+  if (uncertain.length) {
     status = "review";
-    reason = active.length > 1 ? "More than one answer appears to be active." : "A mark could not be classified confidently.";
+    reason = "A mark could not be classified confidently.";
     response = active.length === 1 ? active[0].label : "";
+  } else if (active.length > 1) {
+    response = active.map((bubble) => bubble.label).join(", ");
+    status = "multiple";
+    reason = `More than one active answer was detected (${response}).`;
   } else if (active.length === 1) {
     response = active[0].label;
     status = crossed.length ? "detected_corrected" : "detected";
@@ -2125,7 +2702,7 @@ function resolveQuestion(question, bubbles) {
     status = "incorrect_blank";
     reason = "All marked bubbles appear crossed out; no active answer remains.";
   }
-  return { question, response, status, reason, bubbles };
+  return { question, response, selectedLabels: active.map((bubble) => bubble.label), status, reason, bubbles };
 }
 
 function finishScan() {
@@ -2181,6 +2758,23 @@ function renderSetAnswerKeyOptions() {
     await refreshSavedAnnotationsInBackground();
     renderGradeWorkspace();
   };
+  renderAnswerKeyRules(scanSet, selectedKey);
+}
+
+function selectedLabelsForAnswer(answer) {
+  const labels = Array.isArray(answer?.selectedLabels)
+    ? answer.selectedLabels
+    : String(answer?.response || "").split(",");
+  return [...new Set(labels.map((label) => String(label).trim()).filter((label) => /^[A-Z]$/.test(label)))].sort();
+}
+
+function isResolvedAnswer(answer) {
+  return ["selected", "multiple", "detected", "detected_corrected"].includes(answer?.status) &&
+    selectedLabelsForAnswer(answer).length > 0;
+}
+
+function formatAnswerSet(labels) {
+  return (labels || []).join(" + ") || "Not selected";
 }
 
 function completeAnswerKeyAnswers(sheet) {
@@ -2189,10 +2783,71 @@ function completeAnswerKeyAnswers(sheet) {
   const answers = new Map();
   for (let question = 1; question <= questionCount; question += 1) {
     const answer = sheet.answers.find((item) => item.question === question);
-    if (!answer || answer.status !== "selected" || !/^[A-Z]$/.test(answer.response || "")) return null;
-    answers.set(question, answer.response);
+    if (!answer || !isResolvedAnswer(answer)) return null;
+    answers.set(question, selectedLabelsForAnswer(answer));
   }
   return answers;
+}
+
+function ruleForQuestion(scanSetId, question, keyedAnswers) {
+  if ((keyedAnswers || []).length < 2) return "all";
+  const keyId = answerKeyByScanSet[scanSetId];
+  return answerRulesByAnswerKey[keyId]?.[question] === "any" ? "any" : "all";
+}
+
+function isQuestionDiscountedForAll(scanSetId, question) {
+  return Boolean(questionDiscountsByScanSet[scanSetId]?.[question]);
+}
+
+function isQuestionDiscountedForStudent(sheet, question) {
+  return Array.isArray(sheet?.discountedQuestions) && sheet.discountedQuestions.includes(question);
+}
+
+function setQuestionDiscountForStudent(sheet, question, discounted) {
+  const current = new Set(Array.isArray(sheet.discountedQuestions) ? sheet.discountedQuestions : []);
+  if (discounted) current.add(question);
+  else current.delete(question);
+  sheet.discountedQuestions = [...current].sort((left, right) => left - right);
+}
+
+function evaluateAnswerSet(answer, keyedAnswers, rule) {
+  const selected = selectedLabelsForAnswer(answer);
+  if (!isResolvedAnswer(answer)) return { status: answer?.status === "review" ? "review" : "incorrect", selected };
+  const keyed = new Set(keyedAnswers || []);
+  if (selected.some((label) => !keyed.has(label))) return { status: "incorrect", selected };
+  const correct = rule === "any"
+    ? selected.some((label) => keyed.has(label))
+    : selected.length === keyed.size && [...keyed].every((label) => selected.includes(label));
+  return { status: correct ? "correct" : "incorrect", selected };
+}
+
+function renderAnswerKeyRules(scanSet, key) {
+  if (!answerKeyRules || !answerKeyRuleList) return;
+  const keyed = completeAnswerKeyAnswers(key);
+  const multiQuestions = keyed ? [...keyed.entries()].filter(([, labels]) => labels.length > 1) : [];
+  answerKeyRules.hidden = multiQuestions.length === 0;
+  answerKeyRuleList.replaceChildren();
+  if (!multiQuestions.length) return;
+  answerRulesByAnswerKey[key.id] ||= {};
+  for (const [question, labels] of multiQuestions) {
+    const row = document.createElement("label");
+    row.className = "answer-key-rule-row";
+    const title = document.createElement("span");
+    title.innerHTML = `<strong>Question ${question}</strong><small>Keyed answers: ${formatAnswerSet(labels)}</small>`;
+    const select = document.createElement("select");
+    select.className = "review-select";
+    select.setAttribute("aria-label", `Marking rule for question ${question}`);
+    select.add(new Option("All keyed answers required", "all"));
+    select.add(new Option("Any keyed answer accepted", "any"));
+    select.value = ruleForQuestion(scanSet.id, question, labels);
+    select.addEventListener("change", async () => {
+      answerRulesByAnswerKey[key.id][question] = select.value === "any" ? "any" : "all";
+      await persistScanState();
+      renderGradeWorkspace();
+    });
+    row.append(title, select);
+    answerKeyRuleList.append(row);
+  }
 }
 
 function rosterCandidates(sheet) {
@@ -2301,7 +2956,7 @@ function analysisConfigForForm(formId) {
 }
 
 function validAnalysisAnswer(answer) {
-  return answer?.status === "selected" && /^[A-Z]$/.test(answer.response || "") && !answer.corrected;
+  return isResolvedAnswer(answer);
 }
 
 function analysisRecords() {
@@ -2314,11 +2969,12 @@ function analysisRecords() {
   const sheets = sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId && !isDummyAnswerKey(sheet) && sheet.id !== key.id);
   const records = sheets.map((sheet, index) => {
     const grade = gradeForSheet(sheet, key);
-    const total = Number(sheet.questionCount) || keyAnswers.size;
+    const total = grade.total;
     return { sheet, grade, total, percentage: total ? (grade.correct / total) * 100 : 0, index,
       name: studentNameFor(sheet) };
   });
-  return { key, keyAnswers, records, questionCount: Number(key.questionCount) || keyAnswers.size };
+  const questionCount = [...keyAnswers.keys()].filter((question) => !isQuestionDiscountedForAll(scanSet.id, question)).length;
+  return { scanSet, key, keyAnswers, records, questionCount };
 }
 
 function analysisClassForPercentage(value, config) {
@@ -2342,30 +2998,35 @@ function analysisClassDefinitions(config) {
 }
 
 function analysisItems(data) {
-  const { records, keyAnswers, questionCount } = data;
+  const { scanSet, records, keyAnswers, questionCount } = data;
   const ranked = [...records].sort((a, b) => b.percentage - a.percentage || String(a.sheet.id).localeCompare(String(b.sheet.id)) || a.index - b.index);
   const groupSize = Math.max(1, Math.floor(ranked.length * 0.27));
   const upper = ranked.slice(0, groupSize);
   const lower = ranked.slice(Math.max(groupSize, ranked.length - groupSize));
-  return Array.from({ length: questionCount }, (_, offset) => {
-    const question = offset + 1;
-    const correctAnswer = keyAnswers.get(question) || "";
+  return Array.from({ length: questionCount }, (_, offset) => offset + 1)
+    .filter((question) => !isQuestionDiscountedForAll(scanSet.id, question)).map((question) => {
+    const keyedAnswers = keyAnswers.get(question) || [];
+    const rule = ruleForQuestion(scanSet.id, question, keyedAnswers);
     const valid = records.filter((record) => validAnalysisAnswer(record.sheet.answers?.find((answer) => answer.question === question)));
-    const correct = valid.filter((record) => record.sheet.answers.find((answer) => answer.question === question).response === correctAnswer).length;
+    const correct = valid.filter((record) => evaluateAnswerSet(
+      record.sheet.answers.find((answer) => answer.question === question), keyedAnswers, rule,
+    ).status === "correct").length;
     const options = {};
     for (const record of valid) {
-      const response = record.sheet.answers.find((answer) => answer.question === question).response;
-      options[response] = (options[response] || 0) + 1;
+      const response = record.sheet.answers.find((answer) => answer.question === question);
+      for (const label of selectedLabelsForAnswer(response)) options[label] = (options[label] || 0) + 1;
     }
     const groupRate = (group) => {
       const groupValid = group.filter((record) => validAnalysisAnswer(record.sheet.answers?.find((answer) => answer.question === question)));
       if (!groupValid.length) return null;
-      const hits = groupValid.filter((record) => record.sheet.answers.find((answer) => answer.question === question).response === correctAnswer).length;
+      const hits = groupValid.filter((record) => evaluateAnswerSet(
+        record.sheet.answers.find((answer) => answer.question === question), keyedAnswers, rule,
+      ).status === "correct").length;
       return { rate: hits / groupValid.length, valid: groupValid.length };
     };
     const upperRate = groupRate(upper); const lowerRate = groupRate(lower);
     const discrimination = upperRate && lowerRate ? upperRate.rate - lowerRate.rate : null;
-    return { question, correctAnswer, validCount: valid.length, unresolvedCount: records.length - valid.length,
+    return { question, keyedAnswers, rule, validCount: valid.length, unresolvedCount: records.length - valid.length,
       correctCount: correct, percentage: valid.length ? (correct / valid.length) * 100 : null, options,
       discrimination, upperRate, lowerRate, groupSize, cohortSize: records.length };
   });
@@ -2480,7 +3141,7 @@ function renderDiscriminationChart(items) {
 function renderOptionChart(items) {
   const width = Math.max(680, items.length * 34 + 70), height = 280, left = 44, top = 18, bottom = 42, plotHeight = height - top - bottom, plotWidth = width - left - 14, slot = plotWidth / Math.max(items.length, 1);
   const svg = chartSvg(analysisCharts.option, width, height); chartGrid(svg, left, top, plotWidth, plotHeight, 100, 5, (value) => `${Math.round(value)}%`);
-  items.forEach((item, index) => { let y = top + plotHeight; const options = Object.entries(item.options).sort((a, b) => a[0].localeCompare(b[0])); for (const [option, count] of options) { const percent = item.validCount ? count / item.validCount * 100 : 0; const h = percent / 100 * plotHeight; y -= h; const rect = svgElement("rect", { x: left + index * slot + 5, y, width: Math.max(10, slot - 10), height: Math.max(h, 1), class: `analysis-option ${option === item.correctAnswer ? "keyed" : ""}` }); svg.append(rect); bindChartMark(rect, { title: `Question ${item.question} · ${option}`, lines: [`${percent.toFixed(1)}% (${count})`, option === item.correctAnswer ? "Keyed answer" : "Distractor", `Valid responses: ${item.validCount}`, `Excluded: ${item.unresolvedCount}`] }); } chartText(svg, String(item.question), left + index * slot + slot / 2, height - 14, { class: "analysis-axis-label", "text-anchor": "middle" }); });
+  items.forEach((item, index) => { let y = top + plotHeight; const options = Object.entries(item.options).sort((a, b) => a[0].localeCompare(b[0])); for (const [option, count] of options) { const percent = item.validCount ? count / item.validCount * 100 : 0; const h = percent / 100 * plotHeight; y -= h; const keyed = item.keyedAnswers.includes(option); const rect = svgElement("rect", { x: left + index * slot + 5, y, width: Math.max(10, slot - 10), height: Math.max(h, 1), class: `analysis-option ${keyed ? "keyed" : ""}` }); svg.append(rect); bindChartMark(rect, { title: `Question ${item.question} · ${option}`, lines: [`${percent.toFixed(1)}% (${count})`, keyed ? `Keyed answer · ${item.rule === "any" ? "any keyed" : "all keyed"}` : "Distractor", `Valid responses: ${item.validCount}`, `Excluded: ${item.unresolvedCount}`] }); } chartText(svg, String(item.question), left + index * slot + slot / 2, height - 14, { class: "analysis-axis-label", "text-anchor": "middle" }); });
 }
 
 function renderAnalysisThresholds(formId) {
@@ -2629,7 +3290,7 @@ function percentageLabelForScan(sheet) {
   const answerKey = getGradeKeyForScan(sheet);
   if (sheet.rawScanVersion !== RAW_SCAN_VERSION || !answerKey || answerKey.id === sheet.id || !Number(sheet.questionCount)) return "—";
   const grade = gradeForSheet(sheet, answerKey);
-  return `${((grade.correct / grade.total) * 100).toFixed(1)}%`;
+  return grade.total ? `${((grade.correct / grade.total) * 100).toFixed(1)}%` : "—";
 }
 
 function rosterNumericScore(sheetRecords) {
@@ -2817,7 +3478,8 @@ async function openUnidentifiedDialog(sheet, nextSheetId = "") {
   queueMicrotask(() => unidentifiedSearch.focus());
   try {
     const preview = await createNameAreaPreview(sheet);
-    if (!preview || unidentifiedDialogSheet !== sheet) {
+    if (unidentifiedDialogSheet !== sheet) return;
+    if (!preview) {
       unidentifiedNameStatus.textContent = "Name-area preview is unavailable; use Review scan for the full page.";
       unidentifiedNameStatus.hidden = false;
       return;
@@ -2825,6 +3487,7 @@ async function openUnidentifiedDialog(sheet, nextSheetId = "") {
     unidentifiedNameObjectUrl = URL.createObjectURL(preview);
     unidentifiedNameImage.src = unidentifiedNameObjectUrl;
   } catch (error) {
+    if (unidentifiedDialogSheet !== sheet) return;
     unidentifiedNameStatus.textContent = error.message;
     unidentifiedNameStatus.hidden = false;
   }
@@ -2866,6 +3529,13 @@ unidentifiedMatch?.addEventListener("keydown", async (event) => {
   await assignUnidentifiedDialogStudent();
 });
 unidentifiedAssign?.addEventListener("click", assignUnidentifiedDialogStudent);
+$("#unidentified-skip")?.addEventListener("click", () => {
+  if (!unidentifiedDialogSheet) return;
+  const nextId = findNextUnidentifiedSheetId(unidentifiedDialogSheet.id);
+  const next = sheetResults.find((sheet) => sheet.id === nextId);
+  closeUnidentifiedDialog();
+  if (next) queueMicrotask(() => openUnidentifiedDialog(next, findNextUnidentifiedSheetId(next.id)));
+});
 $("#unidentified-dialog-close")?.addEventListener("click", closeUnidentifiedDialog);
 unidentifiedDialog?.addEventListener("cancel", () => {
   if (unidentifiedNameObjectUrl) URL.revokeObjectURL(unidentifiedNameObjectUrl);
@@ -2978,6 +3648,7 @@ function openStudentScans(name, sheetRecords) {
   scanPreviewTitle.textContent = `${name} · scanned sheets`;
   scanPreviewMeta.textContent = "Choose a scanned sheet to preview its detected answers.";
   previewedSheetId = "";
+  updateScanPreviewNavigation(null);
   resetOriginalScanPreview();
   scanPreviewContent.replaceChildren();
   for (const sheet of sheetRecords) {
@@ -2994,6 +3665,7 @@ function openStudentScans(name, sheetRecords) {
 function openScanPreview(sheet) {
   resetOriginalScanPreview();
   previewedSheetId = sheet.id;
+  updateScanPreviewNavigation(sheet);
   scanPreviewTitle.textContent = `${studentNameFor(sheet)} · ${sheet.formTitle}`;
   const answerKey = getGradeKeyForScan(sheet);
   const sheetGrade = answerKey && answerKey.id !== sheet.id ? gradeForSheet(sheet, answerKey) : null;
@@ -3016,7 +3688,7 @@ function openScanPreview(sheet) {
     showOriginalScanBlob(sheet, sheet.annotatedPage);
   } else if (hasCurrentRawPage) {
     showOriginalScanBlob(sheet, sheet.rawPage);
-    refreshSavedAnnotationsInBackground().then(() => {
+    refreshSavedAnnotationsInBackground(new Set([sheet.id])).then(() => {
       if (previewedSheetId === sheet.id && sheet.annotatedPage instanceof Blob) {
         showOriginalScanBlob(sheet, sheet.annotatedPage);
       }
@@ -3036,7 +3708,7 @@ function openScanPreview(sheet) {
     table.className = "scan-results-table";
     const header = document.createElement("thead");
     const headerRow = document.createElement("tr");
-    for (const label of ["Question", "Scanned answer", "Correct answer", "Result"]) {
+    for (const label of ["Question", "Scanned answer", "Correct answer", "Result", "Discount"]) {
       const cell = document.createElement("th");
       cell.scope = "col";
       cell.textContent = label;
@@ -3051,17 +3723,47 @@ function openScanPreview(sheet) {
       question.scope = "row";
       question.textContent = String(answer.question);
       const scanned = document.createElement("td");
-      scanned.textContent = answerDisplayValue(answer.response) +
+      scanned.textContent = formatAnswerSet(selectedLabelsForAnswer(answer)) +
         (answer.corrected ? " (crossed correction)" : "");
       scanned.className = `scan-answer-status ${answer.status}`;
       const correct = document.createElement("td");
       const grade = gradedAnswers[index];
-      correct.textContent = grade ? answerDisplayValue(grade.correctAnswer?.response) : "—";
+      correct.textContent = grade ? `${formatAnswerSet(grade.keyedAnswers)}${grade.keyedAnswers?.length > 1 ? ` · ${grade.rule === "any" ? "any keyed" : "all keyed"}` : ""}` : "—";
       const result = document.createElement("td");
       result.textContent = grade ? gradeResultLabel(grade.status, answer.corrected) : "Not graded";
       result.className = `scan-answer-result ${grade?.status || "ungraded"}`;
       result.title = answer.reason;
-      row.append(question, scanned, correct, result);
+      const discount = document.createElement("td");
+      if (sheetGrade && grade) {
+        const label = document.createElement("label");
+        label.className = "student-question-discount";
+        const select = document.createElement("select");
+        select.className = "student-question-discount-select";
+        select.setAttribute("aria-label", `Score treatment for question ${answer.question}`);
+        select.add(new Option("Include in score", "include"));
+        select.add(new Option("Exclude for this student", "student"));
+        select.add(new Option("Exclude for all students", "all"));
+        select.value = grade.status === "discounted_all" ? "all"
+          : grade.status === "discounted_student" ? "student" : "include";
+        label.append(document.createTextNode("Score: "), select);
+        select.addEventListener("change", async () => {
+          questionDiscountsByScanSet[sheet.scanSetId] ||= {};
+          if (select.value === "all") {
+            questionDiscountsByScanSet[sheet.scanSetId][answer.question] = true;
+            setQuestionDiscountForStudent(sheet, answer.question, false);
+          } else {
+            delete questionDiscountsByScanSet[sheet.scanSetId][answer.question];
+            setQuestionDiscountForStudent(sheet, answer.question, select.value === "student");
+          }
+          await persistScanState();
+          renderGradeWorkspace();
+          openScanPreview(sheet);
+        });
+        discount.append(label);
+      } else {
+        discount.textContent = "—";
+      }
+      row.append(question, scanned, correct, result, discount);
       body.append(row);
     }
     table.append(header, body);
@@ -3073,6 +3775,51 @@ function openScanPreview(sheet) {
     return;
   }
   if (!scanPreviewDialog.open) scanPreviewDialog.showModal();
+}
+
+function previewableStudentGroups(sheet) {
+  const groups = new Map();
+  for (const candidate of sheetResults.filter((item) => item.scanSetId === sheet.scanSetId && !isDummyAnswerKey(item))) {
+    const learner = matchedLearner(candidate);
+    // Keep separate unidentified pages separate: there is no reliable way to
+    // know whether two of them belong to the same student.
+    const id = learner ? `learner:${learner.student_id}` : `scan:${candidate.id}`;
+    if (!groups.has(id)) groups.set(id, { id, name: learner ? rosterDisplayName(learner) : "Student not identified", sheets: [] });
+    groups.get(id).sheets.push(candidate);
+  }
+  return [...groups.values()]
+    .map((group) => ({ ...group, sheets: group.sheets.sort((left, right) =>
+      String(left.sourceFile || "").localeCompare(String(right.sourceFile || ""), undefined, { numeric: true }) ||
+      Number(left.pageNo || 0) - Number(right.pageNo || 0)) }))
+    .sort((left, right) => left.name.localeCompare(right.name, undefined, { sensitivity: "base" }));
+}
+
+function updateScanPreviewNavigation(sheet) {
+  if (!scanPreviewPrevious || !scanPreviewNext) return;
+  if (!sheet) {
+    scanPreviewPrevious.hidden = true;
+    scanPreviewNext.hidden = true;
+    return;
+  }
+  const groups = previewableStudentGroups(sheet);
+  const index = groups.findIndex((group) => group.sheets.some((candidate) => candidate.id === sheet.id));
+  const previous = index > 0 ? groups[index - 1] : null;
+  const next = index >= 0 && index < groups.length - 1 ? groups[index + 1] : null;
+  scanPreviewPrevious.hidden = false;
+  scanPreviewNext.hidden = false;
+  scanPreviewPrevious.disabled = !previous;
+  scanPreviewNext.disabled = !next;
+  scanPreviewPrevious.title = previous ? `Open ${previous.name}` : "This is the first student";
+  scanPreviewNext.title = next ? `Open ${next.name}` : "This is the last student";
+}
+
+function moveScanPreview(direction) {
+  const current = sheetResults.find((sheet) => sheet.id === previewedSheetId);
+  if (!current) return;
+  const groups = previewableStudentGroups(current);
+  const index = groups.findIndex((group) => group.sheets.some((sheet) => sheet.id === current.id));
+  const target = groups[index + direction];
+  if (target) openScanPreview(target.sheets[0]);
 }
 
 function showOriginalScanBlob(sheet, blob) {
@@ -3119,34 +3866,40 @@ function releaseOriginalScanUrl() {
 
 function gradeForSheet(sheet, key) {
   if (sheet.id === key.id) {
+    const activeResponses = sheet.answers.filter((response) => !isQuestionDiscountedForAll(sheet.scanSetId, response.question));
     return {
-      correct: sheet.questionCount,
+      correct: activeResponses.length,
       review: 0,
-      total: sheet.questionCount,
+      total: activeResponses.length,
       gradedAnswers: sheet.answers.map((response) => ({
         response,
         correctAnswer: response,
-        status: "correct",
+        keyedAnswers: selectedLabelsForAnswer(response),
+        rule: "all",
+        status: isQuestionDiscountedForAll(sheet.scanSetId, response.question) ? "discounted_all" : "correct",
       })),
     };
   }
   let correct = 0;
   let review = 0;
+  let total = 0;
   const gradedAnswers = [];
   for (let index = 0; index < sheet.answers.length; index += 1) {
     const response = sheet.answers[index];
-    const correctAnswer = key.answers[index];
-    let status = "incorrect";
-    if (response.status === "review" || correctAnswer?.status === "review") {
-      status = "review";
-      review += 1;
-    } else if (response.response && response.response === correctAnswer?.response) {
-      status = "correct";
-      correct += 1;
-    }
-    gradedAnswers.push({ response, correctAnswer, status });
+    const correctAnswer = key.answers.find((answer) => answer.question === response.question);
+    const keyedAnswers = selectedLabelsForAnswer(correctAnswer);
+    const rule = ruleForQuestion(sheet.scanSetId, response.question, keyedAnswers);
+    const discountedForAll = isQuestionDiscountedForAll(sheet.scanSetId, response.question);
+    const discountedForStudent = !discountedForAll && isQuestionDiscountedForStudent(sheet, response.question);
+    const evaluation = discountedForAll || discountedForStudent
+      ? { status: discountedForAll ? "discounted_all" : "discounted_student", selected: selectedLabelsForAnswer(response) }
+      : evaluateAnswerSet(response, keyedAnswers, rule);
+    if (!discountedForAll && !discountedForStudent) total += 1;
+    if (evaluation.status === "review") review += 1;
+    if (evaluation.status === "correct") correct += 1;
+    gradedAnswers.push({ response, correctAnswer, keyedAnswers, rule, selectedAnswers: evaluation.selected, status: evaluation.status });
   }
-  return { correct, review, total: sheet.questionCount, gradedAnswers };
+  return { correct, review, total, gradedAnswers };
 }
 
 function samplePatternCheck(sheet) {
@@ -3162,6 +3915,9 @@ function statusPill(status) {
   const labels = {
     detected: "Detected · not graded",
     detected_corrected: "Corrected · not graded",
+    multiple: "Multiple selected · not graded",
+    discounted_all: "Excluded for all students",
+    discounted_student: "Excluded for this student",
     detected_manual: "Reviewed · not graded",
     correct: "Correct",
     incorrect: "Incorrect",
@@ -3174,8 +3930,7 @@ function statusPill(status) {
 
 function downloadCsv() {
   const formSheets = sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId && !isDummyAnswerKey(sheet));
-  const questionCount = formSheets.find((sheet) => Number(sheet.questionCount) > 0)?.questionCount;
-  const rows = [["student_id", "student_name", questionCount ? `score /${questionCount}` : "score", "percentage (%)"]];
+  const rows = [["student_id", "student_name", "score", "percentage (%)"]];
   for (const sheet of formSheets) {
     const learner = matchedLearner(sheet);
     const key = getGradeKeyForScan(sheet);
@@ -3184,7 +3939,7 @@ function downloadCsv() {
     const studentId = learner?.student_id || sheet.studentId || sheet.bubbleStudentId || sheet.writtenStudentId || "";
     const studentName = learner ? rosterDisplayName(learner) : studentNameFor(sheet);
     const score = grade ? grade.correct : "";
-    const percentage = grade ? ((grade.correct / grade.total) * 100).toFixed(1) : "";
+    const percentage = grade && grade.total ? ((grade.correct / grade.total) * 100).toFixed(1) : "";
     rows.push([studentId, studentName, score, percentage]);
   }
   const csv = rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
@@ -3213,10 +3968,11 @@ function setStageProgress(message) {
   rescanStageBar.removeAttribute("value");
 }
 
-async function refreshSavedAnnotations() {
+async function refreshSavedAnnotations(sheetIds = null) {
   await loadFormsManifest();
   let changed = false;
   for (const sheet of sheetResults) {
+    if (sheetIds && !sheetIds.has(sheet.id)) continue;
     // Legacy records intentionally cannot be re-read: their originalPage may
     // be contrast-adjusted or already annotated rather than raw pixels.
     if (sheet.rawScanVersion !== RAW_SCAN_VERSION || !(sheet.rawPage instanceof Blob)) continue;
@@ -3270,18 +4026,10 @@ function formatBytes(bytes) {
 }
 
 loadPersistedScanState().then(() => {
-  if (window.location.pathname.replace(/\/$/, "").endsWith("/grade")) {
+  if (standaloneMode ? new URLSearchParams(window.location.search).get("view") === "grade" : window.location.pathname.replace(/\/$/, "").endsWith("/grade")) {
     showGradeDashboard(false).catch(showGradeLoadError);
   } else {
     renderGradeDashboardSheets([]);
     renderGradeWorkspace();
   }
-  // Annotation rules are versioned. Refresh saved browser-local scans as soon
-  // as the app opens, rather than requiring someone to navigate to Grade
-  // before they can see the current detector's green/blue overlay.
-  refreshSavedAnnotationsInBackground().then(() => {
-    renderScanSetList();
-    renderGradeDashboardSheets(gradeDashboardData?.forms || []);
-    renderGradeWorkspace();
-  });
 });

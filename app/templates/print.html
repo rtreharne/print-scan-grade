@@ -72,13 +72,21 @@
           <button class="primary-button" type="submit">Save answer sheet</button>
         </form>
 
+        <form method="post" action="{{ url_for('download_generic_sheet') }}" class="design-form" id="generic-sheet-form">
+          <input type="hidden" name="csrf_token" value="{{ session['print_csrf'] }}">
+          <input type="hidden" name="question_count" id="generic-question-count" value="20">
+          <input type="hidden" name="choice_count" id="generic-choice-count" value="4">
+          <button class="secondary-button" type="submit">Download generic sheet (no title or QR)</button>
+          <small>This sheet is not saved as a design. When scanning it in this browser, you’ll be asked for a title.</small>
+        </form>
+
         <aside class="sheet-details">
           <h3>Included on each sheet</h3>
           <ul>
             <li>Student name field and a 9-digit ID with bubble and handwritten entry</li>
             <li>Clear instructions for marking and correcting answers</li>
             <li>Annotated student guide on page 2</li>
-            <li>Form code and registration marks for future scanning</li>
+            <li>Registration marks for scanning; saved sheets also include a form code</li>
           </ul>
         </aside>
       </section>
@@ -141,10 +149,17 @@
       const questions = questionInput.value || "0";
       const lastChoice = "ABCDEFGH"[Number(choiceInput.value) - 1] || "D";
       summary.textContent = `${questions} ${questions === "1" ? "question" : "questions"} · choices A–${lastChoice} · answer sheet plus student guide`;
+      document.getElementById("generic-question-count").value = questions;
+      document.getElementById("generic-choice-count").value = choiceInput.value;
     }
     questionInput.addEventListener("input", updateSheetSummary);
     choiceInput.addEventListener("change", updateSheetSummary);
     updateSheetSummary();
+    document.getElementById("generic-sheet-form").addEventListener("submit", () => {
+      localStorage.setItem("print-scan-grade-generic-layout", JSON.stringify({
+        question_count: Number(questionInput.value), choice_count: Number(choiceInput.value)
+      }));
+    });
   </script>
 </body>
 </html>

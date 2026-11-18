@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b2b">
+  <title>UoL legacy sheets · Print Scan Grade</title>
+  <link rel="icon" href="{{ url_for('static', filename='logo.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='print.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='scan.css', v=6) }}">
+  <script src="{{ url_for('static', filename='vendor/jszip.min.js') }}"></script>
+</head>
+<body class="standalone-embedded-workspace">
+  <main class="workspace">
+    <header class="workspace-header">
+      <a class="brand" href="{{ url_for('standalone_home') }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="42" height="42"><span>Print Scan Grade</span></a>
+      <span class="course-badge">University of Liverpool MCQ sheets</span>
+    </header>
+    <nav class="phase-nav" aria-label="Workspace phases">
+      <a class="{{ 'active' if view == 'print' else '' }}" href="{{ url_for('standalone_uol_legacy', view='print') }}">1 · Print</a>
+      <a class="{{ 'active' if view == 'scan' else '' }}" href="{{ url_for('standalone_uol_legacy', view='scan') }}">2 · Scan</a>
+      <a class="{{ 'active' if view == 'grade' else '' }}" href="{{ url_for('standalone_uol_legacy', view='grade') }}">3 · Results</a>
+    </nav>
+
+    {% if view == 'print' %}
+    <section class="intro"><p class="eyebrow">Phase 01 · Print</p><h1>Embed the UoL legacy scanner</h1><p>This workspace reads existing University of Liverpool answer sheets. It does not create or print sheets.</p></section>
+    <section class="panel scan-panel"><div class="scan-heading"><div><p class="eyebrow">Embed this workspace</p><h2>Iframe code</h2></div></div>
+      <label class="scan-key-field" for="uol-iframe-code"><span>Copy this code into your VLE</span><textarea id="uol-iframe-code" class="review-select" rows="4" readonly><iframe src="{{ public_base_url }}{{ url_for('standalone_uol_legacy', view='scan') }}" title="University of Liverpool MCQ sheet scanner" width="100%" height="1000" style="border:0"></iframe></textarea></label>
+      <button id="uol-copy-iframe" class="download-button" type="button">Copy iframe code</button>
+    </section>
+    {% elif view == 'scan' %}
+    <section class="intro"><p class="eyebrow">Phase 02 · Scan</p><h1>Read UoL answer sheets</h1><p>Import the class roster first, then upload one PDF or a ZIP containing any number of multi-page PDFs. Pages are processed locally in this browser, including grayscale scans.</p></section>
+    <section class="panel scan-panel" aria-labelledby="uol-roster-title"><div class="scan-heading"><div><p class="eyebrow">Start here</p><h2 id="uol-roster-title">Import student roster</h2></div><span id="uol-roster-status" class="privacy-mark">Roster required before scanning</span></div>
+      <p class="muted">Choose a CSV with a header row. Map the student name and the column containing each nine-digit student number.</p>
+      <label class="file-drop" for="uol-roster-file"><span class="upload-symbol" aria-hidden="true">↑</span><span><strong>Select student roster (.csv)</strong><small id="uol-roster-file-name">Choose a CSV with student names and nine-digit student numbers.</small></span><input id="uol-roster-file" type="file" accept=".csv,text/csv" aria-describedby="uol-roster-file-name"></label>
+      <div id="uol-roster-mapping" hidden></div><div id="uol-roster-message" class="scan-errors" role="status" hidden></div>
+    </section>
+    <section id="uol-upload-panel" class="panel scan-panel" aria-labelledby="uol-scan-title" hidden>
+      <div class="scan-heading"><div><p class="eyebrow">Student pages</p><h2 id="uol-scan-title">Choose PDF or ZIP files</h2></div><span class="privacy-mark">Processed in this browser</span></div>
+      <p class="muted">Every page is read separately. Each answer uses the strongest bubble in its row; ID digits are read from the nine marked 0–9 columns when possible.</p>
+      <label class="file-drop" for="uol-scan-file"><span class="upload-symbol" aria-hidden="true">↑</span><span><strong>Select sheets (.pdf or .zip)</strong><small id="uol-file-name">A PDF can contain multiple pages; a ZIP can contain multiple PDFs.</small></span><input id="uol-scan-file" type="file" accept=".pdf,application/pdf,.zip,application/zip"></label>
+      <button id="uol-scan-button" class="primary-button" type="button" disabled>Scan pages</button>
+      <div id="uol-progress" class="scan-progress" role="status" aria-live="polite" hidden><progress id="uol-progress-bar" max="100" value="0"></progress><span id="uol-progress-label">Preparing scan…</span></div>
+      <div id="uol-scan-message" class="scan-errors" role="status" hidden></div>
+      <p class="field-help">PDFs are limited to 64 MB each; ZIPs to 256 MB. Result rows and answers stay in this browser.</p>
+    </section>
+    {% else %}
+    <section class="intro"><p class="eyebrow">Phase 03 · Grade</p><h1>Grade answer sheets</h1><p>Select the marked answer sheet, confirm student matches, then inspect each detected response against its annotated scan.</p></section>
+    <section class="panel scan-panel legacy-grade-panel">
+      <div class="grade-detail-actions"><strong id="uol-results-summary">No pages scanned yet.</strong><button id="uol-download-csv" class="download-button" type="button" disabled>Download CSV</button></div>
+      <label id="uol-key-field" class="scan-key-field" for="uol-key-select" hidden><span>Master answer sheet</span><select id="uol-key-select" class="review-select"></select></label>
+      <p id="uol-key-help" class="scan-key-help" hidden>Select the marked master page. It is excluded from the student list and provides the 70 keyed answers used for scores.</p>
+      <div id="uol-grade-message" class="scan-errors roster-error" role="status" hidden></div>
+      <div class="grade-tabs" role="tablist" aria-label="Scan set review views">
+        <button id="students-tab" class="grade-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="students-panel">Students</button>
+        <button id="analysis-tab" class="grade-tab" type="button" role="tab" aria-selected="false" aria-controls="analysis-panel">Analysis</button>
+      </div>
+      <div id="students-panel" role="tabpanel" aria-labelledby="students-tab">
+      <div class="grade-detail-actions"><span id="uol-matching-summary" role="status"></span><button id="uol-resolve-students" class="download-button" type="button" disabled>Resolve unidentified students</button></div>
+      <div class="roster-table-wrap"><table class="roster-table"><thead><tr><th scope="col"><button type="button" class="roster-sort-button" data-uol-sort="name" data-label="Student">Student ↕</button></th><th scope="col"><button type="button" class="roster-sort-button" data-uol-sort="score" data-label="Score">Score ↕</button></th><th scope="col"><button type="button" class="roster-sort-button" data-uol-sort="percentage" data-label="Percentage">Percentage ↕</button></th></tr></thead><tbody id="uol-result-rows"><tr><td colspan="3">Scan pages to see results.</td></tr></tbody></table></div>
+      </div>
+      {% include '_grade_analysis.html' %}
+      <dialog id="uol-identify-dialog" class="scan-preview-dialog unidentified-dialog" aria-labelledby="uol-identify-title">
+        <div class="scan-preview-heading"><div><p class="eyebrow">Student identification</p><h2 id="uol-identify-title">Student not identified</h2><p id="uol-identify-meta" class="muted"></p></div><div class="scan-preview-actions"><button id="uol-identify-skip" class="download-button" type="button" title="Leave this scan unassigned and continue">Skip</button><button id="uol-identify-close" class="download-button" type="button">Close</button></div></div>
+        <p class="field-help">Check the scanned name and ID, then type a name, login or student number. Press Enter to assign and move to the next unidentified scan.</p>
+        <div class="unidentified-name-preview uol-identity-preview"><p class="field-help">Name · original scan</p><img id="uol-identify-image" alt="Name from scanned sheet"><p class="field-help">Written student ID · original scan</p><img id="uol-identify-id-image" alt="Written student ID from scanned sheet"><p id="uol-identify-status" class="field-help" hidden></p></div>
+        <div class="unidentified-assignment"><label for="uol-identify-search">Search roster<input id="uol-identify-search" class="review-select" type="search" placeholder="Type to search…" autocomplete="off"></label><select id="uol-identify-match" class="review-select" aria-label="Matching roster student"></select><button id="uol-identify-assign" class="primary-button" type="button" disabled>Assign and next</button></div>
+      </dialog>
+      <dialog id="uol-preview-dialog" class="scan-preview-dialog" aria-labelledby="uol-preview-title">
+        <div class="scan-preview-heading"><div><p class="eyebrow">Student review</p><h2 id="uol-preview-title">Scanned answer sheet</h2><p id="uol-preview-meta" class="muted"></p></div><div class="scan-preview-actions"><button id="uol-preview-previous" class="download-button" type="button">← Previous student</button><button id="uol-preview-next" class="download-button" type="button">Next student →</button><button id="uol-preview-close" class="download-button" type="button">Close</button></div></div>
+        <div class="scan-preview-actions"><button id="uol-preview-reassign" class="download-button" type="button">Change student match</button><button id="uol-preview-image-toggle" class="download-button original-scan-toggle" type="button">View annotated scan</button></div>
+        <section id="uol-preview-image-panel" class="original-scan-panel" hidden>
+          <p class="field-help">Original scan with circle overlays only. Green circles show the response read from this page; blue circles show the keyed answer.</p>
+          <div class="unidentified-name-preview uol-identity-preview"><p class="field-help">Name · original scan</p><img id="uol-preview-name-image" alt="Enlarged name from the original scanned sheet"></div>
+          <div class="scan-preview-actions uol-preview-zoom" aria-label="Annotated page zoom"><button id="uol-preview-zoom-out" class="download-button" type="button" aria-label="Zoom out">−</button><output id="uol-preview-zoom-level" aria-live="polite">100%</output><button id="uol-preview-zoom-in" class="download-button" type="button" aria-label="Zoom in">+</button><button id="uol-preview-zoom-fit" class="download-button" type="button">Fit page</button></div>
+          <img id="uol-preview-image" alt="Annotated scanned answer sheet">
+        </section>
+        <div id="uol-preview-content" class="scan-preview-content"></div>
+      </dialog>
+    </section>
+    {% endif %}
+    <footer class="standalone-footer"><hr><span>© Print Scan Grade {{ current_year }}</span></footer>
+  </main>
+  <script type="module" src="{{ url_for('static', filename='standalone-uol-legacy.js', v=12) }}"></script>
+</body>
+</html>

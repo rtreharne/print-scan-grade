@@ -1,29 +1,32 @@
 """Print Scan Grade: a small LTI 1.3 launch app."""
 import json
+import ipaddress
 import math
 import os
 import random
 import re
 import secrets
+import socket
 import sqlite3
 from statistics import NormalDist
 import time
 import uuid
 import base64
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from functools import wraps
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 import jwt
 import pymupdf
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.fernet import Fernet, InvalidToken
-from flask import Flask, abort, flash, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, abort, flash, jsonify, make_response, redirect, render_template, request, send_file, session, url_for
 from jwt.algorithms import RSAAlgorithm
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
@@ -82,7 +85,25 @@ class MinimumFontCanvas(canvas.Canvas):
 
 
 def base_url():
-    return os.getenv("TOOL_BASE_URL", "http://localhost:8004").rstrip("/")
+    domain = os.getenv("DOMAIN", "").strip().rstrip("/")
+    if domain:
+        return f"https://{domain}"
+    return os.getenv("TOOL_BASE_URL", "http://localhost:8004").strip().rstrip("/")
+
+
+def _public_https_url(value):
+    """Accept only public HTTPS endpoints for outbound dynamic-registration calls."""
+    parsed = urlparse(value if isinstance(value, str) else "")
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or
+            parsed.password or parsed.fragment):
+        raise ValueError("The platform supplied an invalid HTTPS endpoint.")
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443)}
+    except OSError as exc:
+        raise ValueError("The platform endpoint could not be resolved.") from exc
+    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
+        raise ValueError("The platform endpoint must resolve to a public address.")
+    return parsed
 
 
 def environment_platforms():
@@ -141,17 +162,19 @@ def connect():
             updated_at INTEGER NOT NULL,
             UNIQUE (issuer, client_id)
         );
+        CREATE TABLE IF NOT EXISTS lti_registration_requests (
+            request_id TEXT PRIMARY KEY,
+            issuer TEXT NOT NULL,
+            authorization_endpoint TEXT NOT NULL,
+            jwks_url TEXT NOT NULL,
+            token_endpoint TEXT NOT NULL,
+            registration_endpoint TEXT NOT NULL,
+            registration_token TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS app_migrations (
             name TEXT PRIMARY KEY,
             applied_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS canvas_config (
-            id INTEGER PRIMARY KEY CHECK(id=1), base_url TEXT NOT NULL, token BLOB NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS canvas_connections (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
-            base_url TEXT NOT NULL, token BLOB NOT NULL, updated_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS exam_designs (
             form_id TEXT PRIMARY KEY,
@@ -175,16 +198,22 @@ def connect():
             updated_at INTEGER NOT NULL,
             PRIMARY KEY (issuer, context_id)
         );
+        CREATE TABLE IF NOT EXISTS standalone_designs (
+            slug TEXT PRIMARY KEY,
+            form_id TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            question_count INTEGER NOT NULL CHECK(question_count BETWEEN 1 AND 60),
+            choice_count INTEGER NOT NULL CHECK(choice_count BETWEEN 2 AND 8),
+            logo BLOB,
+            logo_type TEXT CHECK(logo_type IN ('image/png', 'image/jpeg')),
+            created_at INTEGER NOT NULL
+        );
     """)
     # Releases before lti_clients was introduced stored only deployment rows.
     # Once endpoint metadata is available, retain those clients in the new
     # registration table so existing launches continue to work and appear in
     # the admin UI.
     now = int(time.time())
-    legacy_canvas = db.execute("SELECT base_url, token, updated_at FROM canvas_config WHERE id=1").fetchone()
-    if legacy_canvas and not db.execute("SELECT 1 FROM canvas_connections LIMIT 1").fetchone():
-        db.execute("INSERT INTO canvas_connections (name, base_url, token, updated_at) VALUES (?,?,?,?)",
-                   ("Canvas", legacy_canvas["base_url"], legacy_canvas["token"], legacy_canvas["updated_at"]))
     for issuer, platform in environment_platforms().items():
         migration_name = f"deployment-clients:{issuer}"
         if db.execute(
@@ -284,152 +313,15 @@ def is_course_staff(roles):
 
 
 def active_course_context():
-    context = session.get("lti_course") or session.get("canvas_course")
+    context = session.get("lti_course")
     if not isinstance(context, dict) or not context.get("is_staff"):
-        abort(403, "Launch Print Scan Grade from a MiniVLE course as an instructor to manage answer sheets.")
+        abort(403, "Launch Print Scan Grade through LTI from your course as an instructor to manage answer sheets.")
     required = ("issuer", "context_id", "deployment_id", "course_title", "user_id")
     if any(not context.get(key) for key in required):
-        abort(403, "The active LTI course context is incomplete. Launch the app from MiniVLE again.")
+        abort(403, "The active LTI course context is incomplete. Launch the app from your learning platform again.")
     return context
 
 
-def canvas_cipher():
-    key = os.getenv("CANVAS_TOKEN_ENCRYPTION_KEY", "").strip()
-    if not key:
-        raise ValueError("Set CANVAS_TOKEN_ENCRYPTION_KEY before configuring Canvas.")
-    try:
-        return Fernet(key.encode())
-    except Exception as error:
-        raise ValueError("CANVAS_TOKEN_ENCRYPTION_KEY must be a valid Fernet key.") from error
-
-
-def canvas_config(connection_id=None):
-    with connect() as db:
-        if connection_id is None:
-            row = db.execute("SELECT id, name, base_url, token FROM canvas_connections ORDER BY id LIMIT 1").fetchone()
-        else:
-            row = db.execute("SELECT id, name, base_url, token FROM canvas_connections WHERE id=?", (connection_id,)).fetchone()
-    if not row:
-        return None
-    try:
-        token = canvas_cipher().decrypt(row["token"]).decode()
-    except (InvalidToken, ValueError, UnicodeDecodeError) as error:
-        raise ValueError("Canvas token cannot be decrypted. Check CANVAS_TOKEN_ENCRYPTION_KEY.") from error
-    return {"id": row["id"], "name": row["name"], "base_url": row["base_url"], "token": token}
-
-
-def canvas_connection_list():
-    with connect() as db:
-        rows = db.execute("SELECT id, name, base_url FROM canvas_connections ORDER BY name, id").fetchall()
-    return [dict(row) for row in rows]
-
-
-def canvas_api(path, params=None, connection_id=None):
-    config = canvas_config(connection_id)
-    if not config:
-        raise ValueError("Canvas is not configured. Ask the app administrator to set it up.")
-    url = config["base_url"] + "/api/v1/" + path.lstrip("/")
-    if params:
-        url += "?" + urlencode(params, doseq=True)
-    items = []
-    for _ in range(100):
-        request_obj = Request(url, headers={"Authorization": "Bearer " + config["token"], "Accept": "application/json"})
-        try:
-            with urlopen(request_obj, timeout=12) as response:
-                payload = json.load(response)
-                link_header = response.headers.get("Link", "")
-        except Exception as error:
-            raise ValueError("Canvas API request failed. Check the token, Canvas URL, and course permissions.") from error
-        if isinstance(payload, list):
-            items.extend(payload)
-        else:
-            return payload
-        next_link = re.search(r'<([^>]+)>\s*;\s*rel="?next"?', link_header, re.I)
-        if not next_link:
-            return items
-        next_url = urlparse(next_link.group(1))
-        if next_url.scheme != "https" or next_url.netloc != urlparse(config["base_url"]).netloc:
-            raise ValueError("Canvas returned an unexpected pagination URL.")
-        url = next_link.group(1)
-    raise ValueError("Canvas returned too many pages.")
-
-
-def canvas_courses(connection_id=None):
-    courses = canvas_api("courses", {"enrollment_state": "active", "per_page": 100}, connection_id)
-    return [course for course in courses if course.get("id") and course.get("name")]
-
-
-def canvas_course_context(course_id, connection_id):
-    course_id = str(course_id)
-    course = next((item for item in canvas_courses(connection_id) if str(item.get("id")) == course_id), None)
-    if not course:
-        abort(403, "That Canvas course is not available to the configured token.")
-    config = canvas_config(connection_id)
-    return {
-        "issuer": config["base_url"], "context_id": course_id, "deployment_id": "canvas-personal-token",
-        "course_title": course["name"], "user_id": session.get("canvas_user", "instructor"), "is_staff": True,
-        "canvas": True, "canvas_connection_id": config["id"],
-    }
-
-
-def course_learners(context, allow_synthetic_ids=False):
-    if not context.get("canvas"):
-        return fetch_active_learners(context)
-    rows = canvas_api(f"courses/{context['context_id']}/enrollments", {
-        "type[]": "StudentEnrollment", "state[]": "active", "per_page": 100,
-        "include[]": "user",
-    }, context.get("canvas_connection_id"))
-    learners = []
-    for enrollment in rows:
-        user = enrollment.get("user") or {}
-        name = str(user.get("name") or "").strip()
-        login = str(user.get("login_id") or user.get("sis_user_id") or "").strip()
-        if not name:
-            name = login or str(user.get("id") or "Student")
-        # Canvas can expose the institutional number in different SIS fields
-        # depending on the enrollment source. Search both the enrollment and
-        # embedded user payload, including SIS IDs and login IDs.
-        id_values = []
-        for record in (enrollment, user):
-            for key, value in record.items():
-                if value is not None and ("sis" in key.lower() or key.lower() in {
-                    "login_id", "integration_id", "student_id", "user_id"
-                }):
-                    values = value if isinstance(value, (list, tuple)) else [value]
-                    id_values.extend(str(item).strip() for item in values if item is not None)
-        id_values.append(login)
-        matches = list(dict.fromkeys(
-            match
-            for value in id_values
-            for match in re.findall(r"(?<!\d)(\d{9})(?!\d)", value)
-        ))
-        # Use a nine-digit SIS/login value only when the Canvas response points
-        # to exactly one candidate; ambiguous records are treated as missing.
-        student_id = matches[0] if len(matches) == 1 else ""
-        learners.append({"name": name, "sis_login_id": login, "student_id": student_id})
-    ids = [item["student_id"] for item in learners]
-    id_counts = {}
-    for student_id in ids:
-        id_counts[student_id] = id_counts.get(student_id, 0) + 1
-    duplicate_ids = {student_id for student_id, count in id_counts.items() if count > 1}
-    invalid = [not re.fullmatch(r"\d{9}", student_id) or student_id in duplicate_ids for student_id in ids]
-    if any(invalid):
-        if not allow_synthetic_ids:
-            if duplicate_ids:
-                raise ValueError("Canvas returned duplicate student numbers for active students.")
-            raise ValueError("Canvas roster is missing a unique nine-digit student ID for an active student.")
-        reserved = {student_id for student_id in ids if re.fullmatch(r"\d{9}", student_id)}
-        candidate = 999999999
-        for learner, needs_id in zip(learners, invalid):
-            if not needs_id:
-                continue
-            while f"{candidate:09d}" in reserved:
-                candidate -= 1
-            learner["student_id"] = f"{candidate:09d}"
-            learner["synthetic_student_id"] = True
-            reserved.add(learner["student_id"])
-            candidate -= 1
-    return learners
 
 
 def _same_origin(left, right):
@@ -441,13 +333,21 @@ def normalize_nrps_url(value, issuer):
     public_origin = urlparse(issuer)
     internal_base = os.getenv("LTI_INTERNAL_PLATFORM_BASE_URL", "").strip()
     internal_origin = urlparse(internal_base) if internal_base else None
+    canvas_public_base = os.getenv("CANVAS_PUBLIC_BASE_URL", "").strip()
+    canvas_public_origin = urlparse(canvas_public_base) if canvas_public_base else None
     if not parsed.netloc or parsed.username or parsed.password or parsed.fragment:
-        raise ValueError("MiniVLE provided an invalid course roster URL.")
+        raise ValueError("The learning platform provided an invalid course roster URL.")
+    # Canvas commonly advertises canvas.instructure.com as its issuer while
+    # serving its institution-specific NRPS endpoint from another host.
+    if canvas_public_origin and _same_origin(parsed, canvas_public_origin):
+        if parsed.scheme != "https":
+            raise ValueError("The course roster service must use HTTPS.")
+        return parsed.geturl()
     if _same_origin(parsed, public_origin):
         if internal_origin:
             parsed = parsed._replace(scheme=internal_origin.scheme, netloc=internal_origin.netloc)
     elif not internal_origin or not _same_origin(parsed, internal_origin):
-        raise ValueError("MiniVLE provided a course roster URL on an unexpected host.")
+        raise ValueError("The learning platform provided a course roster URL on an unexpected host.")
     if parsed.scheme != "https" and not (internal_origin and _same_origin(parsed, internal_origin)):
         raise ValueError("The course roster service must use HTTPS.")
     return parsed.geturl()
@@ -463,7 +363,7 @@ def fetch_active_learners(context):
     platform = platform_client(context["issuer"], context.get("client_id")) or platforms().get(context["issuer"])
     token_url = (platform or {}).get("token_endpoint", "")
     if not memberships_url or not token_url:
-        raise ValueError("Update the MiniVLE tool registration to grant the course roster read scope, then reopen this page.")
+        raise ValueError("Update the tool registration to grant the course roster read scope, then reopen this page.")
     token_endpoint = urlparse(token_url)
     internal_base = os.getenv("LTI_INTERNAL_PLATFORM_BASE_URL", "").strip()
     internal_origin = urlparse(internal_base) if internal_base else None
@@ -471,7 +371,7 @@ def fetch_active_learners(context):
             token_endpoint.username or token_endpoint.password or
             (token_endpoint.scheme != "https" and
              (not internal_origin or not _same_origin(token_endpoint, internal_origin)))):
-        raise ValueError("The MiniVLE service token endpoint is not configured securely.")
+        raise ValueError("The learning platform token endpoint is not configured securely.")
 
     now = int(time.time())
     assertion = jwt.encode(
@@ -490,10 +390,13 @@ def fetch_active_learners(context):
     }).encode()
     try:
         with urlopen(Request(token_url, data=token_body, headers={
-                "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"}), timeout=10) as response:
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "User-Agent": "PrintScanGrade-LTI/1.0 (+https://printscangrade.uniwebdev.co.uk)",
+        }), timeout=10) as response:
             access_token = json.load(response).get("access_token")
         if not access_token:
-            raise ValueError("MiniVLE did not provide a course roster access token.")
+            raise ValueError("The learning platform did not provide a course roster access token.")
 
         current_url = normalize_nrps_url(memberships_url, context["issuer"])
         learners = {}
@@ -502,12 +405,13 @@ def fetch_active_learners(context):
             with urlopen(Request(current_url, headers={
                     "Authorization": f"Bearer {access_token}",
                     "Accept": "application/vnd.ims.lti-nrps.v2.membershipcontainer+json",
+                    "User-Agent": "PrintScanGrade-LTI/1.0 (+https://printscangrade.uniwebdev.co.uk)",
             }), timeout=10) as response:
                 payload = json.load(response)
                 link_header = response.headers.get("Link", "")
             members = payload.get("members", [])
             if not isinstance(members, list):
-                raise ValueError("MiniVLE returned an invalid course roster.")
+                raise ValueError("The learning platform returned an invalid course roster.")
             for member in members:
                 if not isinstance(member, dict) or not member.get("user_id"):
                     continue
@@ -520,10 +424,11 @@ def fetch_active_learners(context):
                     # Other platforms can provide student_id directly.
                     matches = re.findall(r"(?<!\d)(\d{9})(?!\d)", sis_login_id)
                     student_id = matches[0] if len(matches) == 1 else str(member.get("student_id") or "").strip()
-                    if not sis_login_id or not re.fullmatch(r"\d{9}", student_id):
-                        raise ValueError(
-                            "MiniVLE's NRPS roster is missing a SIS login ID or a matching nine-digit student number."
-                        )
+                    # Canvas test courses commonly omit SIS IDs. Preserve a
+                    # stable value here; normalize_learners assigns an
+                    # unambiguous temporary nine-digit ID when needed.
+                    if not student_id:
+                        student_id = sis_login_id or user_id
                     name = str(member.get("name") or "").strip()
                     if not name:
                         name = " ".join(filter(None, (member.get("given_name"), member.get("family_name"))))
@@ -541,12 +446,12 @@ def fetch_active_learners(context):
                 raise ValueError("The course roster has too many pages to load safely.")
         student_ids = [learner["student_id"] for learner in learners.values()]
         if len(student_ids) != len(set(student_ids)):
-            raise ValueError("MiniVLE returned duplicate student numbers for active learners.")
+            raise ValueError("The learning platform returned duplicate student numbers for active learners.")
         return list(learners.values())
     except ValueError:
         raise
     except Exception as error:
-        raise ValueError("MiniVLE's course roster could not be read. Check the NRPS tool scope and try again.") from error
+        raise ValueError("The learning platform's course roster could not be read. Check the NRPS tool scope and try again.") from error
 
 
 def draw_registration_marks(pdf, width, height, layout_version=SHEET_LAYOUT_VERSION):
@@ -630,10 +535,11 @@ def guide_card(pdf, x, y, width, height, number, title):
     pdf.drawString(x + 36, y + height - 25, title)
 
 
-def draw_guide_page(pdf, design, logo=None):
+def draw_guide_page(pdf, design, logo=None, generic=False):
     width, height = A4
     left, right = 40, width - 40
-    draw_registration_marks(pdf, width, height)
+    if not generic:
+        draw_registration_marks(pdf, width, height)
 
     pdf.setFillColorRGB(0.08, 0.31, 0.48)
     pdf.setFont("Helvetica-Bold", 8)
@@ -655,12 +561,13 @@ def draw_guide_page(pdf, design, logo=None):
         except (ValueError, OSError):
             pass
 
-    guide_qr_size = 46
-    guide_qr_x, guide_qr_y = right - guide_qr_size, height - 131
-    draw_qr(pdf, f"PSGGUIDE|{design['form_id']}", guide_qr_x, guide_qr_y, guide_qr_size)
-    pdf.setFillColorRGB(0.35, 0.37, 0.39)
-    pdf.setFont("Helvetica", 5)
-    pdf.drawCentredString(guide_qr_x + guide_qr_size / 2, guide_qr_y - 7, "INSTRUCTIONS ONLY")
+    if not generic:
+        guide_qr_size = 46
+        guide_qr_x, guide_qr_y = right - guide_qr_size, height - 131
+        draw_qr(pdf, f"PSGGUIDE|{design['form_id']}", guide_qr_x, guide_qr_y, guide_qr_size)
+        pdf.setFillColorRGB(0.35, 0.37, 0.39)
+        pdf.setFont("Helvetica", 5)
+        pdf.drawCentredString(guide_qr_x + guide_qr_size / 2, guide_qr_y - 7, "INSTRUCTIONS ONLY")
 
     card_width, gap = 249, 16
     top_card_height, lower_card_height = 260, 220
@@ -771,8 +678,8 @@ def draw_guide_page(pdf, design, logo=None):
                left_x + 13, lower_y + 42, card_width - 26, font_size=7.5, leading=9, max_lines=3)
 
     # 4. Faint marks can disappear in scanning or photocopying.
-    guide_card(pdf, right_x, lower_y, card_width, lower_card_height, 4, "Shade firmly and darkly")
-    guide_text(pdf, "A faintly shaded bubble may be read as blank and marked incorrect.", right_x + 13,
+    guide_card(pdf, right_x, lower_y, card_width, lower_card_height, 4, "Use black pen and shade firmly")
+    guide_text(pdf, "Use black pen only. A faintly shaded bubble may be read as blank and marked incorrect.", right_x + 13,
                lower_y + 164, card_width - 26, font_size=7.8, leading=10)
     faint_x, dark_x, example_y = right_x + 76, right_x + 174, lower_y + 111
     for cx, shade, label, label_color in (
@@ -786,7 +693,7 @@ def draw_guide_page(pdf, design, logo=None):
         pdf.setFillColorRGB(*label_color)
         pdf.setFont("Helvetica-Bold", 6.5)
         pdf.drawCentredString(cx, example_y - 28, label)
-    guide_text(pdf, "Fill the bubble inside its border using a dark pencil or pen. Do not make a light mark.",
+    guide_text(pdf, "Fill the bubble inside its border using black pen. Do not use pencil or make a light mark.",
                right_x + 13, lower_y + 56, card_width - 26, font_size=7.6, leading=10, max_lines=3)
 
     checklist_y, checklist_height = 40, 130
@@ -800,7 +707,7 @@ def draw_guide_page(pdf, design, logo=None):
         "Print your name inside the box",
         "Make the ID boxes and bubbles match",
         "Choose one answer per question",
-        "Shade bubbles firmly",
+        "Use black pen and shade bubbles firmly",
     )
     checklist_x, checklist_y_text = left + 18, checklist_y + checklist_height - 52
     pdf.setFont("Helvetica-Bold", 12)
@@ -817,7 +724,7 @@ def draw_guide_page(pdf, design, logo=None):
     pdf.setFont("Helvetica", 7)
     pdf.drawCentredString(width / 2, 27, "printscangrade.com  |  student instructions")
 
-    # Fade instructional artwork for printing, but keep the guide QR readable.
+    # Fade instructional artwork while retaining the registration marks.
     pdf.saveState()
     pdf.setFillAlpha(0.22)
     pdf.setFillColorRGB(1, 1, 1)
@@ -826,13 +733,13 @@ def draw_guide_page(pdf, design, logo=None):
 
 
 def make_answer_sheet(design, logo=None, sample_response=None, include_guide=True,
-                      layout_version=SHEET_LAYOUT_VERSION):
+                      layout_version=SHEET_LAYOUT_VERSION, generic=False):
     if not 1 <= int(design["question_count"]) <= MAX_QUESTIONS:
         raise ValueError(f"Answer sheets support 1–{MAX_QUESTIONS} questions.")
     buffer = BytesIO()
     width, height = A4
     pdf = MinimumFontCanvas(buffer, pagesize=(width, height), pageCompression=1)
-    title_text = pdf_text(design["title"])
+    title_text = "" if generic else pdf_text(design["title"])
     pdf.setTitle(f"{title_text} - Print Scan Grade answer sheet" + (" - sample response" if sample_response else ""))
     pdf.setAuthor("Print Scan Grade")
     draw_registration_marks(pdf, width, height, layout_version)
@@ -841,7 +748,7 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
     pdf.setFillColorRGB(0, 0, 0)
     pdf.setFont("Helvetica-Bold", 8)
     pdf.drawString(left, height - 28,
-                   "STUDENT ANSWER SHEET  |  READ INSTRUCTIONS PAGE FIRST (Turn over)")
+                   "USE BLACK PEN ONLY  |  READ INSTRUCTIONS PAGE FIRST (Turn over)")
     title_size = 18
     title_limit = width - left - 150
     while title_size > 10 and stringWidth(title_text, "Helvetica-Bold", title_size) > title_limit:
@@ -851,11 +758,14 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
             title_text = title_text[:-1]
         title_text += "..."
     pdf.setFont("Helvetica-Bold", title_size)
-    pdf.drawString(left, height - 51, title_text)
+    if title_text:
+        pdf.drawString(left, height - 51, title_text)
     pdf.setFont("Helvetica", 9)
     choice_labels = ", ".join(chr(ord("A") + i) for i in range(design["choice_count"]))
     subtitle = f"{design['question_count']} questions  |  Choices {choice_labels}"
-    if sample_response:
+    if generic:
+        qr_payload = None
+    elif sample_response:
         subtitle += "  |  SAMPLE RESPONSE"
     pdf.drawString(left, height - 68, subtitle)
 
@@ -939,10 +849,11 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
     # Center the form QR and its identifier beneath the student-name box.
     qr_x = name_x + name_w - qr_size
     qr_y = name_y - qr_size - 18
-    draw_qr(pdf, qr_payload, qr_x, qr_y, qr_size)
-    pdf.setFillColorRGB(0.28, 0.3, 0.32)
-    pdf.setFontExact("Helvetica", 10)
-    pdf.drawRightString(name_x + name_w, qr_y - 16, f"FORM {design['form_id'][:12]}")
+    if not generic:
+        draw_qr(pdf, qr_payload, qr_x, qr_y, qr_size)
+        pdf.setFillColorRGB(0.28, 0.3, 0.32)
+        pdf.setFontExact("Helvetica", 10)
+        pdf.drawRightString(name_x + name_w, qr_y - 16, f"FORM {design['form_id'][:12]}")
 
     # Balanced columns make the answer area span the available portrait page height.
     columns = min(4, max(1, (design["question_count"] + QUESTIONS_PER_COLUMN - 1) // QUESTIONS_PER_COLUMN))
@@ -1014,9 +925,11 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
                     selected_choice = answer_key[question_number - 1] if answer_key else (
                         question_number + sample_response["seed"]
                     ) % design["choice_count"]
+                    selected_choices = (selected_choice if isinstance(selected_choice, (list, tuple, set))
+                                        else [selected_choice])
                     crossed_choice = sample_response.get("crossed_answers", {}).get(question_number)
                     extra_choices = sample_response.get("additional_answers", {}).get(question_number, [])
-                    selected = (choice == selected_choice or choice == crossed_choice or
+                    selected = (choice in selected_choices or choice == crossed_choice or
                                 choice in extra_choices)
                 else:
                     selected = False
@@ -1047,7 +960,7 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
     pdf.drawCentredString(width / 2, 16, "printscangrade.com")
     pdf.showPage()
     if include_guide:
-        draw_guide_page(pdf, design, logo)
+        draw_guide_page(pdf, design, logo, generic=generic)
         pdf.showPage()
     pdf.save()
     buffer.seek(0)
@@ -1080,7 +993,7 @@ def draw_sample_handwriting(pdf, text, x, y, max_width, font_name):
 
 def make_sample_response_pdf(design, learner, logo=None, sample_index=0, seed=None, answers=None,
                              layout_version=SHEET_LAYOUT_VERSION, fill_id_bubbles=True,
-                             crossed_answers=None, additional_answers=None):
+                             crossed_answers=None, additional_answers=None, generic=False):
     student = {
         "name": learner["name"],
         "student_id": learner["student_id"],
@@ -1098,73 +1011,36 @@ def make_sample_response_pdf(design, learner, logo=None, sample_index=0, seed=No
         student["additional_answers"] = additional_answers
     return make_answer_sheet(
         design, logo, sample_response=student, include_guide=False,
-        layout_version=layout_version,
+        layout_version=layout_version, generic=generic,
     )
 
 
 def dummy_score_counts(student_count, question_count, rng):
-    """Return bounded, bell-shaped correct-answer counts for a dummy cohort.
-
-    Evenly spaced normal quantiles avoid the old two-cluster pattern produced
-    by paired low/high scores. The distribution is centred near 65%, has an
-    approximately 20% population spread, and is deliberately bounded across
-    the 10%–90% range so the generated cohort exercises the grade bands.
-    """
+    """Return a realistic bell-shaped cohort with a small number of outliers."""
     if student_count < 1 or question_count < 1:
         return []
-    minimum = math.ceil(question_count * 0.10)
+    minimum = math.ceil(question_count * 0.40)
     maximum = math.floor(question_count * 0.90)
-    # Very short tests cannot express a distinct 10–90% interval.
+    # Very short tests cannot express a distinct 40–90% interval.
     if minimum > maximum:
         minimum, maximum = 0, question_count
     if student_count == 1:
         return [min(maximum, max(minimum, round(question_count * 0.65)))]
 
-    # Quantiles give every cohort size a smooth progression of scores instead
-    # of a handful of repeated low/high pairs. The slightly wider source
-    # distribution compensates for the 10%/90% clipping and yields roughly the
-    # requested 20% realised standard deviation.
-    normal = NormalDist(mu=0.67, sigma=0.23)
+    # Quantiles give every cohort size a smooth progression without artificial
+    # score clusters. The main cohort sits between 40% and 90% around 65%.
+    normal = NormalDist(mu=0.65, sigma=0.12)
     target_rates = [normal.inv_cdf((index + 0.5) / student_count)
                     for index in range(student_count)]
-    target_rates = [min(0.90, max(0.10, rate)) for rate in target_rates]
+    target_rates = [min(0.90, max(0.40, rate)) for rate in target_rates]
     target_counts = [rate * question_count for rate in target_rates]
     counts = [min(maximum, max(minimum, round(target))) for target in target_counts]
-    compensatory_counts = {
-        count for count in range(minimum, maximum + 1)
-        if 0.35 <= count / question_count < 0.40
-    }
-
-    def move_out_of_compensatory(count, target):
-        if count not in compensatory_counts:
-            return count
-        candidates = [candidate for candidate in (count - 1, count + 1)
-                      if minimum <= candidate <= maximum and candidate not in compensatory_counts]
-        return min(candidates, key=lambda candidate: abs(candidate - target)) if candidates else count
-
-    counts = [move_out_of_compensatory(count, target)
-              for count, target in zip(counts, target_counts)]
-    # Keep visible tails so the histogram spans the grade boundaries even when
-    # the requested cohort is modest. The total is rebalanced below.
-    counts[0] = minimum
-    counts[-1] = maximum
-    desired_total = min(student_count * maximum, max(student_count * minimum,
-                        round(student_count * question_count * 0.65)))
-    # Correct rounding drift without favouring a particular learner.
-    while sum(counts) < desired_total:
-        candidates = [index for index, score in enumerate(counts)
-                      if score < maximum and counts[index] + 1 not in compensatory_counts]
-        if not candidates:
-            break
-        index = max(candidates, key=lambda item: target_counts[item] - counts[item])
-        counts[index] += 1
-    while sum(counts) > desired_total:
-        candidates = [index for index, score in enumerate(counts)
-                      if score > minimum and counts[index] - 1 not in compensatory_counts]
-        if not candidates:
-            break
-        index = max(candidates, key=lambda item: counts[item] - target_counts[item])
-        counts[index] -= 1
+    # Add rare tails outside the main 40–90% profile. They make the histogram
+    # and item analysis resemble a real cohort without dominating it.
+    outlier_count = 1 if student_count >= 8 else 0
+    if outlier_count:
+        counts[0] = max(0, math.floor(question_count * rng.uniform(0.25, 0.39)))
+        counts[-1] = min(question_count, math.ceil(question_count * rng.uniform(0.91, 0.98)))
     rng.shuffle(counts)
     return counts
 
@@ -1179,8 +1055,46 @@ def score_distribution(counts, question_count):
     return mean, math.sqrt(variance)
 
 
+def dummy_correct_question_sets(score_counts, question_count, rng, multi_answer_question=1):
+    """Generate answer patterns with varied difficulty and useful discrimination.
+
+    Higher-ability students are more likely to solve well-discriminating items;
+    a small set of weak items and difficult items gives the analysis dashboard
+    realistic signals rather than identical item bars.
+    """
+    if not score_counts or question_count < 1:
+        return [], []
+    abilities = [score / question_count for score in score_counts]
+    correct_sets = [set() for _ in score_counts]
+    qualities = []
+    for question in range(1, question_count + 1):
+        position = (question - 1) / max(1, question_count - 1)
+        difficulty = 0.82 - position * 0.36
+        # Every eighth item is deliberately weak; every sixth is challenging.
+        discrimination = 1.35
+        if question % 8 == 0:
+            difficulty, discrimination = 0.58, 0.15
+            quality = "weak discrimination"
+        elif question % 6 == 0:
+            difficulty, discrimination = 0.42, 1.55
+            quality = "challenging"
+        else:
+            quality = "discriminating"
+        qualities.append(quality)
+        for index, ability in enumerate(abilities):
+            probability = difficulty + (ability - 0.65) * discrimination
+            probability = min(0.96, max(0.04, probability))
+            if rng.random() < probability:
+                correct_sets[index].add(question)
+    return correct_sets, qualities
+
+
 def create_app():
     app = Flask(__name__)
+    app.extensions["roster_jobs"] = {}
+    app.extensions["roster_executor"] = ThreadPoolExecutor(
+        max_workers=4, thread_name_prefix="lti-roster"
+    )
     secure = os.getenv("COOKIE_SECURE", "false").lower() == "true"
     app.config.update(
         SECRET_KEY=os.getenv("FLASK_SECRET_KEY", "local-development-only-change-me"),
@@ -1193,92 +1107,34 @@ def create_app():
         MAX_CONTENT_LENGTH=4 * 1024 * 1024,
     )
 
+    @app.before_request
+    def redirect_public_http_to_https():
+        public = urlparse(base_url())
+        forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+        if (public.scheme == "https" and request.host == public.netloc and
+                forwarded_proto == "http"):
+            return redirect(base_url() + request.full_path, code=308)
+
     @app.after_request
     def iframe_headers(response):
-        if request.path.startswith("/canvas") or request.path in {"/print", "/scan", "/grade"} and session.get("canvas_course"):
+        if request.path.startswith("/standalone/"):
             response.headers.pop("X-Frame-Options", None)
-            ancestors = ["'self'", "https://*.instructure.com", "https://*.canvaslms.com"]
-            connection_id = request.args.get("connection_id", type=int)
-            if not connection_id and request.path == "/canvas/login":
-                next_target = request.args.get("next") or request.form.get("next", "")
-                if next_target.startswith("/canvas"):
-                    connection_id = parse_qs(urlparse(next_target).query).get("connection_id", [None])[0]
-                    try:
-                        connection_id = int(connection_id) if connection_id else None
-                    except ValueError:
-                        connection_id = None
-            active_course = session.get("canvas_course")
-            canvas_origin = active_course.get("issuer") if isinstance(active_course, dict) else None
-            if not canvas_origin and connection_id:
-                try:
-                    configured = canvas_config(connection_id)
-                    canvas_origin = configured.get("base_url") if configured else None
-                except ValueError:
-                    canvas_origin = None
-            if canvas_origin and canvas_origin not in ancestors:
-                ancestors.append(canvas_origin)
-            response.headers["Content-Security-Policy"] = "frame-ancestors " + " ".join(ancestors)
+            response.headers["Content-Security-Policy"] = "frame-ancestors *"
+            return response
         return response
 
     @app.get("/")
     def home():
-        return render_template("landing.html", course=None, launched=False)
+        response = make_response(render_template("landing.html", course=None, launched=False))
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
-    def canvas_login_required(view):
+    def lti_course_required(view):
         @wraps(view)
         def wrapped(*args, **kwargs):
-            if not session.get("canvas_authenticated") and not session.get("lti_course"):
-                return redirect(url_for("canvas_login", next=request.full_path))
+            active_course_context()
             return view(*args, **kwargs)
         return wrapped
-
-    @app.route("/canvas/login", methods=["GET", "POST"])
-    def canvas_login():
-        error = ""
-        if request.method == "POST":
-            username = os.getenv("CANVAS_USERNAME", "")
-            password = os.getenv("CANVAS_PASSWORD", "")
-            if username and password and secrets.compare_digest(request.form.get("username", ""), username) and secrets.compare_digest(request.form.get("password", ""), password):
-                next_target = request.form.get("next", "")
-                session.clear()
-                session["canvas_authenticated"] = True
-                session["canvas_user"] = username
-                target = next_target if next_target.startswith("/canvas") else url_for("canvas_home")
-                return redirect(target)
-            error = "Incorrect username or password, or Canvas login is not configured."
-        return render_template("canvas_login.html", error=error, next=request.args.get("next", "") or request.form.get("next", "")), 401 if error else 200
-
-    @app.post("/canvas/logout")
-    @canvas_login_required
-    def canvas_logout():
-        if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("canvas_csrf", "")):
-            abort(400, "Invalid form token.")
-        session.clear()
-        return redirect(url_for("canvas_login"))
-
-    @app.route("/canvas", methods=["GET", "POST"])
-    @canvas_login_required
-    def canvas_home():
-        if request.method == "POST":
-            if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("canvas_csrf", "")):
-                abort(400, "Invalid form token.")
-            session["canvas_course"] = canvas_course_context(request.form.get("course_id", ""), request.form.get("connection_id", type=int))
-            return redirect(url_for("print_workspace"))
-        error = ""
-        connections = canvas_connection_list()
-        selected_connection = request.args.get("connection_id", type=int) or (connections[0]["id"] if connections else None)
-        try:
-            courses = canvas_courses(selected_connection) if selected_connection else []
-        except ValueError as exc:
-            courses, error = [], str(exc)
-        requested_course = request.args.get("course_id", "").strip()
-        if requested_course and selected_connection and not error:
-            session["canvas_course"] = canvas_course_context(requested_course, selected_connection)
-            return redirect(url_for("print_workspace"))
-        if "canvas_csrf" not in session:
-            session["canvas_csrf"] = secrets.token_urlsafe(32)
-        return render_template("canvas_courses.html", courses=courses, error=error,
-                               connections=connections, selected_connection=selected_connection)
 
     def admin_required(view):
         @wraps(view)
@@ -1296,8 +1152,8 @@ def create_app():
             if (secrets.compare_digest(request.form.get("username", ""), username) and
                     secrets.compare_digest(request.form.get("password", ""), password) and username and password):
                 session["lti_admin_authenticated"] = True
-                target = request.args.get("next") or request.form.get("next") or url_for("canvas_admin")
-                return redirect(target if target.startswith("/") else url_for("canvas_admin"))
+                target = request.args.get("next") or request.form.get("next") or url_for("lti_admin")
+                return redirect(target if target.startswith("/") else url_for("lti_admin"))
             return render_template("admin_login.html", error="Incorrect username or password.", next=request.form.get("next", "")), 401
         return render_template("admin_login.html", error="", next=request.args.get("next", ""))
 
@@ -1343,63 +1199,6 @@ def create_app():
             clients = [dict(row) for row in db.execute("SELECT * FROM lti_clients ORDER BY issuer, name")]
         return render_template("lti_admin.html", clients=clients)
 
-    @app.route("/admin/canvas", methods=["GET", "POST"])
-    @admin_required
-    def canvas_admin():
-        error = ""
-        if "canvas_admin_csrf" not in session:
-            session["canvas_admin_csrf"] = secrets.token_urlsafe(32)
-        if request.method == "POST":
-            if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("canvas_admin_csrf", "")):
-                abort(400, "Invalid form token.")
-            connection_id = request.form.get("id", "").strip()
-            name = request.form.get("name", "").strip()
-            base = request.form.get("base_url", "").strip().rstrip("/")
-            token = request.form.get("token", "")
-            parsed = urlparse(base)
-            if not name:
-                error = "Enter a name for this Canvas connection."
-            elif parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
-                error = "Canvas URL must be a valid HTTPS origin."
-            elif not token and not connection_id:
-                error = "Enter a Canvas personal API token."
-            else:
-                try:
-                    cipher = canvas_cipher()
-                    previous = canvas_config(int(connection_id)) if connection_id else None
-                    if connection_id and not previous:
-                        abort(404)
-                    encrypted = cipher.encrypt((token or previous["token"]).encode())
-                    with connect() as db:
-                        if connection_id:
-                            db.execute("UPDATE canvas_connections SET name=?, base_url=?, token=?, updated_at=? WHERE id=?",
-                                       (name, base, encrypted, int(time.time()), connection_id))
-                        else:
-                            db.execute("INSERT INTO canvas_connections (name, base_url, token, updated_at) VALUES (?,?,?,?)",
-                                       (name, base, encrypted, int(time.time())))
-                    return redirect(url_for("canvas_admin"))
-                except ValueError as exc:
-                    error = str(exc)
-        connections = canvas_connection_list()
-        course_options, course_errors = {}, {}
-        for connection in connections:
-            try:
-                course_options[str(connection["id"])] = canvas_courses(connection["id"])
-            except ValueError as exc:
-                course_options[str(connection["id"])] = []
-                course_errors[str(connection["id"])] = str(exc)
-        return render_template("canvas_admin.html", connections=connections, error=error,
-                               course_options=course_options, course_errors=course_errors,
-                               app_base_url=base_url())
-
-    @app.post("/admin/canvas/<int:connection_id>/delete")
-    @admin_required
-    def canvas_connection_delete(connection_id):
-        if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("canvas_admin_csrf", "")):
-            abort(400, "Invalid form token.")
-        with connect() as db:
-            db.execute("DELETE FROM canvas_connections WHERE id=?", (connection_id,))
-        return redirect(url_for("canvas_admin"))
 
     @app.post("/admin/lti/<int:client_pk>/delete")
     @admin_required
@@ -1436,18 +1235,51 @@ def create_app():
         ), status
 
     @app.get("/print")
-    @canvas_login_required
+    @lti_course_required
     def print_workspace():
         return render_print_workspace(active_course_context())
 
     @app.get("/scan")
-    @canvas_login_required
+    @lti_course_required
     def scan_workspace():
         context = active_course_context()
-        return render_template("scan.html", context=context)
+        job_key = (context["issuer"], str(context["context_id"]),
+                   str(context.get("client_id", "")), str(context["deployment_id"]))
+        jobs = app.extensions["roster_jobs"]
+        job = jobs.get(job_key)
+        # Keep a completed roster briefly so switching between Scan and Grade
+        # does not make another NRPS request. A fresh page load after two
+        # minutes starts a new lookup.
+        if not job or (job["future"].done() and time.monotonic() - job["started"] > 120):
+            job = {
+                "started": time.monotonic(),
+                "future": app.extensions["roster_executor"].submit(
+                    fetch_active_learners, dict(context)
+                ),
+            }
+            jobs[job_key] = job
+        if not job["future"].done():
+            return render_template("scan_loading.html", context=context)
+
+        with connect() as db:
+            dummy_forms = [dict(row) for row in db.execute(
+                "SELECT form_id, title FROM exam_designs WHERE issuer=? AND context_id=? ORDER BY created_at DESC",
+                (context["issuer"], context["context_id"]),
+            )]
+        dummy_learners, dummy_enrollment_error = [], ""
+        try:
+            dummy_learners = job["future"].result()
+        except Exception as error:
+            dummy_enrollment_error = str(error)
+        return render_template(
+            "scan.html", context=context, dummy_forms=dummy_forms,
+            dummy_student_count=len(dummy_learners),
+            dummy_synthetic_student_ids=any(item.get("synthetic_student_id") for item in dummy_learners),
+            dummy_enrollment_error=dummy_enrollment_error,
+        )
 
     @app.post("/scan/render-page")
-    @canvas_login_required
+    @lti_course_required
     def render_scan_page():
         active_course_context()
         request.max_content_length = 64 * 1024 * 1024
@@ -1477,7 +1309,7 @@ def create_app():
         return response
 
     @app.get("/scan/forms.json")
-    @canvas_login_required
+    @lti_course_required
     def scan_forms_manifest():
         context = active_course_context()
         with connect() as db:
@@ -1499,7 +1331,7 @@ def create_app():
         return jsonify(scan_forms)
 
     @app.get("/scan/dummy-options.json")
-    @canvas_login_required
+    @lti_course_required
     def scan_dummy_options():
         context = active_course_context()
         with connect() as db:
@@ -1508,7 +1340,7 @@ def create_app():
                 (context["issuer"], context["context_id"]),
             ).fetchall()
         try:
-            learners = course_learners(context, allow_synthetic_ids=True)
+            learners = fetch_active_learners(context)
         except ValueError as error:
             return jsonify({"error": str(error), "forms": [], "student_count": 0}), 503
         return jsonify({
@@ -1517,8 +1349,19 @@ def create_app():
             "synthetic_student_ids": any(learner.get("synthetic_student_id") for learner in learners),
         })
 
+    @app.get("/scan/dummy-forms.json")
+    @lti_course_required
+    def scan_dummy_forms():
+        context = active_course_context()
+        with connect() as db:
+            rows = db.execute(
+                "SELECT form_id, title FROM exam_designs WHERE issuer=? AND context_id=? ORDER BY created_at DESC",
+                (context["issuer"], context["context_id"]),
+            ).fetchall()
+        return jsonify({"forms": [dict(row) for row in rows]})
+
     @app.get("/grade")
-    @canvas_login_required
+    @lti_course_required
     def grade_workspace():
         context = active_course_context()
         with connect() as db:
@@ -1530,19 +1373,17 @@ def create_app():
         grade_forms = [dict(row) for row in rows]
         if request.args.get("format") != "json":
             return render_template("scan.html", context=context, initial_phase="grade")
-        roster_available = bool(context.get("canvas") or (
+        roster_available = bool(
             context.get("nrps_url") and
             (platform_client(context["issuer"], context.get("client_id")) or
              platforms().get(context["issuer"]) or {}).get("token_endpoint")
-        ))
+        )
         roster = []
         roster_error = ""
         if roster_available:
             try:
-                # Keep usable Canvas enrollments available for cross-reference
-                # even when some students lack unique SIS numbers. Those rows
-                # receive temporary IDs that cannot match a scanned sheet.
-                roster = course_learners(context, allow_synthetic_ids=True)
+                # Cross-reference the roster supplied by the LTI NRPS service.
+                roster = fetch_active_learners(context)
             except ValueError as error:
                 roster_error = str(error)
         return jsonify({
@@ -1553,7 +1394,7 @@ def create_app():
         })
 
     @app.get("/scan/<form_id>/sample.pdf")
-    @canvas_login_required
+    @lti_course_required
     def download_sample_response(form_id):
         context = active_course_context()
         with connect() as db:
@@ -1568,7 +1409,7 @@ def create_app():
         if not design:
             abort(404)
         try:
-            learners = course_learners(context)
+            learners = fetch_active_learners(context)
         except ValueError as error:
             flash(str(error), "error")
             return redirect(url_for("scan_workspace"))
@@ -1585,7 +1426,7 @@ def create_app():
         )
 
     @app.get("/scan/<form_id>/dummy.zip")
-    @canvas_login_required
+    @lti_course_required
     def download_dummy_response_zip(form_id):
         context = active_course_context()
         try:
@@ -1600,8 +1441,9 @@ def create_app():
         # layout they can read instead of handing them a newly introduced QR
         # version that the already-loaded JavaScript will reject.
         dummy_layout_version = 7 if scanner_layout_version >= 7 else 6 if scanner_layout_version >= 6 else 5 if scanner_layout_version >= 5 else 4 if scanner_layout_version >= 4 else 3
+        generic = form_id == "generic"
         with connect() as db:
-            design = db.execute(
+            design = None if generic else db.execute(
                 "SELECT * FROM exam_designs WHERE form_id=? AND issuer=? AND context_id=?",
                 (form_id, context["issuer"], context["context_id"]),
             ).fetchone()
@@ -1609,10 +1451,20 @@ def create_app():
                 "SELECT logo FROM course_branding WHERE issuer=? AND context_id=?",
                 (context["issuer"], context["context_id"]),
             ).fetchone()
-        if not design:
+        if generic:
+            try:
+                question_count = int(request.args.get("question_count", ""))
+                choice_count = int(request.args.get("choice_count", ""))
+                if not 1 <= question_count <= MAX_QUESTIONS or not 2 <= choice_count <= 8:
+                    raise ValueError
+            except (TypeError, ValueError):
+                abort(400, f"Choose 1–{MAX_QUESTIONS} questions and 2–8 choices.")
+            design = {"title": "Generic answer sheet", "form_id": "", "question_count": question_count,
+                      "choice_count": choice_count}
+        elif not design:
             abort(404)
         try:
-            learners = course_learners(context, allow_synthetic_ids=True)
+            learners = fetch_active_learners(context)
         except ValueError as error:
             abort(503, str(error))
         if not learners:
@@ -1629,12 +1481,22 @@ def create_app():
             (question_number + answer_seed) % choice_count
             for question_number in range(1, question_count + 1)
         ]
+        # Include a deterministic multi-answer key item in every dummy set so
+        # the Grade workspace exposes its all-keyed/any-keyed rule selector.
+        multi_answer_question = 1
+        multi_answer_choices = [correct_answers[0], (correct_answers[0] + 1) % choice_count]
+        answer_key_answers = list(correct_answers)
+        answer_key_answers[multi_answer_question - 1] = multi_answer_choices
         rng = random.SystemRandom()
         score_counts = dummy_score_counts(count, question_count, rng)
+        correct_question_sets, item_qualities = dummy_correct_question_sets(
+            score_counts, question_count, rng, multi_answer_question
+        )
         all_answer_slots = [
             (student_index, question_number)
             for student_index in range(count)
             for question_number in range(1, question_count + 1)
+            if question_number != multi_answer_question
         ]
         shuffled_slots = rng.sample(all_answer_slots, len(all_answer_slots))
         total_student_answers = len(all_answer_slots)
@@ -1688,8 +1550,8 @@ def create_app():
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             answer_pdf = make_sample_response_pdf(
                 design, answer_sheet, branding["logo"] if branding else None,
-                sample_index=0, seed=answer_seed, answers=correct_answers,
-                layout_version=dummy_layout_version,
+                sample_index=0, seed=answer_seed, answers=answer_key_answers,
+                layout_version=dummy_layout_version, generic=generic,
             )
             archive.writestr("000-Answer_Sheet.pdf", answer_pdf.getvalue())
 
@@ -1699,13 +1561,14 @@ def create_app():
             issue_lines = [
                 "Page appearance: clean white PDF; no rotation or geometric distortion.",
                 f"Student pages: {count}; questions per page: {question_count}.",
-                "Score target: 65% cohort average, 20% population standard deviation, bounded to 10%–90%.",
-                f"Generated scores: {score_mean:.0%} average, {score_stddev:.0%} standard deviation, "
+                "Score profile: bell-shaped main cohort from 40% to 90%, with occasional low and high outliers.",
+                f"Planned student ability profile: {score_mean:.0%} average, {score_stddev:.0%} standard deviation, "
                 f"{min(effective_score_counts) / question_count:.0%}–{max(effective_score_counts) / question_count:.0%} range; "
-                "no compensatory-pass scores.",
+                "with varied item difficulty and discrimination.",
                 f"Filled answer then crossed out: {correction_count} of {total_student_answers} student answers.",
                 f"Two filled answers with no cross: {multiple_count} of {total_student_answers} student answers.",
                 f"No answer filled: {blank_count} of {total_student_answers} student answers.",
+                "Answer key: question 1 has two correct answers; configure its scoring rule in Grade.",
                 f"Name left blank: {learners[missing_name_index]['name']}.",
                 "ID bubbles left blank (written student number remains): " +
                 ", ".join(learners[index]["name"] for index in sorted(missing_id_bubbles_indices)) + ".",
@@ -1719,28 +1582,32 @@ def create_app():
                     question_index for question_index in range(question_count)
                     if question_index + 1 not in excluded_questions
                 ]
-                correct_questions = set(rng.sample(
-                    gradeable_questions, effective_score_counts[index]
-                ))
+                correct_questions = correct_question_sets[index] & {
+                    question + 1 for question in gradeable_questions
+                }
                 student_answers = []
-                for question_index, correct_answer in enumerate(correct_answers):
+                for question_index, correct_answer in enumerate(answer_key_answers):
+                    keyed_choices = (list(correct_answer) if isinstance(correct_answer, (list, tuple, set))
+                                     else [correct_answer])
                     if question_index + 1 in blanks_by_student[index]:
                         student_answers.append(None)
-                    elif question_index in correct_questions:
-                        student_answers.append(correct_answer)
+                    elif question_index + 1 in correct_questions:
+                        student_answers.append(keyed_choices if len(keyed_choices) > 1 else keyed_choices[0])
                     else:
                         alternatives = [choice for choice in range(choice_count)
-                                        if choice != correct_answer]
+                                        if choice not in keyed_choices]
                         student_answers.append(rng.choice(alternatives))
                 crossed_answers = {}
                 additional_answers = {}
                 for question_number in corrections_by_student[index]:
                     answer = student_answers[question_number - 1]
-                    alternatives = [choice for choice in range(choice_count) if choice != answer]
+                    answer_choices = answer if isinstance(answer, (list, tuple, set)) else [answer]
+                    alternatives = [choice for choice in range(choice_count) if choice not in answer_choices]
                     crossed_answers[question_number] = rng.choice(alternatives)
                 for question_number in multiples_by_student[index]:
                     answer = student_answers[question_number - 1]
-                    alternatives = [choice for choice in range(choice_count) if choice != answer]
+                    answer_choices = answer if isinstance(answer, (list, tuple, set)) else [answer]
+                    alternatives = [choice for choice in range(choice_count) if choice not in answer_choices]
                     additional_answers[question_number] = [rng.choice(alternatives)]
                 if index == missing_name_index:
                     learner["name"] = ""
@@ -1752,6 +1619,7 @@ def create_app():
                     fill_id_bubbles=fill_id_bubbles,
                     crossed_answers=crossed_answers,
                     additional_answers=additional_answers,
+                    generic=generic,
                 )
                 archive.writestr(
                     f"{index + 1:03d}-{student_name}.pdf",
@@ -1772,6 +1640,9 @@ def create_app():
                         f"Blank answers: {roster_learner['name']} — "
                         f"questions {', '.join(map(str, sorted(blanks_by_student[index])))}."
                     )
+            issue_lines.append("Item profile: " + ", ".join(
+                f"Q{question + 1} {quality}" for question, quality in enumerate(item_qualities)
+            ) + ".")
             archive.writestr("dummy-set-notes.txt", "\n".join(issue_lines) + "\n")
         output.seek(0)
         return send_file(
@@ -1782,7 +1653,7 @@ def create_app():
         )
 
     @app.post("/print/logo")
-    @canvas_login_required
+    @lti_course_required
     def update_course_logo():
         context = active_course_context()
         submitted_csrf = request.form.get("csrf_token", "")
@@ -1820,7 +1691,7 @@ def create_app():
         return redirect(url_for("print_workspace"))
 
     @app.post("/print/designs")
-    @canvas_login_required
+    @lti_course_required
     def create_exam_design():
         context = active_course_context()
         submitted_csrf = request.form.get("csrf_token", "")
@@ -1868,8 +1739,35 @@ def create_app():
         flash(f"Saved “{title}”. Download the PDF when you are ready to print.", "success")
         return redirect(url_for("print_workspace"))
 
+    @app.post("/print/generic.pdf")
+    @lti_course_required
+    def download_generic_sheet():
+        context = active_course_context()
+        if not secrets.compare_digest(request.form.get("csrf_token", ""), session.get("print_csrf", "")):
+            abort(400, "The form expired. Reload the Print page and try again.")
+        try:
+            question_count = int(request.form.get("question_count", ""))
+            choice_count = int(request.form.get("choice_count", ""))
+            if not 1 <= question_count <= MAX_QUESTIONS or not 2 <= choice_count <= 8:
+                raise ValueError
+        except (TypeError, ValueError):
+            abort(400, f"Choose 1–{MAX_QUESTIONS} questions and 2–8 choices.")
+        design = {"title": "", "form_id": "", "question_count": question_count,
+                  "choice_count": choice_count}
+        with connect() as db:
+            branding = db.execute(
+                "SELECT logo FROM course_branding WHERE issuer=? AND context_id=?",
+                (context["issuer"], context["context_id"]),
+            ).fetchone()
+        return send_file(
+            make_answer_sheet(design, branding["logo"] if branding else None,
+                              include_guide=True, generic=True),
+            mimetype="application/pdf", as_attachment=True,
+            download_name="generic-answer-sheet.pdf",
+        )
+
     @app.get("/print/designs/<form_id>.pdf")
-    @canvas_login_required
+    @lti_course_required
     def download_exam_design(form_id):
         context = active_course_context()
         with connect() as db:
@@ -1890,7 +1788,7 @@ def create_app():
         )
 
     @app.post("/print/designs/<form_id>/delete")
-    @canvas_login_required
+    @lti_course_required
     def delete_exam_design(form_id):
         context = active_course_context()
         submitted_csrf = request.form.get("csrf_token", "")
@@ -1906,6 +1804,178 @@ def create_app():
         flash("Deleted the saved sheet. Existing printed copies will no longer be recognized by Scan.", "success")
         return redirect(url_for("print_workspace"))
 
+    def standalone_design(slug):
+        with connect() as db:
+            row = db.execute("SELECT * FROM standalone_designs WHERE slug=?", (slug,)).fetchone()
+        return row
+
+    @app.route("/standalone", methods=["GET", "POST"])
+    def standalone_home():
+        errors = []
+        values = {"title": "", "question_count": 20, "choice_count": 4}
+        if request.method == "POST":
+            values = {
+                "title": request.form.get("title", "").strip(),
+                "question_count": request.form.get("question_count", ""),
+                "choice_count": request.form.get("choice_count", ""),
+            }
+            if not values["title"] or len(values["title"]) > 120:
+                errors.append("Enter an answer-sheet name of up to 120 characters.")
+            try:
+                question_count = int(values["question_count"])
+                if not 1 <= question_count <= MAX_QUESTIONS: raise ValueError
+            except (TypeError, ValueError):
+                errors.append(f"Choose between 1 and {MAX_QUESTIONS} questions.")
+                question_count = 20
+            try:
+                choice_count = int(values["choice_count"])
+                if not 2 <= choice_count <= 8: raise ValueError
+            except (TypeError, ValueError):
+                errors.append("Choose between 2 and 8 answer choices.")
+                choice_count = 4
+            logo, logo_type = None, None
+            upload = request.files.get("logo")
+            if upload and upload.filename:
+                logo = upload.stream.read(3 * 1024 * 1024 + 1)
+                try:
+                    image = Image.open(BytesIO(logo))
+                    if len(logo) > 3 * 1024 * 1024 or image.format not in ("PNG", "JPEG") or image.width > 8000 or image.height > 8000:
+                        raise ValueError
+                    image.verify()
+                    logo_type = "image/png" if image.format == "PNG" else "image/jpeg"
+                except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+                    errors.append("Upload a PNG or JPEG logo no larger than 3 MB.")
+                    logo, logo_type = None, None
+            if not errors:
+                slug = secrets.token_urlsafe(18).replace("_", "").replace("-", "")
+                form_id = str(uuid.uuid4())
+                with connect() as db:
+                    db.execute("INSERT INTO standalone_designs (slug, form_id, title, question_count, choice_count, logo, logo_type, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                               (slug, form_id, values["title"], question_count, choice_count, logo, logo_type, int(time.time())))
+                return redirect(url_for("standalone_workspace", slug=slug, view="print"))
+            values["question_count"], values["choice_count"] = question_count, choice_count
+        return render_template("standalone.html", errors=errors, values=values)
+
+    @app.get("/standalone/uol_legacy")
+    def standalone_uol_legacy():
+        view = request.args.get("view", "print")
+        if view not in {"print", "scan", "grade"}:
+            view = "print"
+        return render_template(
+            "standalone_uol_legacy.html", view=view,
+            public_base_url=base_url(), current_year=datetime.now(timezone.utc).year,
+        )
+
+    @app.get("/standalone/<slug>")
+    def standalone_workspace(slug):
+        design = standalone_design(slug)
+        if not design: abort(404)
+        if request.args.get("format") == "json":
+            return jsonify({"forms": [{"form_id": design["form_id"], "title": design["title"], "question_count": design["question_count"], "choice_count": design["choice_count"]}], "roster": [], "roster_available": True, "roster_error": ""})
+        view = request.args.get("view", "print")
+        if view == "print":
+            return render_template("standalone_print.html", design=dict(design), slug=slug,
+                                   public_base_url=base_url(), current_year=datetime.now(timezone.utc).year)
+        context = {"issuer": "standalone", "context_id": slug, "course_title": design["title"]}
+        runtime = {
+            "standalone": True, "slug": slug,
+            "forms_url": url_for("standalone_forms_manifest", slug=slug),
+            "render_url": url_for("standalone_render_scan_page", slug=slug),
+            "dummy_url": url_for("standalone_dummy_zip", slug=slug),
+            "grade_url": url_for("standalone_workspace", slug=slug) + "?view=grade&format=json",
+            "scan_url": url_for("standalone_workspace", slug=slug, view="scan"),
+            "grade_path": url_for("standalone_workspace", slug=slug) + "?view=grade",
+        }
+        return render_template("scan.html", context=context, standalone=True, standalone_design=dict(design),
+                               scan_runtime=runtime, initial_phase="grade" if view == "grade" else "scan",
+                               dummy_forms=[], dummy_student_count=0, dummy_enrollment_error="",
+                               current_year=datetime.now(timezone.utc).year)
+
+    @app.get("/standalone/<slug>/forms.json")
+    def standalone_forms_manifest(slug):
+        design = standalone_design(slug)
+        if not design: abort(404)
+        return jsonify([{"form_id": design["form_id"], "title": design["title"], "question_count": design["question_count"], "choice_count": design["choice_count"], "legacy_layout_version": LEGACY_SHEET_LAYOUT_VERSION}])
+
+    @app.get("/standalone/<slug>/answer-sheet.pdf")
+    def standalone_answer_sheet(slug):
+        design = standalone_design(slug)
+        if not design: abort(404)
+        filename = secure_filename(design["title"]) or "answer-sheet"
+        return send_file(make_answer_sheet(design, design["logo"]), mimetype="application/pdf", as_attachment=True,
+                         download_name=f"{filename}.pdf")
+
+    @app.post("/standalone/<slug>/dummy.zip")
+    def standalone_dummy_zip(slug):
+        design = standalone_design(slug)
+        if not design: abort(404)
+        payload = request.get_json(silent=True) or {}
+        raw_roster = payload.get("roster")
+        if not isinstance(raw_roster, list) or not 1 <= len(raw_roster) <= 200:
+            abort(400, "Import between 1 and 200 roster students before generating a dummy ZIP.")
+        learners, seen = [], set()
+        for item in raw_roster:
+            student_id = str(item.get("student_id", "")) if isinstance(item, dict) else ""
+            name = str(item.get("name", "")).strip() if isinstance(item, dict) else ""
+            if not re.fullmatch(r"\d{9}", student_id) or student_id == "000000000" or student_id in seen:
+                abort(400, "The imported roster contains an invalid or duplicate student number.")
+            seen.add(student_id)
+            learners.append({"student_id": student_id, "name": name or student_id, "sis_login_id": ""})
+        question_count, choice_count = int(design["question_count"]), int(design["choice_count"])
+        correct_answers = [(question + 1) % choice_count for question in range(question_count)]
+        correct_answers[0] = [correct_answers[0], (correct_answers[0] + 1) % choice_count]
+        rng = random.SystemRandom()
+        score_counts = dummy_score_counts(len(learners), question_count, rng)
+        correct_question_sets, item_qualities = dummy_correct_question_sets(
+            score_counts, question_count, rng, multi_answer_question=1
+        )
+        output = BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            key = {"name": "Answer Sheet", "student_id": "000000000", "sis_login_id": ""}
+            archive.writestr("000-Answer_Sheet.pdf", make_sample_response_pdf(
+                design, key, design["logo"], sample_index=0, seed=1, answers=correct_answers,
+                layout_version=SHEET_LAYOUT_VERSION).getvalue())
+            for index, learner in enumerate(learners):
+                answers = []
+                for question, keyed in enumerate(correct_answers):
+                    options = list(keyed) if isinstance(keyed, list) else [keyed]
+                    if question + 1 in correct_question_sets[index]:
+                        answers.append(options if question == 0 else options[0])
+                    else:
+                        answers.append(rng.choice([choice for choice in range(choice_count) if choice not in options]))
+                filename = secure_filename(learner["name"]) or f"student-{index + 1}"
+                archive.writestr(f"{index + 1:03d}-{filename}.pdf", make_sample_response_pdf(
+                    design, learner, design["logo"], sample_index=index + 1, seed=1, answers=answers,
+                    layout_version=SHEET_LAYOUT_VERSION).getvalue())
+            archive.writestr("README.txt", "Dummy scan set generated from the imported roster. The answer key uses student number 000000000. Question 1 has two keyed answers. Scores follow a 40–90% bell-shaped profile with occasional outliers. Item difficulty and discrimination vary across the set.\n" + "Item profile: " + ", ".join(f"Q{number + 1} {quality}" for number, quality in enumerate(item_qualities)) + "\n")
+        output.seek(0)
+        filename = secure_filename(design["title"]) or "answer-sheet"
+        return send_file(output, mimetype="application/zip", as_attachment=True,
+                         download_name=f"{filename}-dummy-set.zip")
+
+    @app.post("/standalone/<slug>/render-page")
+    def standalone_render_scan_page(slug):
+        if not standalone_design(slug): abort(404)
+        request.max_content_length = 64 * 1024 * 1024
+        if request.mimetype != "application/pdf" or request.headers.get("X-Scan-Render") != "1":
+            abort(415, "A PDF scan is required.")
+        page_number = request.args.get("page", type=int)
+        pdf_bytes = request.get_data()
+        if page_number is None or page_number < 1 or not pdf_bytes.startswith(b"%PDF-"):
+            abort(400, "A valid PDF page is required.")
+        try:
+            with pymupdf.open(stream=pdf_bytes, filetype="pdf") as document:
+                if page_number > len(document): abort(400, "The requested page does not exist.")
+                page = document[page_number - 1]
+                scale = min(2.8, 1600 / max(page.rect.width, page.rect.height))
+                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(scale), colorspace=pymupdf.csRGB, alpha=False)
+                png = pixmap.tobytes("png")
+        except (pymupdf.FileDataError, pymupdf.EmptyFileError, ValueError):
+            abort(400, "The PDF page could not be rendered.")
+        response = send_file(BytesIO(png), mimetype="image/png", download_name="scan-page.png")
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.get("/lti/config.json")
     def tool_config():
         base = base_url()
@@ -1915,6 +1985,7 @@ def create_app():
             "oidc_initiation_url": base + "/oidc/login",
             "target_link_uri": base + "/lti/launch",
             "redirect_uris": [base + "/lti/launch"],
+            "logo_uri": base + "/static/logo.svg",
             "public_jwk_url": base + "/.well-known/jwks.json",
             "minivle_deployment_registration_url": base + "/api/lti/deployments",
             "scopes": [NRPS_SCOPE],
@@ -1926,6 +1997,246 @@ def create_app():
                 "placements": ["course_navigation"],
             }],
         })
+
+    def registration_page(template, status=200, **context):
+        response = make_response(render_template(template, **context), status)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+    @app.route("/lti/register", methods=["GET", "POST"])
+    def lti_dynamic_registration():
+        class NoRedirect(HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = build_opener(NoRedirect())
+        if request.method == "GET":
+            openid_url = request.args.get("openid_configuration", "")
+            registration_token = request.args.get("registration_token", "")
+            if not openid_url:
+                return registration_page(
+                    "lti_registration_result.html",
+                    success=False,
+                    message="Give this URL to an LTI platform that supports 1EdTech LTI Dynamic Registration. The platform will open it with its OpenID configuration URL.",
+            )
+            try:
+                if len(openid_url) > 4096 or len(registration_token) > 4096:
+                    raise ValueError("The platform registration parameters are too long.")
+                parsed_openid_url = urlparse(openid_url)
+                query_values = parse_qsl(parsed_openid_url.query, keep_blank_values=True)
+                if not registration_token:
+                    registration_token = next(
+                        (value for key, value in query_values if key == "registration_token"), ""
+                    )
+                if registration_token:
+                    query_values = [(key, value) for key, value in query_values
+                                    if key != "registration_token"]
+                    query_values.append(("registration_token", registration_token))
+                    openid_url = parsed_openid_url._replace(query=urlencode(query_values)).geturl()
+                if len(registration_token) > 4096:
+                    raise ValueError("The platform registration token is too long.")
+                config_endpoint = _public_https_url(openid_url)
+                metadata_headers = {
+                    "Accept": "application/json",
+                    "User-Agent": "PrintScanGrade-LTI/1.0 (+https://printscangrade.uniwebdev.co.uk)",
+                }
+                if registration_token:
+                    metadata_headers["Authorization"] = "Bearer " + registration_token
+                with opener.open(Request(openid_url, headers=metadata_headers), timeout=8) as response:
+                    metadata = json.loads(response.read(1_048_577))
+                if not isinstance(metadata, dict):
+                    raise ValueError("The platform returned invalid OpenID configuration.")
+
+                issuer_value = metadata.get("issuer")
+                if not isinstance(issuer_value, str) or not issuer_value:
+                    raise ValueError("The platform OpenID configuration has no issuer.")
+                issuer = issuer_value.rstrip("/")
+                issuer_endpoint = _public_https_url(issuer)
+                same_authority = (issuer_endpoint.hostname.lower() == config_endpoint.hostname.lower() and
+                                  issuer_endpoint.port == config_endpoint.port)
+                issuer_path = issuer_endpoint.path.rstrip("/")
+                issuer_matches_discovery = (
+                    same_authority and config_endpoint.path.startswith(issuer_path + "/") and
+                    not urlparse(issuer).query and not urlparse(issuer).fragment
+                )
+                canvas_public_url = os.getenv("CANVAS_PUBLIC_BASE_URL", "").strip().rstrip("/")
+                canvas_public = urlparse(canvas_public_url) if canvas_public_url else None
+                platform_configuration = metadata.get(
+                    "https://purl.imsglobal.org/spec/lti-platform-configuration", {}
+                )
+                canvas_compatibility = (
+                    isinstance(platform_configuration, dict) and
+                    platform_configuration.get("product_family_code") == "canvas" and
+                    canvas_public and canvas_public.scheme == "https" and
+                    canvas_public.hostname and
+                    canvas_public.hostname.lower() == config_endpoint.hostname.lower()
+                )
+                if not issuer_matches_discovery and not canvas_compatibility:
+                    raise ValueError("The OpenID configuration URL does not match its issuer.")
+
+                authorization_endpoint = metadata.get("authorization_endpoint", "")
+                jwks_url = metadata.get("jwks_uri", "")
+                token_endpoint = metadata.get("token_endpoint", "")
+                registration_endpoint = metadata.get("registration_endpoint", "")
+                for endpoint in (authorization_endpoint, jwks_url, token_endpoint, registration_endpoint):
+                    _public_https_url(endpoint)
+
+                request_id = secrets.token_urlsafe(32)
+                now = int(time.time())
+                with connect() as db:
+                    db.execute("DELETE FROM lti_registration_requests WHERE created_at < ?", (now - 600,))
+                    db.execute(
+                        "INSERT INTO lti_registration_requests "
+                        "(request_id, issuer, authorization_endpoint, jwks_url, token_endpoint, "
+                        "registration_endpoint, registration_token, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                        (request_id, issuer, authorization_endpoint, jwks_url, token_endpoint,
+                         registration_endpoint, registration_token, now),
+                    )
+                return registration_page(
+                    "lti_registration_confirm.html",
+                    issuer=issuer,
+                    request_id=request_id,
+                )
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError, TypeError,
+                    json.JSONDecodeError, sqlite3.Error) as exc:
+                if isinstance(exc, HTTPError):
+                    detail = f"Could not read the platform registration details (HTTP {exc.code})."
+                    try:
+                        error_body = json.loads(exc.read(4096))
+                        if isinstance(error_body, dict):
+                            explanation = error_body.get("error_description") or error_body.get("error")
+                            if isinstance(explanation, str) and explanation.strip():
+                                detail += " " + explanation.strip()[:300]
+                    except (OSError, ValueError, TypeError):
+                        pass
+                elif isinstance(exc, ValueError) and str(exc):
+                    detail = str(exc)
+                else:
+                    detail = "Could not read the platform registration details. Check its configuration and try again."
+                return registration_page("lti_registration_result.html", 400, success=False, message=detail)
+
+        request_id = request.form.get("request_id", "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{40,64}", request_id):
+            return registration_page(
+                "lti_registration_result.html", 400, success=False,
+                message="This registration request is invalid. Start again from your learning platform.",
+            )
+        now = int(time.time())
+        try:
+            with connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                registration = db.execute(
+                    "SELECT * FROM lti_registration_requests WHERE request_id=? AND created_at>=?",
+                    (request_id, now - 600),
+                ).fetchone()
+                if not registration:
+                    db.rollback()
+                    return registration_page(
+                        "lti_registration_result.html", 400, success=False,
+                        message="This registration request expired or has already been used. Start again from your learning platform.",
+                    )
+                registration = dict(registration)
+                db.execute("DELETE FROM lti_registration_requests WHERE request_id=?", (request_id,))
+
+            registration_endpoint = registration["registration_endpoint"]
+            for endpoint in (registration_endpoint, registration["authorization_endpoint"],
+                             registration["jwks_url"], registration["token_endpoint"]):
+                _public_https_url(endpoint)
+            base = base_url()
+            configured_canvas = urlparse(
+                os.getenv("CANVAS_PUBLIC_BASE_URL", "").strip().rstrip("/")
+            )
+            is_canvas_registration = bool(
+                configured_canvas.hostname and
+                urlparse(registration_endpoint).hostname and
+                configured_canvas.hostname.lower() == urlparse(registration_endpoint).hostname.lower()
+            )
+            messages = [{
+                "type": "LtiResourceLinkRequest",
+                "target_link_uri": base + "/lti/launch",
+                "label": "Print Scan Grade",
+                "placements": ["course_navigation"],
+            }] if is_canvas_registration else [{
+                "type": "LtiDeepLinkingRequest",
+                "target_link_uri": base + "/lti/launch",
+                "label": "Add Print Scan Grade",
+                "placements": ["course_navigation"],
+            }]
+            tool_registration = {
+                "application_type": "web",
+                "response_types": ["id_token"],
+                "grant_types": ["implicit", "client_credentials"],
+                "initiate_login_uri": base + "/oidc/login",
+                "redirect_uris": [base + "/lti/launch"],
+                "client_name": "Print Scan Grade",
+                "client_uri": base,
+                "jwks_uri": base + "/.well-known/jwks.json",
+                "logo_uri": base + "/static/logo.svg",
+                "token_endpoint_auth_method": "private_key_jwt",
+                "scope": "openid " + NRPS_SCOPE,
+                "https://purl.imsglobal.org/spec/lti-tool-configuration": {
+                    "domain": urlparse(base).netloc,
+                    "description": "Create paper MCQ exams, scan completed forms, and sync grades to the VLE.",
+                    "target_link_uri": base + "/lti/launch",
+                    "claims": [
+                        "sub", "iss", "aud", "exp", "iat", "nonce", "name", "given_name",
+                        "family_name", "email", LTI + "roles", LTI + "context",
+                        LTI + "resource_link", LTI + "deployment_id", LTI + "message_type",
+                        LTI + "version", LTI + "target_link_uri", LTI + "custom", NRPS_CLAIM,
+                    ],
+                    "messages": messages,
+                },
+            }
+            if is_canvas_registration:
+                tool_registration["https://purl.imsglobal.org/spec/lti-tool-configuration"].update({
+                    "https://canvas.instructure.com/lti/tool_id": "print-scan-grade",
+                    "https://canvas.instructure.com/lti/privacy_level": "public",
+                })
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "PrintScanGrade-LTI/1.0 (+https://printscangrade.uniwebdev.co.uk)",
+            }
+            if registration["registration_token"]:
+                headers["Authorization"] = "Bearer " + registration["registration_token"]
+            request_data = Request(
+                registration_endpoint,
+                data=json.dumps(tool_registration).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with opener.open(request_data, timeout=10) as response:
+                result = json.loads(response.read(1_048_577))
+            client_id = result.get("client_id") if isinstance(result, dict) else None
+            if not isinstance(client_id, str) or not client_id.strip():
+                raise ValueError("The platform response did not include a client ID.")
+
+            with connect() as db:
+                db.execute(
+                    "INSERT INTO lti_clients "
+                    "(name, issuer, client_id, authorization_endpoint, jwks_url, token_endpoint, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(issuer, client_id) DO UPDATE SET name=excluded.name, "
+                    "authorization_endpoint=excluded.authorization_endpoint, jwks_url=excluded.jwks_url, "
+                    "token_endpoint=excluded.token_endpoint, enabled=1, updated_at=excluded.updated_at",
+                    ("Print Scan Grade / " + registration["issuer"], registration["issuer"], client_id.strip(),
+                     registration["authorization_endpoint"], registration["jwks_url"],
+                     registration["token_endpoint"], now, now),
+                )
+            return registration_page(
+                "lti_registration_result.html",
+                success=True,
+                message="Print Scan Grade was registered with your learning platform. You can close this window.",
+            )
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError, TypeError, json.JSONDecodeError, sqlite3.Error) as exc:
+            if isinstance(exc, HTTPError):
+                detail = f"The platform rejected registration (HTTP {exc.code})."
+            elif isinstance(exc, ValueError) and str(exc):
+                detail = str(exc)
+            else:
+                detail = "The platform could not complete dynamic registration. Start again from your learning platform and try again."
+            return registration_page("lti_registration_result.html", 400, success=False, message=detail)
 
     @app.get("/.well-known/jwks.json")
     def jwks():
@@ -1964,14 +2275,18 @@ def create_app():
                        (issuer, client_id, deployment_id, int(time.time())))
         return jsonify({"status": "registered"}), 201
 
-    @app.get("/oidc/login")
+    # Canvas submits its third-party initiated login request as a form POST.
+    # Supporting GET as well keeps the endpoint compatible with platforms that
+    # initiate the same request through a redirect.
+    @app.route("/oidc/login", methods=["GET", "POST"])
     def oidc_login():
-        issuer = request.args.get("iss", "").rstrip("/")
-        client_id = request.args.get("client_id", "")
+        login_params = request.values
+        issuer = login_params.get("iss", "").rstrip("/")
+        client_id = login_params.get("client_id", "")
         with connect() as db:
             if not known_client(db, issuer, client_id):
                 abort(400, "Unknown LTI platform or client ID.")
-        target = request.args.get("target_link_uri", "")
+        target = login_params.get("target_link_uri", "")
         if target and target.rstrip("/") != base_url() + "/lti/launch":
             abort(400, "Unexpected target link URI.")
         state, nonce = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
@@ -1980,8 +2295,8 @@ def create_app():
         params = {
             "response_type": "id_token", "response_mode": "form_post", "scope": "openid",
             "client_id": client_id, "redirect_uri": base_url() + "/lti/launch",
-            "login_hint": request.args.get("login_hint", ""),
-            "lti_message_hint": request.args.get("lti_message_hint", ""),
+            "login_hint": login_params.get("login_hint", ""),
+            "lti_message_hint": login_params.get("lti_message_hint", ""),
             "state": state, "nonce": nonce, "prompt": "none",
         }
         platform = platform_client(issuer, client_id) or platforms()[issuer]
@@ -2008,7 +2323,12 @@ def create_app():
                 if not client_id:
                     raise ValueError("Unknown LTI client ID")
                 platform = platform_client(issuer, client_id) or platform
-                with urlopen(Request(platform["jwks_url"], headers={"Accept": "application/json"}), timeout=8) as response:
+                # Canvas's Cloudflare edge rejects urllib's default user agent.
+                # Identify this server-side LTI verification request explicitly.
+                with urlopen(Request(platform["jwks_url"], headers={
+                    "Accept": "application/json",
+                    "User-Agent": "PrintScanGrade-LTI/1.0 (+https://printscangrade.uniwebdev.co.uk)",
+                }), timeout=8) as response:
                     keys = json.load(response)["keys"]
                 jwk = next(k for k in keys if k.get("kid") == header.get("kid"))
                 claims = jwt.decode(
@@ -2029,7 +2349,20 @@ def create_app():
                     deployment_id in platform.get("deployment_ids", [])
                 )
                 if not registered and not configured_deployment:
-                    raise ValueError("Unregistered LTI deployment")
+                    # Dynamic registration returns a client ID but does not
+                    # provide the deployment ID. Once the signed launch has
+                    # proved the issuer, client ID, audience and nonce, retain
+                    # Canvas's deployment ID for subsequent launches.
+                    dynamic_client = db.execute(
+                        "SELECT 1 FROM lti_clients WHERE issuer=? AND client_id=? AND enabled=1",
+                        (issuer, client_id),
+                    ).fetchone()
+                    if not dynamic_client:
+                        raise ValueError("Unregistered LTI deployment")
+                    db.execute(
+                        "INSERT OR IGNORE INTO deployments VALUES (?,?,?,?)",
+                        (issuer, client_id, deployment_id, int(time.time())),
+                    )
                 if message_type == "LtiDeepLinkingRequest":
                     settings = claims.get(LTI_DEEP_LINKING + "deep_linking_settings", {})
                     return_url = settings.get("deep_link_return_url", "")

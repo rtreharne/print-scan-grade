@@ -6,6 +6,7 @@ services:
     env_file:
       - .env
     environment:
+      DOMAIN: ${DOMAIN:-}
       TOOL_BASE_URL: ${TOOL_BASE_URL:-http://localhost:8004}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       LTI_INTERNAL_PLATFORM_BASE_URL: ${LTI_INTERNAL_PLATFORM_BASE_URL:-http://host.docker.internal:8001}
@@ -16,6 +17,6 @@ services:
     volumes:
       - ./data:/data
       - ./app:/app/app
-    command: ["gunicorn", "--bind", "0.0.0.0:8004", "--workers", "1", "--threads", "4", "--reload", "app.main:app"]
+    command: ["gunicorn", "--bind", "0.0.0.0:8004", "--workers", "1", "--threads", "4", "--timeout", "120", "--reload", "app.main:app"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
