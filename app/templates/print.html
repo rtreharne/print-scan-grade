@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#101b2b">
   <title>Print answer sheets · Print Scan Grade</title>
   <link rel="icon" href="{{ url_for('static', filename='logo.svg') }}" type="image/svg+xml">
-  <link rel="stylesheet" href="{{ url_for('static', filename='print.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='print.css', v=5) }}">
 </head>
 <body>
   <main class="workspace">
@@ -139,6 +139,7 @@
         {% endif %}
       </section>
     </div>
+    {% include '_answer_key_guidance.html' %}
     <footer>Print at 100% scale · <a href="https://printscangrade.com">printscangrade.com</a></footer>
   </main>
   <script>

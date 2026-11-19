@@ -21,8 +21,8 @@
 
   <main id="main-content" class="landing-container">
     <section class="landing-hero" aria-labelledby="landing-title">
-      <p class="eyebrow">Paper exams, connected</p>
-      <h1 id="landing-title">Paper exams.<br><span>Clear results.</span></h1>
+      <p class="eyebrow">Paper based MCQ exams</p>
+      <h1 id="landing-title">From printed answer sheets<br><span>to clear results.</span></h1>
       <p class="landing-lead">Create multiple-choice answer sheets, read completed scans, and turn them into student grades and question analysis.</p>
       <p class="landing-intro">PrintScanGrade brings printing, scanning and grading into one workspace. Check what was read against the original page, resolve student matches, and export the results when you’re ready.</p>
       <div class="landing-actions"><a class="landing-button" href="{{ url_for('standalone_home') }}">Create a standalone workspace <span aria-hidden="true">→</span></a><a class="landing-text-link" href="#how-it-works">See how it works <span aria-hidden="true">↓</span></a></div>
@@ -89,7 +89,7 @@
     </section>
   </main>
 
-  <footer class="landing-footer landing-container"><a class="landing-brand" href="{{ url_for('home') }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="30" height="30"><span>PrintScanGrade</span></a><p>Print. Scan. Review. Grade.</p></footer>
+  <footer class="landing-footer landing-container"><a class="landing-brand" href="{{ url_for('home') }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="30" height="30"><span>PrintScanGrade</span></a></footer>
   <script>
     (() => {
       const registrationUrl = `${window.location.origin}/lti/register`;

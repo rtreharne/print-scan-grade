@@ -6,14 +6,14 @@
   <meta name="theme-color" content="#101b2b">
   <title>Scan answer sheets · Print Scan Grade</title>
   <link rel="icon" href="{{ url_for('static', filename='logo.svg') }}" type="image/svg+xml">
-  <link rel="stylesheet" href="{{ url_for('static', filename='print.css') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='scan.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='print.css', v=2) }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='scan.css', v=13) }}">
   <script src="{{ url_for('static', filename='vendor/jszip.min.js') }}"></script>
   <script src="{{ url_for('static', filename='vendor/jsQR.js') }}"></script>
 </head>
 <body{% if standalone|default(false) %} class="standalone-embedded-workspace"{% endif %}>
   <main class="workspace">
-    <script id="scan-course-key" type="application/json">{{ {'issuer': context.issuer, 'context_id': context.context_id}|tojson }}</script>
+    <script id="scan-course-key" type="application/json">{{ {'issuer': context.issuer, 'context_id': context.context_id, 'course_title': context.course_title}|tojson }}</script>
     <script id="scan-runtime-config" type="application/json">{{ scan_runtime|default({})|tojson }}</script>
     <header class="workspace-header">
       <a class="brand" href="{{ url_for('standalone_home') if standalone|default(false) else '/' }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="42" height="42"><span>Print Scan Grade</span></a>
@@ -35,7 +35,7 @@
     <section class="intro">
       <p class="eyebrow">Phase 02 · Scan</p>
       <h1>Scan answer sheets</h1>
-      <p>Select a completed answer-sheet PDF or a ZIP of PDFs. Student guide pages are skipped automatically. PDFs stay local; detected results and compressed page previews are saved in this browser for this course.</p>
+      <p>Select a completed answer-sheet PDF or a ZIP of PDFs. Student guide pages are skipped automatically. {% if standalone|default(false) %}PDF pages are temporarily sent to this app for faithful rendering; results and compressed page previews are saved in this browser.{% else %}PDFs stay local; detected results and compressed page previews are saved in this browser for this course.{% endif %}</p>
     </section>
 
     {% if standalone|default(false) %}
@@ -50,10 +50,10 @@
       {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}<div class="messages">{% for category, message in messages %}<p class="message {{ category }}" role="status">{{ message }}</p>{% endfor %}</div>{% endif %}
       {% endwith %}
-      <p class="muted">Select a completed answer-sheet PDF or a ZIP of PDFs. Student guide pages are skipped automatically. Pages are rendered and analyzed in this browser; scan images and results are saved in this browser for this course.</p>
+      <p class="muted">Select a completed answer-sheet PDF or a ZIP of PDFs. Student guide pages are skipped automatically. {% if standalone|default(false) %}Pages are temporarily sent to this app for faithful rendering, then analyzed and saved in this browser.{% else %}Pages are rendered and analyzed in this browser; scan images and results are saved in this browser for this course.{% endif %}</p>
       <label class="file-drop" for="scan-file">
         <span class="upload-symbol" aria-hidden="true">↑</span>
-        <span><strong>Select completed sheets (.pdf or .zip)</strong><small id="file-name">PDF pages are rendered in this browser; scan images are saved in this browser.</small></span>
+        <span><strong>Select completed sheets (.pdf or .zip)</strong><small id="file-name">{% if standalone|default(false) %}PDF pages are rendered by this app; scans are saved in this browser.{% else %}PDF pages are rendered in this browser; scan images are saved in this browser.{% endif %}</small></span>
         <input id="scan-file" type="file" accept=".pdf,application/pdf,.zip,application/zip" aria-describedby="zip-help">
       </label>
       <p id="zip-help" class="field-help">A PDF may contain multiple pages. ZIPs can contain multiple PDFs; non-PDF files are skipped. PDF limit: 64 MB each; ZIP limit: 256 MB.</p>
@@ -96,6 +96,7 @@
     <section id="grade-dashboard" class="results-section grade-workspace" aria-labelledby="grade-title" hidden>
       <div class="results-heading">
         <div><p class="eyebrow">Phase 03 · Grade</p><h2 id="grade-title">Grade answer sheets</h2><p id="grade-summary" class="muted"></p></div>
+        <button id="clear-workspace-scans" class="delete-scan-button" type="button" hidden>Delete all saved scans</button>
       </div>
       <div id="grade-form-list" class="grade-form-list"></div>
       <section id="grade-set-list" class="grade-set-list" hidden aria-labelledby="grade-set-title">
@@ -136,9 +137,10 @@
           </table>
         </div>
         <dialog id="scan-preview-dialog" class="scan-preview-dialog" aria-labelledby="scan-preview-title">
-          <div class="scan-preview-heading"><div><p class="eyebrow">Saved scan results</p><h2 id="scan-preview-title">Scanned answer sheet</h2><p id="scan-preview-meta" class="muted"></p></div><div class="scan-preview-actions"><button id="scan-preview-previous" class="download-button" type="button">← Previous student</button><button id="scan-preview-next" class="download-button" type="button">Next student →</button><button id="scan-preview-close" class="download-button" type="button">Close</button></div></div>
-          <button id="original-scan-toggle" class="download-button original-scan-toggle" type="button" hidden>View raw annotated scan</button>
-          <section id="original-scan-panel" class="original-scan-panel" hidden><p class="field-help">This is the original scan with diagnostic circle overlays only. Green indicates filled, blue indicates blank, and a red X marks a crossed-out response.</p><img id="original-scan-image" alt="Raw annotated scanned answer sheet page"></section>
+          <div class="scan-preview-heading"><div><p class="eyebrow">Saved scan results</p><h2 id="scan-preview-title">Scanned answer sheet</h2><p id="scan-preview-meta" class="muted"></p></div><div class="scan-preview-actions scan-preview-header-actions"><button id="scan-preview-previous" class="download-button" type="button">← Previous student</button><button id="scan-preview-next" class="download-button" type="button">Next student →</button><button id="scan-preview-close" class="download-button scan-preview-close-button" type="button">Close</button></div></div>
+          <div id="scan-preview-stale" class="scan-preview-stale" role="alert" hidden><p>This saved page was read from an old, faded browser rendering—not the original PDF. Its answers and student number may be wrong, and reloading cannot recover the missing detail. Re-scan the original PDF to read it accurately. Re-scanning replaces this set, including any manual answer edits and score settings.</p><button id="scan-preview-rescan" class="primary-button" type="button">Re-scan original PDF</button></div>
+          <div class="scan-preview-actions scan-preview-tools"><button id="original-scan-toggle" class="download-button original-scan-toggle" type="button" hidden>View raw annotated scan</button><button id="scan-preview-save-answers" class="download-button scan-preview-save-answers" type="button" hidden>Save answer changes</button></div>
+          <section id="original-scan-panel" class="original-scan-panel" hidden><p id="original-scan-description" class="field-help">This is the original scan with diagnostic circle overlays only. Green indicates filled, blue indicates blank, and a red X marks a crossed-out response.</p><img id="original-scan-image" alt="Raw annotated scanned answer sheet page"></section>
           <div id="scan-preview-content" class="scan-preview-content"></div>
         </dialog>
         <dialog id="unidentified-dialog" class="scan-preview-dialog unidentified-dialog" aria-labelledby="unidentified-dialog-title">
@@ -168,12 +170,12 @@
 
     <button id="back-to-top" class="back-to-top" type="button" aria-label="Back to top" hidden>↑ <span>Back to top</span></button>
     {% if standalone|default(false) %}
-    <footer class="standalone-footer"><hr><span>© Print Scan Grade {{ current_year }}</span></footer>
+    <footer class="standalone-footer"><a class="workspace-footer-brand" href="{{ url_for('home') }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="30" height="30"><span>PrintScanGrade</span></a><p>© PrintScanGrade {{ current_year }}</p></footer>
     {% else %}
     <footer>printscangrade.com</footer>
     {% endif %}
   </main>
 
-<script type="module" src="{{ url_for('static', filename='scan.js', v=95) }}"></script>
+<script type="module" src="{{ url_for('static', filename='scan.js', v=107) }}"></script>
 </body>
 </html>

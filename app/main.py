@@ -61,6 +61,7 @@ QUESTIONS_PER_COLUMN = 15
 FORM_BUBBLE_RADIUS = 6.8
 REGISTRATION_MARK_EDGE = 16
 REGISTRATION_MARK_SIZE = 10
+STANDALONE_USAGE_POLICY_VERSION = "2026-11-19"
 
 
 class MinimumFontCanvas(canvas.Canvas):
@@ -201,6 +202,8 @@ def connect():
         CREATE TABLE IF NOT EXISTS standalone_designs (
             slug TEXT PRIMARY KEY,
             form_id TEXT NOT NULL UNIQUE,
+            source_form_id TEXT,
+            agreement_required INTEGER NOT NULL DEFAULT 0 CHECK(agreement_required IN (0, 1)),
             title TEXT NOT NULL,
             question_count INTEGER NOT NULL CHECK(question_count BETWEEN 1 AND 60),
             choice_count INTEGER NOT NULL CHECK(choice_count BETWEEN 2 AND 8),
@@ -208,7 +211,25 @@ def connect():
             logo_type TEXT CHECK(logo_type IN ('image/png', 'image/jpeg')),
             created_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS standalone_workspace_agreements (
+            slug TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            institution TEXT NOT NULL,
+            department TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            accepted_at INTEGER NOT NULL
+        );
     """)
+    standalone_columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(standalone_designs)")
+    }
+    if "source_form_id" not in standalone_columns:
+        db.execute("ALTER TABLE standalone_designs ADD COLUMN source_form_id TEXT")
+    if "agreement_required" not in standalone_columns:
+        db.execute(
+            "ALTER TABLE standalone_designs "
+            "ADD COLUMN agreement_required INTEGER NOT NULL DEFAULT 0"
+        )
     # Releases before lti_clients was introduced stored only deployment rows.
     # Once endpoint metadata is available, retain those clients in the new
     # registration table so existing launches continue to work and appear in
@@ -1809,15 +1830,47 @@ def create_app():
             row = db.execute("SELECT * FROM standalone_designs WHERE slug=?", (slug,)).fetchone()
         return row
 
+    def standalone_form_code(value):
+        """Normalise a full QR form ID or the shortened code printed after FORM."""
+        code = str(value or "").strip()
+        if code.upper().startswith("PSG1|"):
+            code = code.split("|", 2)[1] if "|" in code[5:] else ""
+        code = re.sub(r"^FORM\s+", "", code, flags=re.IGNORECASE).strip().lower()
+        return code if re.fullmatch(r"[0-9a-f-]{12,36}", code) else ""
+
+    def standalone_manifest(design):
+        accepted_form_ids = [design["form_id"]]
+        source_form_id = design["source_form_id"]
+        if source_form_id and source_form_id not in accepted_form_ids:
+            accepted_form_ids.append(source_form_id)
+        return {
+            "form_id": design["form_id"],
+            "accepted_form_ids": accepted_form_ids,
+            "title": design["title"],
+            "question_count": design["question_count"],
+            "choice_count": design["choice_count"],
+            "legacy_layout_version": LEGACY_SHEET_LAYOUT_VERSION,
+        }
+
+    def standalone_agreement_pending(design):
+        if not design["agreement_required"]:
+            return False
+        with connect() as db:
+            agreement = db.execute(
+                "SELECT 1 FROM standalone_workspace_agreements WHERE slug=?", (design["slug"],)
+            ).fetchone()
+        return agreement is None
+
     @app.route("/standalone", methods=["GET", "POST"])
     def standalone_home():
         errors = []
-        values = {"title": "", "question_count": 20, "choice_count": 4}
+        values = {"title": "", "question_count": 20, "choice_count": 4, "existing_form_code": ""}
         if request.method == "POST":
             values = {
                 "title": request.form.get("title", "").strip(),
                 "question_count": request.form.get("question_count", ""),
                 "choice_count": request.form.get("choice_count", ""),
+                "existing_form_code": request.form.get("existing_form_code", "").strip(),
             }
             if not values["title"] or len(values["title"]) > 120:
                 errors.append("Enter an answer-sheet name of up to 120 characters.")
@@ -1833,6 +1886,11 @@ def create_app():
             except (TypeError, ValueError):
                 errors.append("Choose between 2 and 8 answer choices.")
                 choice_count = 4
+            source_form_id = None
+            if values["existing_form_code"]:
+                source_form_id = standalone_form_code(values["existing_form_code"])
+                if not source_form_id:
+                    errors.append("Enter the form code shown after FORM, or the full QR form ID.")
             logo, logo_type = None, None
             upload = request.files.get("logo")
             if upload and upload.filename:
@@ -1850,28 +1908,113 @@ def create_app():
                 slug = secrets.token_urlsafe(18).replace("_", "").replace("-", "")
                 form_id = str(uuid.uuid4())
                 with connect() as db:
-                    db.execute("INSERT INTO standalone_designs (slug, form_id, title, question_count, choice_count, logo, logo_type, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                               (slug, form_id, values["title"], question_count, choice_count, logo, logo_type, int(time.time())))
-                return redirect(url_for("standalone_workspace", slug=slug, view="print"))
+                    db.execute("INSERT INTO standalone_designs (slug, form_id, source_form_id, agreement_required, title, question_count, choice_count, logo, logo_type, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                               (slug, form_id, source_form_id, 1, values["title"], question_count, choice_count, logo, logo_type, int(time.time())))
+                return redirect(url_for("standalone_agreement", slug=slug))
             values["question_count"], values["choice_count"] = question_count, choice_count
-        return render_template("standalone.html", errors=errors, values=values)
+        return render_template("standalone.html", errors=errors, values=values,
+                               current_year=datetime.now(timezone.utc).year)
 
-    @app.get("/standalone/uol_legacy")
+    @app.route("/standalone/uol_legacy", methods=["GET", "POST"])
     def standalone_uol_legacy():
         view = request.args.get("view", "print")
-        if view not in {"print", "scan", "grade"}:
+        if view not in {"print", "agreement", "scan", "grade"}:
             view = "print"
+        agreement_slug = "uol_legacy"
+        with connect() as db:
+            agreement = db.execute(
+                "SELECT 1 FROM standalone_workspace_agreements WHERE slug=?", (agreement_slug,)
+            ).fetchone()
+        if agreement is None and view != "agreement":
+            return redirect(url_for("standalone_uol_legacy", view="agreement"))
+        if view == "agreement":
+            errors = []
+            values = {"email": "", "institution": "", "department": ""}
+            if request.method == "POST":
+                values = {
+                    "email": request.form.get("email", "").strip(),
+                    "institution": request.form.get("institution", "").strip(),
+                    "department": request.form.get("department", "").strip(),
+                }
+                if not re.fullmatch(r"[^@\s]{1,254}@[^@\s]+\.[^@\s]+", values["email"]):
+                    errors.append("Enter a valid email address.")
+                for field, label in (("institution", "institution"), ("department", "school or department")):
+                    if not values[field] or len(values[field]) > 160:
+                        errors.append(f"Enter a {label} of up to 160 characters.")
+                if request.form.get("accept_policy") != "yes":
+                    errors.append("You must agree to the usage policy and grading disclaimer to continue.")
+                if not errors:
+                    with connect() as db:
+                        db.execute(
+                            "INSERT OR REPLACE INTO standalone_workspace_agreements "
+                            "(slug, email, institution, department, policy_version, accepted_at) VALUES (?,?,?,?,?,?)",
+                            (agreement_slug, values["email"], values["institution"], values["department"],
+                             STANDALONE_USAGE_POLICY_VERSION, int(time.time())),
+                        )
+                    return redirect(url_for("standalone_uol_legacy", view="print"))
+            return render_template(
+                "standalone_agreement.html",
+                design={"title": "University of Liverpool MCQ sheets"}, slug=agreement_slug,
+                errors=errors, values=values, policy_version=STANDALONE_USAGE_POLICY_VERSION,
+                current_year=datetime.now(timezone.utc).year,
+                agreement_action=url_for("standalone_uol_legacy", view="agreement"),
+            )
         return render_template(
             "standalone_uol_legacy.html", view=view,
             public_base_url=base_url(), current_year=datetime.now(timezone.utc).year,
+        )
+
+    @app.route("/standalone/<slug>/agreement", methods=["GET", "POST"])
+    def standalone_agreement(slug):
+        design = standalone_design(slug)
+        if not design:
+            abort(404)
+        if not design["agreement_required"] or not standalone_agreement_pending(design):
+            return redirect(url_for("standalone_workspace", slug=slug, view="print"))
+        errors = []
+        values = {"email": "", "institution": "", "department": ""}
+        if request.method == "POST":
+            values = {
+                "email": request.form.get("email", "").strip(),
+                "institution": request.form.get("institution", "").strip(),
+                "department": request.form.get("department", "").strip(),
+            }
+            if not re.fullmatch(r"[^@\s]{1,254}@[^@\s]+\.[^@\s]+", values["email"]):
+                errors.append("Enter a valid email address.")
+            for field, label in (("institution", "institution"), ("department", "school or department")):
+                if not values[field] or len(values[field]) > 160:
+                    errors.append(f"Enter a {label} of up to 160 characters.")
+            if request.form.get("accept_policy") != "yes":
+                errors.append("You must agree to the usage policy and grading disclaimer to continue.")
+            if not errors:
+                with connect() as db:
+                    db.execute(
+                        "INSERT INTO standalone_workspace_agreements "
+                        "(slug, email, institution, department, policy_version, accepted_at) VALUES (?,?,?,?,?,?)",
+                        (slug, values["email"], values["institution"], values["department"],
+                         STANDALONE_USAGE_POLICY_VERSION, int(time.time())),
+                    )
+                return redirect(url_for("standalone_workspace", slug=slug, view="print"))
+        return render_template(
+            "standalone_agreement.html", design=dict(design), slug=slug, errors=errors, values=values,
+            policy_version=STANDALONE_USAGE_POLICY_VERSION, current_year=datetime.now(timezone.utc).year,
+        )
+
+    @app.get("/usage-policy")
+    def usage_policy():
+        return render_template(
+            "usage_policy.html", policy_version=STANDALONE_USAGE_POLICY_VERSION,
+            current_year=datetime.now(timezone.utc).year,
         )
 
     @app.get("/standalone/<slug>")
     def standalone_workspace(slug):
         design = standalone_design(slug)
         if not design: abort(404)
+        if standalone_agreement_pending(design):
+            return redirect(url_for("standalone_agreement", slug=slug))
         if request.args.get("format") == "json":
-            return jsonify({"forms": [{"form_id": design["form_id"], "title": design["title"], "question_count": design["question_count"], "choice_count": design["choice_count"]}], "roster": [], "roster_available": True, "roster_error": ""})
+            return jsonify({"forms": [standalone_manifest(design)], "roster": [], "roster_available": True, "roster_error": ""})
         view = request.args.get("view", "print")
         if view == "print":
             return render_template("standalone_print.html", design=dict(design), slug=slug,
@@ -1881,26 +2024,35 @@ def create_app():
             "standalone": True, "slug": slug,
             "forms_url": url_for("standalone_forms_manifest", slug=slug),
             "render_url": url_for("standalone_render_scan_page", slug=slug),
+            "render_batch_url": url_for("standalone_render_scan_pages", slug=slug),
             "dummy_url": url_for("standalone_dummy_zip", slug=slug),
             "grade_url": url_for("standalone_workspace", slug=slug) + "?view=grade&format=json",
             "scan_url": url_for("standalone_workspace", slug=slug, view="scan"),
             "grade_path": url_for("standalone_workspace", slug=slug) + "?view=grade",
         }
-        return render_template("scan.html", context=context, standalone=True, standalone_design=dict(design),
-                               scan_runtime=runtime, initial_phase="grade" if view == "grade" else "scan",
-                               dummy_forms=[], dummy_student_count=0, dummy_enrollment_error="",
-                               current_year=datetime.now(timezone.utc).year)
+        response = make_response(render_template(
+            "scan.html", context=context, standalone=True, standalone_design=dict(design),
+            scan_runtime=runtime, initial_phase="grade" if view == "grade" else "scan",
+            dummy_forms=[], dummy_student_count=0, dummy_enrollment_error="",
+            current_year=datetime.now(timezone.utc).year,
+        ))
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/standalone/<slug>/forms.json")
     def standalone_forms_manifest(slug):
         design = standalone_design(slug)
         if not design: abort(404)
-        return jsonify([{"form_id": design["form_id"], "title": design["title"], "question_count": design["question_count"], "choice_count": design["choice_count"], "legacy_layout_version": LEGACY_SHEET_LAYOUT_VERSION}])
+        if standalone_agreement_pending(design):
+            return redirect(url_for("standalone_agreement", slug=slug))
+        return jsonify([standalone_manifest(design)])
 
     @app.get("/standalone/<slug>/answer-sheet.pdf")
     def standalone_answer_sheet(slug):
         design = standalone_design(slug)
         if not design: abort(404)
+        if standalone_agreement_pending(design):
+            return redirect(url_for("standalone_agreement", slug=slug))
         filename = secure_filename(design["title"]) or "answer-sheet"
         return send_file(make_answer_sheet(design, design["logo"]), mimetype="application/pdf", as_attachment=True,
                          download_name=f"{filename}.pdf")
@@ -1909,6 +2061,8 @@ def create_app():
     def standalone_dummy_zip(slug):
         design = standalone_design(slug)
         if not design: abort(404)
+        if standalone_agreement_pending(design):
+            return redirect(url_for("standalone_agreement", slug=slug))
         payload = request.get_json(silent=True) or {}
         raw_roster = payload.get("roster")
         if not isinstance(raw_roster, list) or not 1 <= len(raw_roster) <= 200:
@@ -1929,6 +2083,26 @@ def create_app():
         correct_question_sets, item_qualities = dummy_correct_question_sets(
             score_counts, question_count, rng, multi_answer_question=1
         )
+        answer_slots = [
+            (student_index, question_number)
+            for student_index in range(len(learners))
+            for question_number in range(1, question_count + 1)
+        ]
+        correction_count = min(
+            len(answer_slots), max(len(learners), math.ceil(len(answer_slots) * 0.02))
+        )
+        correction_slots = {
+            (student_index, rng.randrange(1, question_count + 1))
+            for student_index in range(len(learners))
+        }
+        remaining_slots = [slot for slot in answer_slots if slot not in correction_slots]
+        correction_slots.update(rng.sample(
+            remaining_slots, correction_count - len(correction_slots)
+        ))
+        incomplete_id_count = min(
+            len(learners), max(5, math.ceil(len(learners) * 0.05))
+        )
+        incomplete_id_indices = set(rng.sample(range(len(learners)), incomplete_id_count))
         output = BytesIO()
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             key = {"name": "Answer Sheet", "student_id": "000000000", "sis_login_id": ""}
@@ -1936,6 +2110,7 @@ def create_app():
                 design, key, design["logo"], sample_index=0, seed=1, answers=correct_answers,
                 layout_version=SHEET_LAYOUT_VERSION).getvalue())
             for index, learner in enumerate(learners):
+                learner = dict(learner)
                 answers = []
                 for question, keyed in enumerate(correct_answers):
                     options = list(keyed) if isinstance(keyed, list) else [keyed]
@@ -1943,11 +2118,22 @@ def create_app():
                         answers.append(options if question == 0 else options[0])
                     else:
                         answers.append(rng.choice([choice for choice in range(choice_count) if choice not in options]))
+                crossed_answers = {}
+                for question_number in range(1, question_count + 1):
+                    if (index, question_number) not in correction_slots:
+                        continue
+                    answer = answers[question_number - 1]
+                    answer_choices = answer if isinstance(answer, (list, tuple, set)) else [answer]
+                    alternatives = [choice for choice in range(choice_count) if choice not in answer_choices]
+                    crossed_answers[question_number] = rng.choice(alternatives)
+                if index in incomplete_id_indices:
+                    learner["student_id"] = learner["student_id"][:-1]
                 filename = secure_filename(learner["name"]) or f"student-{index + 1}"
                 archive.writestr(f"{index + 1:03d}-{filename}.pdf", make_sample_response_pdf(
                     design, learner, design["logo"], sample_index=index + 1, seed=1, answers=answers,
-                    layout_version=SHEET_LAYOUT_VERSION).getvalue())
-            archive.writestr("README.txt", "Dummy scan set generated from the imported roster. The answer key uses student number 000000000. Question 1 has two keyed answers. Scores follow a 40–90% bell-shaped profile with occasional outliers. Item difficulty and discrimination vary across the set.\n" + "Item profile: " + ", ".join(f"Q{number + 1} {quality}" for number, quality in enumerate(item_qualities)) + "\n")
+                    layout_version=SHEET_LAYOUT_VERSION, fill_id_bubbles=index not in incomplete_id_indices,
+                    crossed_answers=crossed_answers).getvalue())
+            archive.writestr("README.txt", "Dummy scan set generated from the imported roster. The answer key uses student number 000000000. Question 1 has two keyed answers. Scores follow a 40–90% bell-shaped profile with occasional outliers. Item difficulty and discrimination vary across the set.\n" + f"Incomplete student IDs: {incomplete_id_count} of {len(learners)} student sheets.\n" + f"Filled answer then crossed out: {correction_count} of {len(answer_slots)} student answers.\n" + "Item profile: " + ", ".join(f"Q{number + 1} {quality}" for number, quality in enumerate(item_qualities)) + "\n")
         output.seek(0)
         filename = secure_filename(design["title"]) or "answer-sheet"
         return send_file(output, mimetype="application/zip", as_attachment=True,
@@ -1955,7 +2141,10 @@ def create_app():
 
     @app.post("/standalone/<slug>/render-page")
     def standalone_render_scan_page(slug):
-        if not standalone_design(slug): abort(404)
+        design = standalone_design(slug)
+        if not design: abort(404)
+        if standalone_agreement_pending(design):
+            return redirect(url_for("standalone_agreement", slug=slug))
         request.max_content_length = 64 * 1024 * 1024
         if request.mimetype != "application/pdf" or request.headers.get("X-Scan-Render") != "1":
             abort(415, "A PDF scan is required.")
@@ -1973,6 +2162,43 @@ def create_app():
         except (pymupdf.FileDataError, pymupdf.EmptyFileError, ValueError):
             abort(400, "The PDF page could not be rendered.")
         response = send_file(BytesIO(png), mimetype="image/png", download_name="scan-page.png")
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.post("/standalone/<slug>/render-pages")
+    def standalone_render_scan_pages(slug):
+        design = standalone_design(slug)
+        if not design: abort(404)
+        if standalone_agreement_pending(design):
+            return redirect(url_for("standalone_agreement", slug=slug))
+        request.max_content_length = 64 * 1024 * 1024
+        if request.mimetype != "application/pdf" or request.headers.get("X-Scan-Render") != "1":
+            abort(415, "A PDF scan is required.")
+        first = request.args.get("first", type=int)
+        last = request.args.get("last", type=int)
+        target_height = request.args.get("height", default=1600, type=int)
+        if first is None or last is None or first < 1 or last < first or last - first >= 25:
+            abort(400, "Request between 1 and 25 consecutive PDF pages.")
+        if target_height not in (1400, 1600):
+            abort(400, "Unsupported scan render height.")
+        pdf_bytes = request.get_data()
+        if not pdf_bytes.startswith(b"%PDF-"):
+            abort(400, "The uploaded file is not a PDF.")
+        output = BytesIO()
+        try:
+            with pymupdf.open(stream=pdf_bytes, filetype="pdf") as document:
+                if last > len(document): abort(400, "The requested page does not exist.")
+                with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+                    for page_number in range(first, last + 1):
+                        page = document[page_number - 1]
+                        scale = min(2.8, target_height / max(page.rect.width, page.rect.height))
+                        pixmap = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale),
+                                                 colorspace=pymupdf.csRGB, alpha=False)
+                        archive.writestr(f"{page_number}.png", pixmap.tobytes("png"))
+        except (pymupdf.FileDataError, pymupdf.EmptyFileError, ValueError):
+            abort(400, "The PDF pages could not be rendered.")
+        output.seek(0)
+        response = send_file(output, mimetype="application/zip", download_name="scan-pages.zip")
         response.headers["Cache-Control"] = "no-store"
         return response
 

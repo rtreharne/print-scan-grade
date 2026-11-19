@@ -39,6 +39,7 @@ const previewContent = $("#uol-preview-content");
 const previewPrevious = $("#uol-preview-previous");
 const previewNext = $("#uol-preview-next");
 const previewClose = $("#uol-preview-close");
+const previewSaveAnswers = $("#uol-preview-save-answers");
 const roster = [];
 let results = [];
 let scanning = false;
@@ -47,6 +48,7 @@ let previewPageId = "";
 let previewImageUrl = "";
 let previewNameImageUrl = "";
 let previewZoom = 1;
+const pendingPreviewAnswers = new Map();
 let analysisScheme = "undergraduate";
 let analysisDashboard = null;
 let sortKey = "name", sortDirection = "asc";
@@ -537,6 +539,11 @@ async function openPreview(id) {
   const result = results.find((item) => item.id === id), key = selectedKey();
   if (!result || !key || !previewDialog) return;
   previewPageId = id;
+  pendingPreviewAnswers.clear();
+  if (previewSaveAnswers) {
+    previewSaveAnswers.disabled = true;
+    previewSaveAnswers.textContent = "Save answer changes";
+  }
   const student = studentFor(result);
   previewTitle.textContent = student?.name || result.name || "Unidentified student";
   previewMeta.textContent = `${resultLabel(result)} · ${scoreResult(result, key)}/70 (${(scoreResult(result, key) / 70 * 100).toFixed(1)}%)`;
@@ -585,7 +592,19 @@ async function openPreview(id) {
   for (let index = 0; index < 70; index += 1) {
     const row = document.createElement("tr");
     const question = document.createElement("th"); question.scope = "row"; question.textContent = String(index + 1);
-    const scanned = document.createElement("td"); scanned.textContent = result.answers[index] || "Blank"; scanned.className = `scan-answer-status ${result.answers[index] ? "marked" : "not_selected"}`;
+    const scanned = document.createElement("td"); scanned.className = `scan-answer-status ${result.answers[index] ? "marked" : "not_selected"}`;
+    const answerSelect = document.createElement("select"); answerSelect.className = "scan-answer-select";
+    answerSelect.setAttribute("aria-label", `Scanned answer for question ${index + 1}`);
+    answerSelect.add(new Option("No answer", ""));
+    for (const answer of "ABCDE") answerSelect.add(new Option(answer, answer));
+    answerSelect.value = result.answers[index] || "";
+    answerSelect.addEventListener("change", () => {
+      const original = result.answers[index] || "";
+      if (answerSelect.value === original) pendingPreviewAnswers.delete(index);
+      else pendingPreviewAnswers.set(index, answerSelect.value);
+      if (previewSaveAnswers) previewSaveAnswers.disabled = pendingPreviewAnswers.size === 0;
+    });
+    scanned.append(answerSelect);
     const correct = document.createElement("td"); correct.textContent = key.answers[index] || "—";
     const verdict = document.createElement("td"); const isCorrect = result.answers[index] && result.answers[index] === key.answers[index];
     verdict.textContent = isCorrect ? "Correct" : "Incorrect"; verdict.className = `scan-answer-result ${isCorrect ? "correct" : "incorrect"}`;
@@ -597,7 +616,7 @@ async function openPreview(id) {
   previewPrevious.disabled = position <= 0; previewNext.disabled = position < 0 || position >= studentPages.length - 1;
   previewPrevious.onclick = () => openPreview(studentPages[position - 1].id);
   previewNext.onclick = () => openPreview(studentPages[position + 1].id);
-  previewDialog.showModal();
+  if (!previewDialog.open) previewDialog.showModal();
 }
 
 keySelect?.addEventListener("change", () => { keyPageId = keySelect.value; saveState(); renderResults(); });
@@ -612,12 +631,24 @@ $("#uol-preview-zoom-in")?.addEventListener("click", () => setPreviewZoom(previe
 $("#uol-preview-zoom-out")?.addEventListener("click", () => setPreviewZoom(previewZoom - .25));
 $("#uol-preview-zoom-fit")?.addEventListener("click", () => setPreviewZoom(1));
 previewClose?.addEventListener("click", () => previewDialog.close());
+previewSaveAnswers?.addEventListener("click", async () => {
+  const result = results.find((item) => item.id === previewPageId);
+  if (!result || pendingPreviewAnswers.size === 0) return;
+  previewSaveAnswers.disabled = true;
+  previewSaveAnswers.textContent = "Saving answer changes…";
+  for (const [index, answer] of pendingPreviewAnswers) result.answers[index] = answer;
+  pendingPreviewAnswers.clear();
+  saveState();
+  renderResults();
+  await openPreview(result.id);
+});
 previewImageToggle?.addEventListener("click", () => {
   previewImagePanel.hidden = !previewImagePanel.hidden;
   previewImageToggle.textContent = previewImagePanel.hidden ? "View annotated scan" : "Hide annotated scan";
 });
 previewDialog?.addEventListener("close", () => {
   previewPageId = "";
+  pendingPreviewAnswers.clear();
   previewImagePanel.hidden = true;
   if (previewImageUrl) { URL.revokeObjectURL(previewImageUrl); previewImageUrl = ""; }
   previewImage.removeAttribute("src");
@@ -630,6 +661,13 @@ $("#uol-copy-iframe")?.addEventListener("click", async (event) => {
   try { await navigator.clipboard.writeText(field.value); }
   catch (_) { field.focus(); field.select(); document.execCommand("copy"); }
   event.currentTarget.textContent = "Iframe code copied";
+});
+
+$("#uol-copy-link")?.addEventListener("click", async (event) => {
+  const field = $("#uol-share-link");
+  try { await navigator.clipboard.writeText(field.value); }
+  catch (_) { field.focus(); field.select(); document.execCommand("copy"); }
+  event.currentTarget.textContent = "Shareable link copied";
 });
 
 readSaved();

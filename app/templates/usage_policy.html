@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b2b">
+  <title>Usage policy · PrintScanGrade</title>
+  <link rel="icon" href="{{ url_for('static', filename='logo.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='print.css', v=3) }}">
+</head>
+<body>
+  <main class="workspace agreement-workspace">
+    <header class="workspace-header"><a class="brand" href="{{ url_for('home') }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="42" height="42"><span>PrintScanGrade</span></a><a class="course-badge" href="{{ url_for('standalone_home') }}">Standalone workspace</a></header>
+    <section class="intro"><p class="eyebrow">Policy</p><h1>Usage policy</h1><p>Read this before creating or using a standalone workspace.</p></section>
+    <section class="panel agreement-policy-panel">{% include '_standalone_usage_policy.html' %}</section>
+    <footer class="standalone-footer"><a class="workspace-footer-brand" href="{{ url_for('home') }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="30" height="30"><span>PrintScanGrade</span></a><p>© PrintScanGrade {{ current_year }}</p></footer>
+  </main>
+</body>
+</html>

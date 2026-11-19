@@ -3,6 +3,7 @@ import json
 import tempfile
 import time
 import unittest
+import zipfile
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -53,10 +54,33 @@ class EntryFlowsTest(unittest.TestCase):
         self.assertEqual(self.client.post("/print/logo", data={}).status_code, 403)
 
     def test_standalone_workspaces_still_work(self):
-        self.assertEqual(self.client.get("/standalone").status_code, 200)
+        setup = self.client.get("/standalone")
+        self.assertEqual(setup.status_code, 200)
+        self.assertIn(b"Existing FORM code", setup.data)
         response = self.client.post("/standalone", data={"title": "Test sheet", "question_count": 20, "choice_count": 4})
         self.assertEqual(response.status_code, 302)
-        path = response.location.split("?")[0]
+        agreement_path = response.location
+        path = agreement_path.removesuffix("/agreement")
+        self.assertEqual(self.client.get(f"{path}?view=scan").location, agreement_path)
+        agreement = self.client.get(agreement_path)
+        self.assertEqual(agreement.status_code, 200)
+        self.assertIn(b"PrintScanGrade usage policy", agreement.data)
+        accepted = self.client.post(agreement_path, data={
+            "email": "teacher@example.test", "institution": "Example University",
+            "department": "School of Chemistry", "accept_policy": "yes",
+        })
+        self.assertEqual(accepted.status_code, 302)
+        self.assertEqual(accepted.location, f"{path}?view=print")
+        slug = path.rsplit("/", 1)[-1]
+        with main.connect() as db:
+            agreement_row = db.execute(
+                "SELECT email, institution, department, policy_version "
+                "FROM standalone_workspace_agreements WHERE slug=?", (slug,)
+            ).fetchone()
+        self.assertEqual(dict(agreement_row)["email"], "teacher@example.test")
+        self.assertEqual(dict(agreement_row)["institution"], "Example University")
+        self.assertEqual(dict(agreement_row)["department"], "School of Chemistry")
+        self.assertEqual(self.client.get("/usage-policy").status_code, 200)
         for view in ["print", "scan", "grade"]:
             self.assertEqual(self.client.get(f"{path}?view={view}").status_code, 200)
             legacy = self.client.get(f"/standalone/uol_legacy?view={view}")
@@ -65,6 +89,46 @@ class EntryFlowsTest(unittest.TestCase):
         pdf = self.client.get(path + "/answer-sheet.pdf")
         self.assertEqual(pdf.status_code, 200)
         self.assertTrue(pdf.data.startswith(b"%PDF-"))
+        imported = self.client.post("/standalone", data={
+            "title": "CHEM101 In-Class Test", "question_count": 15,
+            "choice_count": 4, "existing_form_code": "6945b3d6-b7e",
+        })
+        self.assertEqual(imported.status_code, 302)
+        imported_agreement_path = imported.location
+        imported_path = imported_agreement_path.removesuffix("/agreement")
+        self.client.post(imported_agreement_path, data={
+            "email": "teacher@example.test", "institution": "Example University",
+            "department": "School of Chemistry", "accept_policy": "yes",
+        })
+        imported_form = self.client.get(imported_path + "/forms.json").json[0]
+        self.assertEqual(imported_form["question_count"], 15)
+        self.assertEqual(imported_form["choice_count"], 4)
+        self.assertEqual(imported_form["accepted_form_ids"], [imported_form["form_id"], "6945b3d6-b7e"])
+
+    def test_standalone_batch_renderer_returns_requested_pages(self):
+        created = self.client.post("/standalone", data={"title": "Render check", "question_count": 15,
+                                                        "choice_count": 4})
+        path = created.location.removesuffix("/agreement")
+        self.client.post(created.location, data={
+            "email": "teacher@example.test", "institution": "Example University",
+            "department": "Chemistry", "accept_policy": "yes",
+        })
+        scan_workspace = self.client.get(path + "?view=scan")
+        self.assertEqual(scan_workspace.headers["Cache-Control"], "no-store")
+        self.assertIn(b"scan.js?v=107", scan_workspace.data)
+        pdf = self.client.get(path + "/answer-sheet.pdf").data
+        for height in (1400, 1600):
+            response = self.client.post(path + f"/render-pages?first=1&last=1&height={height}",
+                                        data=pdf, content_type="application/pdf",
+                                        headers={"X-Scan-Render": "1"})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            with zipfile.ZipFile(BytesIO(response.data)) as pages:
+                self.assertEqual(pages.namelist(), ["1.png"])
+                self.assertTrue(pages.read("1.png").startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(self.client.post(path + "/render-pages?first=1&last=26",
+                                          data=pdf, content_type="application/pdf",
+                                          headers={"X-Scan-Render": "1"}).status_code, 400)
 
     def test_admin_login_lands_on_lti_clients(self):
         response = self.client.post("/admin/login", data={"username": "admin", "password": "test-password"})

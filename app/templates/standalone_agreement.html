@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b2b">
+  <title>Confirm standalone workspace · PrintScanGrade</title>
+  <link rel="icon" href="{{ url_for('static', filename='logo.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='print.css', v=3) }}">
+</head>
+<body>
+  <main class="workspace agreement-workspace">
+    <header class="workspace-header"><a class="brand" href="{{ url_for('home') }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="42" height="42"><span>PrintScanGrade</span></a><span class="course-badge">Standalone workspace</span></header>
+    <section class="intro"><p class="eyebrow">One final step</p><h1>Confirm responsible use</h1><p>Before opening <strong>{{ design.title }}</strong>, tell us who is responsible for this workspace and agree to the usage policy.</p></section>
+    <section class="panel agreement-policy-panel">{% include '_standalone_usage_policy.html' %}</section>
+    <section class="panel agreement-form-panel" aria-labelledby="agreement-form-title">
+      <h2 id="agreement-form-title">Workspace contact</h2>
+      <p class="muted">We store these contact details and your policy acceptance with this workspace.</p>
+      {% if errors %}<div class="errors"><ul>{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul></div>{% endif %}
+      <form method="post" action="{{ agreement_action|default('') }}" class="design-form">
+        <label for="agreement-email">Email address</label><input id="agreement-email" name="email" type="email" maxlength="254" required value="{{ values.email }}" autocomplete="email">
+        <label for="agreement-institution">Institution</label><input id="agreement-institution" name="institution" maxlength="160" required value="{{ values.institution }}" autocomplete="organization">
+        <label for="agreement-department">School or department</label><input id="agreement-department" name="department" maxlength="160" required value="{{ values.department }}">
+        <label class="agreement-checkbox" for="accept-policy"><input id="accept-policy" name="accept_policy" type="checkbox" value="yes" required> <span>I have read and agree to the PrintScanGrade usage policy, including the assessment responsibility and liability disclaimer.</span></label>
+        <button class="primary-button" type="submit">Agree and open workspace</button>
+      </form>
+    </section>
+    <footer class="standalone-footer"><a class="workspace-footer-brand" href="{{ url_for('home') }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="30" height="30"><span>PrintScanGrade</span></a><p>© PrintScanGrade {{ current_year }}</p></footer>
+  </main>
+</body>
+</html>

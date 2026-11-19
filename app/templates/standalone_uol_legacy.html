@@ -6,8 +6,8 @@
   <meta name="theme-color" content="#101b2b">
   <title>UoL legacy sheets · Print Scan Grade</title>
   <link rel="icon" href="{{ url_for('static', filename='logo.svg') }}" type="image/svg+xml">
-  <link rel="stylesheet" href="{{ url_for('static', filename='print.css') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='scan.css', v=6) }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='print.css', v=5) }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='scan.css', v=14) }}">
   <script src="{{ url_for('static', filename='vendor/jszip.min.js') }}"></script>
 </head>
 <body class="standalone-embedded-workspace">
@@ -16,18 +16,33 @@
       <a class="brand" href="{{ url_for('standalone_home') }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="42" height="42"><span>Print Scan Grade</span></a>
       <span class="course-badge">University of Liverpool MCQ sheets</span>
     </header>
-    <nav class="phase-nav" aria-label="Workspace phases">
+    {% if view != 'agreement' %}<nav class="phase-nav" aria-label="Workspace phases">
       <a class="{{ 'active' if view == 'print' else '' }}" href="{{ url_for('standalone_uol_legacy', view='print') }}">1 · Print</a>
       <a class="{{ 'active' if view == 'scan' else '' }}" href="{{ url_for('standalone_uol_legacy', view='scan') }}">2 · Scan</a>
       <a class="{{ 'active' if view == 'grade' else '' }}" href="{{ url_for('standalone_uol_legacy', view='grade') }}">3 · Results</a>
-    </nav>
+    </nav>{% endif %}
 
-    {% if view == 'print' %}
-    <section class="intro"><p class="eyebrow">Phase 01 · Print</p><h1>Embed the UoL legacy scanner</h1><p>This workspace reads existing University of Liverpool answer sheets. It does not create or print sheets.</p></section>
-    <section class="panel scan-panel"><div class="scan-heading"><div><p class="eyebrow">Embed this workspace</p><h2>Iframe code</h2></div></div>
-      <label class="scan-key-field" for="uol-iframe-code"><span>Copy this code into your VLE</span><textarea id="uol-iframe-code" class="review-select" rows="4" readonly><iframe src="{{ public_base_url }}{{ url_for('standalone_uol_legacy', view='scan') }}" title="University of Liverpool MCQ sheet scanner" width="100%" height="1000" style="border:0"></iframe></textarea></label>
-      <button id="uol-copy-iframe" class="download-button" type="button">Copy iframe code</button>
+    {% if view == 'agreement' %}
+    <section class="intro"><h1>Confirm responsible use</h1><p>Before opening the University of Liverpool MCQ workspace, tell us who is responsible and agree to the usage policy.</p></section>
+    <section class="panel agreement-policy-panel">{% include '_standalone_usage_policy.html' %}</section>
+    <section class="panel agreement-form-panel" aria-labelledby="agreement-form-title">
+      <h2 id="agreement-form-title">Workspace contact</h2>
+      <p class="muted">We store these contact details and your policy acceptance with this workspace.</p>
+      {% if errors %}<div class="errors"><ul>{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul></div>{% endif %}
+      <form method="post" action="{{ url_for('standalone_uol_legacy', view='agreement') }}" class="design-form">
+        <label for="agreement-email">Email address</label><input id="agreement-email" name="email" type="email" maxlength="254" required value="{{ values.email }}" autocomplete="email">
+        <label for="agreement-institution">Institution</label><input id="agreement-institution" name="institution" maxlength="160" required value="{{ values.institution }}" autocomplete="organization">
+        <label for="agreement-department">School or department</label><input id="agreement-department" name="department" maxlength="160" required value="{{ values.department }}">
+        <label class="agreement-checkbox" for="accept-policy"><input id="accept-policy" name="accept_policy" type="checkbox" value="yes" required> <span>I have read and agree to the PrintScanGrade usage policy, including the assessment responsibility and liability disclaimer.</span></label>
+        <button class="primary-button" type="submit">Agree and open workspace</button>
+      </form>
     </section>
+    {% elif view == 'print' %}
+    <section class="intro"><p class="eyebrow">Phase 01 · Print</p><h1>Embed the UoL legacy scanner</h1><p>This workspace reads existing University of Liverpool answer sheets. It does not create or print sheets.</p></section>
+    <section class="panel scan-panel"><div class="scan-heading"><div><p class="eyebrow">Embed this workspace</p><h2>Share or embed</h2></div></div>
+      <div id="uol-embed-controls" class="embed-controls"><div class="embed-share-block"><label class="scan-key-field" for="uol-share-link"><span>Shareable workspace link</span><input id="uol-share-link" class="review-select" type="url" readonly value="{{ public_base_url }}{{ url_for('standalone_uol_legacy', view='agreement') }}"></label><button id="uol-copy-link" class="download-button" type="button">Copy shareable link</button><p class="field-help embed-reminder">Save or bookmark this private link now and share it only with people who need this workspace. We can’t retrieve it for you later.</p></div><div class="embed-code-block"><label class="scan-key-field" for="uol-iframe-code"><span>Iframe code</span><textarea id="uol-iframe-code" class="review-select" rows="4" readonly><iframe src="{{ public_base_url }}{{ url_for('standalone_uol_legacy', view='agreement') }}" title="University of Liverpool MCQ sheet workspace" width="100%" height="1000" style="border:0"></iframe></textarea></label><button id="uol-copy-iframe" class="download-button" type="button">Copy iframe code</button></div></div>
+    </section>
+    {% include '_answer_key_guidance.html' %}
     {% elif view == 'scan' %}
     <section class="intro"><p class="eyebrow">Phase 02 · Scan</p><h1>Read UoL answer sheets</h1><p>Import the class roster first, then upload one PDF or a ZIP containing any number of multi-page PDFs. Pages are processed locally in this browser, including grayscale scans.</p></section>
     <section class="panel scan-panel" aria-labelledby="uol-roster-title"><div class="scan-heading"><div><p class="eyebrow">Start here</p><h2 id="uol-roster-title">Import student roster</h2></div><span id="uol-roster-status" class="privacy-mark">Roster required before scanning</span></div>
@@ -67,8 +82,8 @@
         <div class="unidentified-assignment"><label for="uol-identify-search">Search roster<input id="uol-identify-search" class="review-select" type="search" placeholder="Type to search…" autocomplete="off"></label><select id="uol-identify-match" class="review-select" aria-label="Matching roster student"></select><button id="uol-identify-assign" class="primary-button" type="button" disabled>Assign and next</button></div>
       </dialog>
       <dialog id="uol-preview-dialog" class="scan-preview-dialog" aria-labelledby="uol-preview-title">
-        <div class="scan-preview-heading"><div><p class="eyebrow">Student review</p><h2 id="uol-preview-title">Scanned answer sheet</h2><p id="uol-preview-meta" class="muted"></p></div><div class="scan-preview-actions"><button id="uol-preview-previous" class="download-button" type="button">← Previous student</button><button id="uol-preview-next" class="download-button" type="button">Next student →</button><button id="uol-preview-close" class="download-button" type="button">Close</button></div></div>
-        <div class="scan-preview-actions"><button id="uol-preview-reassign" class="download-button" type="button">Change student match</button><button id="uol-preview-image-toggle" class="download-button original-scan-toggle" type="button">View annotated scan</button></div>
+        <div class="scan-preview-heading"><div><p class="eyebrow">Student review</p><h2 id="uol-preview-title">Scanned answer sheet</h2><p id="uol-preview-meta" class="muted"></p></div><div class="scan-preview-actions scan-preview-header-actions"><button id="uol-preview-previous" class="download-button" type="button">← Previous student</button><button id="uol-preview-next" class="download-button" type="button">Next student →</button><button id="uol-preview-close" class="download-button scan-preview-close-button" type="button">Close</button></div></div>
+        <div class="scan-preview-actions scan-preview-tools"><button id="uol-preview-reassign" class="download-button" type="button">Change student match</button><button id="uol-preview-image-toggle" class="download-button original-scan-toggle" type="button">View annotated scan</button><button id="uol-preview-save-answers" class="download-button scan-preview-save-answers" type="button" disabled>Save answer changes</button></div>
         <section id="uol-preview-image-panel" class="original-scan-panel" hidden>
           <p class="field-help">Original scan with circle overlays only. Green circles show the response read from this page; blue circles show the keyed answer.</p>
           <div class="unidentified-name-preview uol-identity-preview"><p class="field-help">Name · original scan</p><img id="uol-preview-name-image" alt="Enlarged name from the original scanned sheet"></div>
@@ -79,8 +94,8 @@
       </dialog>
     </section>
     {% endif %}
-    <footer class="standalone-footer"><hr><span>© Print Scan Grade {{ current_year }}</span></footer>
+    <footer class="standalone-footer"><a class="workspace-footer-brand" href="{{ url_for('home') }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="30" height="30"><span>PrintScanGrade</span></a><p>© PrintScanGrade {{ current_year }}</p></footer>
   </main>
-  <script type="module" src="{{ url_for('static', filename='standalone-uol-legacy.js', v=12) }}"></script>
+  <script type="module" src="{{ url_for('static', filename='standalone-uol-legacy.js', v=13) }}"></script>
 </body>
 </html>

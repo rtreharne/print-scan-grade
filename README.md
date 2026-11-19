@@ -80,12 +80,13 @@ The Compose service is named `print-scan-grade`; the application's name is **Pri
 
 ## Standalone workflow
 
-1. Open `/standalone` and create a design with a title, 1–60 questions and 2–8 answer choices. You can add a PNG or JPEG logo.
-2. Download the printable A4 PDF. Page 1 is the answer sheet; page 2 is the student guide. Copy the iframe code into your VLE if you want an embedded workspace.
-3. Complete an answer-key sheet using student number `000000000`.
-4. Open Scan. Import a roster CSV if you want student matching, then upload a PDF or ZIP containing PDFs. Multi-page documents are supported, and generated student-guide pages are skipped.
-5. Open Grade, choose the scan set and confirm its answer key. Use student review to compare extracted answers with the annotated page.
-6. Resolve unidentified students, inspect Analysis, and download the results CSV.
+1. Open `/standalone` and create a design with a title, 1–60 questions and 2–8 answer choices. You can add a PNG or JPEG logo, or enter an earlier printed `FORM` code so the new workspace recognises those sheets.
+2. For a newly created workspace, provide a responsible contact email, institution and school or department, then accept the usage policy and grading disclaimer.
+3. Download the printable A4 PDF. Page 1 is the answer sheet; page 2 is the student guide. Copy the iframe code into your VLE if you want an embedded workspace.
+4. Complete an answer-key sheet using student number `000000000`.
+5. Open Scan. Import a roster CSV if you want student matching, then upload a PDF or ZIP containing PDFs. Multi-page documents are supported, and generated student-guide pages are skipped.
+6. Open Grade, choose the scan set and confirm its answer key. Use student review to compare extracted answers with the annotated page.
+7. Resolve unidentified students, inspect Analysis, and download the results CSV.
 
 The roster importer lets you map the name and student-number fields. A nine-digit number can appear within a longer source value, such as a SIS login ID.
 
@@ -169,7 +170,7 @@ The browser scan workflows decode uploaded PDFs, extract marks, grade answers an
 | Data | Where it lives |
 | --- | --- |
 | Scan results, previews, imported rosters and manual student matches | Browser storage: IndexedDB and/or localStorage. |
-| Answer-sheet designs and uploaded logos | Server SQLite database. |
+| Answer-sheet designs, uploaded logos and standalone workspace contact/usage-policy acceptance records | Server SQLite database. |
 | LTI clients, deployments and registration state | Server SQLite database. |
 | LTI course rosters | Fetched by the server and held in memory for use by the workspace; not saved as roster records in SQLite. |
 | App secrets and administrator credentials | `.env`. |
