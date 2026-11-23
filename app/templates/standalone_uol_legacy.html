@@ -62,7 +62,7 @@
     {% else %}
     <section class="intro"><p class="eyebrow">Phase 03 · Grade</p><h1>Grade answer sheets</h1><p>Select the marked answer sheet, confirm student matches, then inspect each detected response against its annotated scan.</p></section>
     <section class="panel scan-panel legacy-grade-panel">
-      <div class="grade-detail-actions"><strong id="uol-results-summary">No pages scanned yet.</strong><button id="uol-download-csv" class="download-button" type="button" disabled>Download CSV</button></div>
+      <div class="grade-detail-actions"><strong id="uol-results-summary">No pages scanned yet.</strong><button id="uol-download-xlsx" class="download-button" type="button" disabled>Export XLSX</button></div>
       <label id="uol-key-field" class="scan-key-field" for="uol-key-select" hidden><span>Master answer sheet</span><select id="uol-key-select" class="review-select"></select></label>
       <p id="uol-key-help" class="scan-key-help" hidden>Select the marked master page. It is excluded from the student list and provides the 70 keyed answers used for scores.</p>
       <div id="uol-grade-message" class="scan-errors roster-error" role="status" hidden></div>
@@ -96,6 +96,6 @@
     {% endif %}
     <footer class="standalone-footer"><a class="workspace-footer-brand" href="{{ url_for('home') }}"><img src="{{ url_for('static', filename='logo.svg') }}" alt="" width="30" height="30"><span>PrintScanGrade</span></a><p>© PrintScanGrade {{ current_year }}</p></footer>
   </main>
-  <script type="module" src="{{ url_for('static', filename='standalone-uol-legacy.js', v=13) }}"></script>
+  <script type="module" src="{{ url_for('static', filename='standalone-uol-legacy.js', v=14) }}"></script>
 </body>
 </html>

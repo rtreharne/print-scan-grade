@@ -1,5 +1,6 @@
 import * as pdfjsLib from "./vendor/pdf.min.mjs";
-import { readLegacyAnswerImage, mapLegacyPoint } from "./legacy-reader.mjs";
+import { readLegacyAnswerImage, mapLegacyPoint } from "./legacy-reader.mjs?v=113";
+import { rosterCandidatesForPartialId, rosterCandidatesNearId } from "./id-roster-match.mjs?v=114";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("./vendor/pdf.worker.min.mjs", import.meta.url).toString();
 
@@ -27,6 +28,7 @@ const rescanStageBar = $("#rescan-stage-bar");
 const rescanStageLabel = $("#rescan-stage-label");
 const rescanResultMessage = $("#rescan-result-message");
 const csvButton = $("#download-csv");
+const annotatedSheetsButton = $("#download-annotated-sheets");
 const backToTopButton = $("#back-to-top");
 const courseRoster = [];
 const setKeyField = $("#set-key-field");
@@ -34,6 +36,8 @@ const setKeySelect = $("#set-key-select");
 const answerKeyRules = $("#answer-key-rules");
 const answerKeyRuleList = $("#answer-key-rule-list");
 const rosterRows = $("#roster-rows");
+const matchingSummary = $("#matching-summary");
+const resolveStudentsButton = $("#resolve-students");
 const rosterSortButtons = [...document.querySelectorAll("[data-roster-sort]")];
 let rosterSortKey = "name";
 let rosterSortDirection = "asc";
@@ -80,6 +84,8 @@ const originalScanImage = $("#original-scan-image");
 const unidentifiedDialog = $("#unidentified-dialog");
 const unidentifiedDialogTitle = $("#unidentified-dialog-title");
 const unidentifiedDialogMeta = $("#unidentified-dialog-meta");
+const unidentifiedRemaining = $("#unidentified-remaining");
+const unidentifiedIdImage = $("#unidentified-id-image");
 const unidentifiedNameImage = $("#unidentified-name-image");
 const unidentifiedNameStatus = $("#unidentified-name-status");
 const unidentifiedSearch = $("#unidentified-search");
@@ -88,6 +94,7 @@ const unidentifiedAssign = $("#unidentified-assign");
 let unidentifiedDialogSheet = null;
 let unidentifiedDialogNextId = "";
 let unidentifiedNameObjectUrl = "";
+let unidentifiedIdObjectUrl = "";
 const scanDashboard = $("#scan-dashboard");
 const gradeDashboard = $("#grade-dashboard");
 const gradeLink = document.querySelector("[data-grade-link]");
@@ -107,7 +114,7 @@ const MARK_MARGIN = 16;
 const CURRENT_MARK_MARGIN = 21;
 const ANSWER_READER_VERSION = 5;
 const RAW_SCAN_VERSION = 2;
-const ANNOTATION_VERSION = 15;
+const ANNOTATION_VERSION = 16;
 const CURRENT_SHEET_LAYOUT_VERSION = 7;
 const REGISTRATION_MARK_THRESHOLD = 160;
 const MAX_PDF_BYTES = 64 * 1024 * 1024;
@@ -115,6 +122,7 @@ const MAX_ZIP_BYTES = 256 * 1024 * 1024;
 const formsById = new Map();
 let genericScanTitle = "";
 const standaloneRosterFile = $("#standalone-roster-file");
+const standaloneRosterFileName = $("#standalone-roster-file-name");
 const standaloneRosterMapping = $("#standalone-roster-mapping");
 const standaloneRosterMessage = $("#standalone-roster-message");
 const copyStandaloneIframe = $("#copy-standalone-iframe");
@@ -228,7 +236,7 @@ function showStandaloneRosterMapping(rows) {
   };
   Object.values(selects).forEach((select) => select.addEventListener("change", updatePreview));
   nameMode.addEventListener("change", () => { applyNameMode(); updatePreview(); });
-  const confirm = document.createElement("button"); confirm.type = "button"; confirm.className = "primary-button"; confirm.textContent = "Confirm roster import";
+  const confirm = document.createElement("button"); confirm.type = "button"; confirm.className = "primary-button roster-import-confirm"; confirm.textContent = "Confirm roster import";
   confirm.addEventListener("click", async () => {
     const duplicateIds = new Set(); const seen = new Set(); const roster = [];
     for (const row of dataRows) {
@@ -245,7 +253,7 @@ function showStandaloneRosterMapping(rows) {
     }
     courseRoster.splice(0, courseRoster.length, ...roster);
     await persistScanState();
-    if (standaloneDummyZip) standaloneDummyZip.disabled = false;
+    if (standaloneDummyZip) standaloneDummyZip.setAttribute("aria-disabled", "false");
     standaloneRosterMessage.textContent = `Imported ${roster.length} students. ${dataRows.length - roster.length} row(s) without a unique nine-digit ID were skipped.`;
     standaloneRosterMessage.hidden = false;
     renderRosterTable();
@@ -257,6 +265,7 @@ function showStandaloneRosterMapping(rows) {
 
 standaloneRosterFile?.addEventListener("change", async () => {
   const file = standaloneRosterFile.files?.[0]; if (!file) return;
+  if (standaloneRosterFileName) standaloneRosterFileName.textContent = `${file.name} · ${formatBytes(file.size)}`;
   if (file.size > 4 * 1024 * 1024) { standaloneRosterMessage.textContent = "CSV files must be 4 MB or smaller."; standaloneRosterMessage.hidden = false; return; }
   const rows = parseCsv(await file.text());
   if (rows.length < 2) { standaloneRosterMessage.textContent = "Choose a CSV with a header row and at least one student."; standaloneRosterMessage.hidden = false; return; }
@@ -268,9 +277,11 @@ copyStandaloneIframe?.addEventListener("click", async () => {
   catch (_) { standaloneIframeCode.focus(); standaloneIframeCode.select(); document.execCommand("copy"); copyStandaloneIframe.textContent = "Iframe code copied"; }
 });
 
-standaloneDummyZip?.addEventListener("click", async () => {
+standaloneDummyZip?.addEventListener("click", async (event) => {
+  event.preventDefault();
+  if (standaloneDummyZip.getAttribute("aria-disabled") === "true") return;
   if (!courseRoster.length || !scanRuntime.dummy_url) return;
-  standaloneDummyZip.disabled = true;
+  standaloneDummyZip.setAttribute("aria-disabled", "true");
   const originalText = standaloneDummyZip.textContent;
   standaloneDummyZip.textContent = "Generating dummy ZIP…";
   try {
@@ -286,7 +297,7 @@ standaloneDummyZip?.addEventListener("click", async () => {
     standaloneRosterMessage.textContent = error.message || "Could not generate the dummy ZIP.";
     standaloneRosterMessage.hidden = false;
   } finally {
-    standaloneDummyZip.disabled = false;
+    standaloneDummyZip.setAttribute("aria-disabled", "false");
     standaloneDummyZip.textContent = originalText;
   }
 });
@@ -424,6 +435,20 @@ let answerRulesByScanSet = {};
 let answerRulesByAnswerKey = {};
 let questionDiscountsByScanSet = {};
 let analysisConfigByForm = {};
+let manualStudentMatches = {};
+
+function hasActiveGradingWork() {
+  return sheetResults.length > 0 || Object.keys(answerKeyByScanSet).length > 0 ||
+    Object.keys(answerRulesByAnswerKey).length > 0 || Object.keys(questionDiscountsByScanSet).length > 0;
+}
+
+window.addEventListener("beforeunload", (event) => {
+  // A refresh interrupts review, and can cause users to lose track of the
+  // answer-key and multiple-answer rules currently applied to their grades.
+  if (!hasActiveGradingWork()) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
 const DEFAULT_ANALYSIS_CLASSES = { first: 70, upperSecond: 60, lowerSecond: 50, third: 40, compensatory: 35 };
 const DEFAULT_MASTERS_CLASSES = { scheme: "masters", first: 70, upperSecond: 60, lowerSecond: 50, third: 0, compensatory: 0 };
 let gradeDetailTab = "students";
@@ -437,6 +462,7 @@ let formsManifestLoaded = false;
 let persistenceReady = false;
 let persistenceWarning = "";
 let persistenceLoadPromise = null;
+let persistenceSaveQueue = Promise.resolve();
 let formsManifestPromise = null;
 let annotationRefreshPromise = null;
 let pendingUnidentifiedFocusId = "";
@@ -457,7 +483,7 @@ async function loadFormsManifest() {
   if (formsManifestPromise) return formsManifestPromise;
   formsManifestPromise = (async () => {
     const response = await fetch(scanRuntime.forms_url || "/scan/forms.json", {
-      headers: { Accept: "application/json" }, credentials: "same-origin"
+      headers: { Accept: "application/json" }, credentials: "same-origin", cache: "no-store"
     });
     if (!response.ok) throw new Error("Saved sheet settings could not be loaded. Reopen the app from the course and try again.");
     const manifest = await response.json();
@@ -478,14 +504,22 @@ async function loadFormsManifest() {
 
 function openScanDatabase() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(scanDatabaseName, 1);
+    const request = indexedDB.open(scanDatabaseName, 2);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains("courses")) db.createObjectStore("courses", { keyPath: "key" });
+      if (!db.objectStoreNames.contains("scan-sheets")) {
+        const sheets = db.createObjectStore("scan-sheets", { keyPath: "key" });
+        sheets.createIndex("courseKey", "courseKey", { unique: false });
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error("Browser storage could not be opened."));
   });
+}
+
+function sheetStorageKey(sheetId) {
+  return `${scanStorageKey}::${sheetId}`;
 }
 
 async function loadPersistedScanState() {
@@ -496,16 +530,28 @@ async function loadPersistedScanState() {
 }
 
 async function loadPersistedScanStateOnce() {
+  let migrateLegacyState = false;
   try {
     const db = await openScanDatabase();
-    const state = await new Promise((resolve, reject) => {
-      const request = db.transaction("courses", "readonly").objectStore("courses").get(scanStorageKey);
-      request.onsuccess = () => resolve(request.result?.state || null);
-      request.onerror = () => reject(request.error || new Error("Saved scan data could not be read."));
+    const { state, storedSheets } = await new Promise((resolve, reject) => {
+      const transaction = db.transaction(["courses", "scan-sheets"], "readonly");
+      const stateRequest = transaction.objectStore("courses").get(scanStorageKey);
+      const sheetsRequest = transaction.objectStore("scan-sheets").index("courseKey").getAll(scanStorageKey);
+      let savedState = null;
+      let savedSheets = [];
+      stateRequest.onsuccess = () => { savedState = stateRequest.result?.state || null; };
+      sheetsRequest.onsuccess = () => { savedSheets = sheetsRequest.result || []; };
+      transaction.oncomplete = () => resolve({ state: savedState, storedSheets: savedSheets });
+      transaction.onerror = () => reject(transaction.error || new Error("Saved scan data could not be read."));
+      transaction.onabort = () => reject(transaction.error || new Error("Saved scan data could not be read."));
     });
     db.close();
-    if (state && state.version === 1) {
-      sheetResults.splice(0, sheetResults.length, ...(Array.isArray(state.sheetResults) ? state.sheetResults : []));
+    if (state && (state.version === 1 || state.version === 2)) {
+      migrateLegacyState = state.version === 1;
+      const savedResults = state.version === 2
+        ? storedSheets.map((record) => record.sheet).filter(Boolean)
+        : Array.isArray(state.sheetResults) ? state.sheetResults : [];
+      sheetResults.splice(0, sheetResults.length, ...savedResults);
       pageIssues.splice(0, pageIssues.length, ...(Array.isArray(state.pageIssues) ? state.pageIssues : []));
       guidePagesSkipped = Number(state.guidePagesSkipped || 0);
       scanSets = Array.isArray(state.scanSets) ? state.scanSets : [];
@@ -519,9 +565,11 @@ async function loadPersistedScanStateOnce() {
         ? state.questionDiscountsByScanSet : {};
       analysisConfigByForm = state.analysisConfigByForm && typeof state.analysisConfigByForm === "object"
         ? state.analysisConfigByForm : {};
+      manualStudentMatches = state.manualStudentMatches && typeof state.manualStudentMatches === "object"
+        ? state.manualStudentMatches : {};
       if (standaloneMode && Array.isArray(state.standaloneRoster)) {
         courseRoster.splice(0, courseRoster.length, ...state.standaloneRoster);
-        if (standaloneDummyZip && courseRoster.length) standaloneDummyZip.disabled = false;
+        if (standaloneDummyZip && courseRoster.length) standaloneDummyZip.setAttribute("aria-disabled", "false");
       }
       if (standaloneMode) {
         legacyPages = Array.isArray(state.legacyPages) ? state.legacyPages : [];
@@ -533,6 +581,13 @@ async function loadPersistedScanStateOnce() {
       for (const [index, sheet] of sheetResults.entries()) {
         if (!sheet.id) sheet.id = `sheet-${index + 1}`;
         sheet.studentId ||= "";
+        if (sheet.manualStudentId && !manualStudentMatches[sheet.id]) {
+          manualStudentMatches[sheet.id] = {
+            student_id: sheet.manualStudentId,
+            name: sheet.manualStudentName || "",
+            sis_login_id: sheet.manualStudentSisLoginId || "",
+          };
+        }
         if (!sheet.scanSetId) {
           let legacySet = scanSets.find((set) => set.legacy && set.formId === sheet.formId);
           if (!legacySet) {
@@ -566,6 +621,7 @@ async function loadPersistedScanStateOnce() {
       }
     }
     persistenceReady = true;
+    if (migrateLegacyState) await persistScanState();
     if (standaloneMode) renderLegacyResults();
   } catch (error) {
     persistenceWarning = "Browser storage is unavailable; scan results will last only until this page is closed.";
@@ -574,42 +630,67 @@ async function loadPersistedScanStateOnce() {
   }
 }
 
-async function persistScanState() {
-  if (!persistenceReady) return;
-  try {
-    const db = await openScanDatabase();
-    const state = {
-      version: 1,
-      sheetResults,
-      scanSets,
-      pageIssues,
-      guidePagesSkipped,
-      answerKeyByScanSet,
-      answerRulesByScanSet,
-      answerRulesByAnswerKey,
-      standaloneRoster: standaloneMode ? courseRoster : undefined,
-      legacyPages: standaloneMode ? legacyPages : undefined,
-      legacyBatchName: standaloneMode ? legacyBatchName : undefined,
-      legacyKeyPageId: standaloneMode ? legacyKeyPageId : undefined,
-      questionDiscountsByScanSet,
-      analysisConfigByForm,
-      savedAt: Date.now(),
-    };
-    await new Promise((resolve, reject) => {
-      const transaction = db.transaction("courses", "readwrite");
-      transaction.objectStore("courses").put({ key: scanStorageKey, state });
-      transaction.oncomplete = resolve;
-      transaction.onerror = () => reject(transaction.error || new Error("Saved scan data could not be written."));
-      transaction.onabort = () => reject(transaction.error || new Error("Saved scan data could not be written."));
-    });
-    db.close();
-    persistenceWarning = "";
-    return true;
-  } catch (error) {
-    persistenceWarning = "Browser storage could not save scan results; keep this page open until results are exported.";
-    console.warn("Could not save scan results", error);
-    return false;
-  }
+function persistScanState() {
+  if (!persistenceReady) return Promise.resolve(false);
+  // IndexedDB transactions complete asynchronously. Serializing saves stops a
+  // slow, old snapshot overwriting newer annotated-page blobs.
+  const save = persistenceSaveQueue.catch(() => {}).then(async () => {
+    let db;
+    try {
+      db = await openScanDatabase();
+      for (const [index, sheet] of sheetResults.entries()) {
+        if (!sheet.id) sheet.id = `sheet-${index + 1}`;
+      }
+      const sheets = [...sheetResults].filter((sheet) => sheet?.id);
+      const state = {
+        version: 2,
+        scanSets,
+        pageIssues,
+        guidePagesSkipped,
+        answerKeyByScanSet,
+        answerRulesByScanSet,
+        answerRulesByAnswerKey,
+        standaloneRoster: standaloneMode ? courseRoster : undefined,
+        legacyPages: standaloneMode ? legacyPages : undefined,
+        legacyBatchName: standaloneMode ? legacyBatchName : undefined,
+        legacyKeyPageId: standaloneMode ? legacyKeyPageId : undefined,
+        questionDiscountsByScanSet,
+        analysisConfigByForm,
+        manualStudentMatches,
+        savedAt: Date.now(),
+      };
+      await new Promise((resolve, reject) => {
+        const transaction = db.transaction(["courses", "scan-sheets"], "readwrite");
+        const courseStore = transaction.objectStore("courses");
+        const sheetStore = transaction.objectStore("scan-sheets");
+        const existingKeys = sheetStore.index("courseKey").getAllKeys(scanStorageKey);
+        existingKeys.onsuccess = () => {
+          const currentKeys = new Set(sheets.map((sheet) => sheetStorageKey(sheet.id)));
+          for (const key of existingKeys.result || []) {
+            if (!currentKeys.has(key)) sheetStore.delete(key);
+          }
+          for (const sheet of sheets) {
+            sheetStore.put({ key: sheetStorageKey(sheet.id), courseKey: scanStorageKey, sheet });
+          }
+          courseStore.put({ key: scanStorageKey, state });
+        };
+        existingKeys.onerror = () => reject(existingKeys.error || new Error("Saved scan data could not be written."));
+        transaction.oncomplete = resolve;
+        transaction.onerror = () => reject(transaction.error || new Error("Saved scan data could not be written."));
+        transaction.onabort = () => reject(transaction.error || new Error("Saved scan data could not be written."));
+      });
+      persistenceWarning = "";
+      return true;
+    } catch (error) {
+      persistenceWarning = "Browser storage could not save scan results; keep this page open until results are exported.";
+      console.warn("Could not save scan results", error);
+      return false;
+    } finally {
+      db?.close();
+    }
+  });
+  persistenceSaveQueue = save;
+  return save;
 }
 
 gradeLink.addEventListener("click", (event) => {
@@ -632,7 +713,7 @@ async function showGradeDashboard(pushHistory) {
   await loadPersistedScanState();
   if (!gradeDashboardData) {
     gradeSummary.textContent = "Loading the course roster and saved sheets…";
-    const response = await fetch(scanRuntime.grade_url || "/grade?format=json", { headers: { Accept: "application/json" }, credentials: "same-origin" });
+    const response = await fetch(scanRuntime.grade_url || "/grade?format=json", { headers: { Accept: "application/json" }, credentials: "same-origin", cache: "no-store" });
     if (!response.ok) throw new Error(`Grade dashboard could not load (${response.status}). Reopen the app from the course and try again.`);
     gradeDashboardData = await response.json();
     if (!standaloneMode) courseRoster.splice(0, courseRoster.length, ...(gradeDashboardData.roster || []));
@@ -806,6 +887,7 @@ async function clearWorkspaceScans() {
   answerRulesByScanSet = {};
   answerRulesByAnswerKey = {};
   questionDiscountsByScanSet = {};
+  manualStudentMatches = {};
   selectedGradeFormId = "";
   selectedScanSetId = "";
   rescanTargetScanSetId = "";
@@ -889,6 +971,7 @@ async function deleteScanSet(scanSetId) {
   if (!window.confirm(`Delete this scan set?\n\n${label} · ${count} student scan(s)\n\nAll scans, saved page previews, and grades in this set will be removed from this browser.`)) return;
   const removedIds = new Set(sheetResults.filter((sheet) => sheet.scanSetId === scanSetId).map((sheet) => sheet.id));
   sheetResults = sheetResults.filter((sheet) => sheet.scanSetId !== scanSetId);
+  for (const sheetId of removedIds) delete manualStudentMatches[sheetId];
   scanSets = scanSets.filter((item) => item.id !== scanSetId);
   delete answerKeyByScanSet[scanSetId];
   delete answerRulesByScanSet[scanSetId];
@@ -959,6 +1042,7 @@ rescanFileInput.addEventListener("cancel", () => {
   rescanTargetScanSetId = "";
 });
 csvButton.addEventListener("click", downloadCsv);
+annotatedSheetsButton?.addEventListener("click", downloadAnnotatedSheets);
 
 function chooseRescanFile(scanSetId) {
   rescanTargetScanSetId = scanSetId;
@@ -1414,7 +1498,7 @@ async function loadFaithfulScanPages(bytes, first, last, height = 1600) {
   url.searchParams.set("last", last);
   url.searchParams.set("height", height);
   const response = await fetch(url, {
-    method: "POST", credentials: "same-origin",
+    method: "POST", credentials: "same-origin", cache: "no-store",
     headers: { "Content-Type": "application/pdf", "X-Scan-Render": "1" },
     body: bytes,
   });
@@ -1743,7 +1827,7 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
     : Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, choiceCount - 1));
   const annotations = [];
   const idSignals = [];
-  const inspect = (kind, label, question, templateX, templateY, templateRadius) => {
+  const inspect = (kind, label, question, templateX, templateY, templateRadius, offset = null) => {
     const [x, y, radius] = rawBubbleGeometry(mapping, templateX * scale, templateY * scale, templateRadius * scale, sourceCanvas.width / A4.width);
     // Registration marks correct page-level rotation and perspective. A wider
     // local search then absorbs small residual print/scan distortions at each
@@ -1752,12 +1836,14 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
     // measurement, then judge answers relative to the other choices in their
     // row so the faint printed A–D guide letters do not become selections.
     const analysis = analyzeCircle(image, sourceCanvas.width, sourceCanvas.height,
-      x, y, radius, 0.46, standaloneMode ? 205 : null);
+      x + (offset?.x || 0), y + (offset?.y || 0), radius, 0.46, standaloneMode ? 205 : null);
+    let idSignal = null;
     if (kind === "student_id") {
       // ID selection follows the same strict central-ink evidence as answers.
       // Contrast alone is not meaningful for an empty printed circle.
-      idSignals.push({ label, signal: analysis.fillRatio, fillRatio: analysis.fillRatio,
-        normalizedContrast: analysis.normalizedContrast, column: Math.floor(idSignals.length / 10) });
+      idSignal = { label, signal: analysis.fillRatio, fillRatio: analysis.fillRatio,
+        normalizedContrast: analysis.normalizedContrast, column: Math.floor(idSignals.length / 10) };
+      idSignals.push(idSignal);
     }
     // A real printed bubble has a local circular ring. This gate prevents the
     // overlay from marking every expected location when a scan is blank/cropped.
@@ -1776,18 +1862,25 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
       : 0;
     const crossExtensionStats = status === "filled"
       ? diagonalCoverageStats(image, sourceCanvas.width, sourceCanvas.height,
-        analysis.cx, analysis.cy, radius, crossDarkThreshold, 0.8, 1.8, 3)
+        analysis.cx, analysis.cy, radius, crossDarkThreshold, 0.8, 1.8, 3,
+        standaloneMode && kind === "answer" ? 12 : 0)
       : { min: 0, max: 0, average: 0 };
     const crossOuterStats = status === "filled"
       ? diagonalCoverageStats(image, sourceCanvas.width, sourceCanvas.height,
-        analysis.cx, analysis.cy, radius, crossDarkThreshold, 1.0, 1.8, 3)
+        analysis.cx, analysis.cy, radius, crossDarkThreshold, 1.0, 1.8, 3,
+        standaloneMode && kind === "answer" ? 12 : 0)
       : { min: 0, max: 0, average: 0 };
-    // Handwritten Xs are often faint, skewed, and not centred on the bubble.
-    // Use a wider diagonal stroke and require dark ink outside the bubble so
-    // a normal filled circle does not become a false cross.
-    const crossed = status === "filled" && crossExtensionStats.max >= 0.5 &&
-      (crossOuterStats.max >= 0.5 || crossScore >= 0.75 ||
-        (standaloneMode && crossExtensionStats.min >= 0.45 && crossOuterStats.min >= 0.35));
+    // An imperfect X can have unequal, slightly skewed strokes. Both
+    // diagonals still need ink beyond the printed ring; one long slash or
+    // dark shading alone must not cancel an answer.
+    const crossed = status === "filled" && (standaloneMode && kind === "answer"
+      ? crossExtensionStats.min >= 0.42 && crossOuterStats.min >= 0.3 &&
+        crossExtensionStats.max >= 0.52 && crossOuterStats.max >= 0.42
+      : crossExtensionStats.max >= 0.5 &&
+        (crossOuterStats.max >= 0.5 || crossScore >= 0.75));
+    // Only a pronounced X in both diagonals can cancel an ID bubble. Solid
+    // filled circles sometimes resemble an X under the looser answer rule.
+    if (idSignal) idSignal.crossed = crossExtensionStats.min >= 0.65 && crossOuterStats.min >= 0.6;
     annotations.push({ kind, label, question, x: analysis.cx, y: analysis.cy,
       radius, status, fillRatio: analysis.fillRatio, crossed, crossScore,
       crossExtensionScore: crossExtensionStats.min,
@@ -1813,11 +1906,16 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
     const firstBubbleX = 27 + 2 + 34;
     const firstRowY = A4.height - (A4.height - 145 - 13);
     const rowPitchId = currentLayout ? 14.5 : 9.1;
+    const idRadius = currentLayout ? 6.8 : 3.9;
+    const idGridShift = standaloneMode
+      ? findIdGridShift(image, sourceCanvas.width, sourceCanvas.height, mapping,
+        firstBubbleX, firstRowY, rowPitchId, idRadius, scale)
+      : null;
     for (let column = 0; column < 9; column += 1) {
       for (let digit = 0; digit < 10; digit += 1) {
         inspect("student_id", String(digit), null,
           firstBubbleX + column * 20.5, firstRowY + digit * rowPitchId,
-          currentLayout ? 6.8 : 3.9);
+          idRadius, idGridShift);
       }
     }
   }
@@ -1842,6 +1940,58 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
   const answerData = resolveTemplateAnswers(annotations, questionCount);
   return { annotations, counts, idSignals, answers: answerData.answers,
     answerCounts: answerData.counts };
+}
+
+function findIdGridShift(image, width, height, mapping, firstX, firstY, pitch, radius, scale) {
+  // Corner marks align the page globally, but a photocopier can move the ID
+  // block relative to those corners. Use the printed rings (not the shading)
+  // to locate this entire grid, so a dark digit cannot pull one circle onto
+  // its neighbor. A few rows across all columns make the fit robust to marks.
+  const anchors = [];
+  for (const column of [0, 2, 4, 6, 8]) {
+    for (const digit of [0, 3, 6, 9]) {
+      const [x, y, r] = rawBubbleGeometry(mapping,
+        (firstX + column * 20.5) * scale, (firstY + digit * pitch) * scale,
+        radius * scale, width / A4.width);
+      anchors.push({ x, y, radius: r });
+    }
+  }
+  const averageRadius = anchors.reduce((sum, item) => sum + item.radius, 0) / anchors.length;
+  const maxX = Math.min(19, Math.round(averageRadius * 1.35));
+  const maxY = Math.min(23, Math.round(averageRadius * 1.7));
+  let best = { x: 0, y: 0, score: -Infinity };
+  for (let dy = -maxY; dy <= maxY; dy += 2) {
+    for (let dx = -maxX; dx <= maxX; dx += 2) {
+      let score = 0;
+      for (const anchor of anchors) {
+        score += idRingContrast(image.data, width, height,
+          Math.round(anchor.x + dx), Math.round(anchor.y + dy), anchor.radius);
+      }
+      score = score / anchors.length - Math.hypot(dx, dy) * 0.12;
+      if (score > best.score) best = { x: dx, y: dy, score };
+    }
+  }
+  return best.score >= 5 ? { x: best.x, y: best.y } : { x: 0, y: 0 };
+}
+
+function idRingContrast(pixels, width, height, cx, cy, radius) {
+  let contrast = 0;
+  let count = 0;
+  for (let step = 0; step < 12; step += 1) {
+    const angle = step * Math.PI / 6;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const toneAt = (distance) => {
+      const x = Math.round(cx + cos * distance);
+      const y = Math.round(cy + sin * distance);
+      return x >= 0 && x < width && y >= 0 && y < height
+        ? pixels[(y * width + x) * 4] : 255;
+    };
+    const ring = Math.min(toneAt(radius * 0.86), toneAt(radius), toneAt(radius * 1.1));
+    contrast += toneAt(radius * 1.45) - ring;
+    count += 1;
+  }
+  return contrast / count;
 }
 
 function resolveTemplateAnswers(annotations, questionCount) {
@@ -2468,7 +2618,12 @@ function readStudentIdFromSignals(idSignals, layoutVersion) {
   const uncertainColumns = [];
   for (let column = 0; column < 9; column += 1) {
     const bubbles = idSignals.slice(column * 10, column * 10 + 10);
-    const ranked = [...bubbles].sort((a, b) => b.signal - a.signal);
+    const uncrossed = bubbles.filter((bubble) => !bubble.crossed)
+      .sort((a, b) => b.signal - a.signal);
+    const correction = bubbles.some((bubble) => bubble.crossed && bubble.signal >= 0.4) &&
+      uncrossed[0]?.signal >= 0.42 &&
+      uncrossed[0].signal - (uncrossed[1]?.signal || 0) >= 0.12;
+    const ranked = correction ? uncrossed : [...bubbles].sort((a, b) => b.signal - a.signal);
     const top = ranked[0];
     const second = ranked[1];
     const signalGap = top.signal - second.signal;
@@ -2695,29 +2850,36 @@ function relativeDiagonalCoverage(image, width, height, cx, cy, radius, darkThre
 }
 
 function diagonalCoverageStats(image, width, height, cx, cy, radius, darkThreshold,
-  startScale = 0.5, endScale = 1.5, lineHalfWidth = 1) {
+  startScale = 0.5, endScale = 1.5, lineHalfWidth = 1, angleTolerance = 0) {
   const start = Math.max(2, Math.round(radius * startScale));
   const end = Math.round(radius * endScale);
   const diagonalRatios = [];
   for (const direction of [1, -1]) {
-    let hits = 0;
-    let samples = 0;
-    for (const sign of [-1, 1]) {
-      for (let distance = start; distance <= end; distance += 1) {
-        const dx = Math.round(distance / Math.sqrt(2)) * sign;
-        const dy = Math.round(distance / Math.sqrt(2)) * sign * direction;
-        let dark = false;
-        for (let offset = -lineHalfWidth; offset <= lineHalfWidth; offset += 1) {
-          const px = cx + dx + offset;
-          const py = cy + dy - offset * direction;
-          if (px < 0 || px >= width || py < 0 || py >= height) continue;
-          if (grayAt(image.data, py * width + px) < darkThreshold) dark = true;
+    let bestRatio = 0;
+    for (const skew of angleTolerance ? [-angleTolerance, 0, angleTolerance] : [0]) {
+      const angle = Math.PI / 4 + skew * Math.PI / 180;
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      let hits = 0;
+      let samples = 0;
+      for (const sign of [-1, 1]) {
+        for (let distance = start; distance <= end; distance += 1) {
+          const dx = Math.round(distance * cos) * sign;
+          const dy = Math.round(distance * sin) * sign * direction;
+          let dark = false;
+          for (let offset = -lineHalfWidth; offset <= lineHalfWidth; offset += 1) {
+            const px = cx + dx + offset;
+            const py = cy + dy - offset * direction;
+            if (px < 0 || px >= width || py < 0 || py >= height) continue;
+            if (grayAt(image.data, py * width + px) < darkThreshold) dark = true;
+          }
+          if (dark) hits += 1;
+          samples += 1;
         }
-        if (dark) hits += 1;
-        samples += 1;
       }
+      bestRatio = Math.max(bestRatio, samples ? hits / samples : 0);
     }
-    diagonalRatios.push(samples ? hits / samples : 0);
+    diagonalRatios.push(bestRatio);
   }
   const min = Math.min(...diagonalRatios);
   const max = Math.max(...diagonalRatios);
@@ -2871,7 +3033,6 @@ function finishScan() {
     }
   }
   renderGradeDashboardSheets(gradeDashboardData?.forms || []);
-  persistScanState();
 }
 
 function renderSetAnswerKeyOptions() {
@@ -3051,16 +3212,64 @@ function rosterCandidates(sheet) {
   return courseRoster.filter((learner) => identifiers.has(learner.student_id));
 }
 
+function partialIdCandidates(sheet) {
+  if (!sheet || sheet.studentId || sheet.bubbleStudentId || sheet.writtenStudentId ||
+      sheet.manualStudentId || isDummyAnswerKey(sheet)) return [];
+  return rosterCandidatesForPartialId(sheet.bubbleIdRaw, courseRoster);
+}
+
+function inferredRosterLearner(sheet) {
+  if (!sheet || sheet.manualStudentId || isDummyAnswerKey(sheet) || rosterCandidates(sheet).length) return null;
+  const raw = sheet.bubbleIdRaw || sheet.studentId || sheet.bubbleStudentId || "";
+  const partial = /^\d{0,8}\?\d{0,8}$/.test(raw) && raw.length === 9;
+  const candidates = partial ? partialIdCandidates(sheet)
+    : /^\d{9}$/.test(raw) ? nearIdCandidates(sheet) : [];
+  if (candidates.length !== 1) return null;
+  const candidate = candidates[0];
+  // Two pages claiming the same student need review, even if one is close.
+  const alreadyRead = sheetResults.some((other) => other.id !== sheet.id &&
+    other.scanSetId === sheet.scanSetId &&
+    [other.studentId, other.bubbleStudentId, other.writtenStudentId, other.manualStudentId]
+      .includes(candidate.student_id));
+  return alreadyRead ? null : candidate;
+}
+
+function nearIdCandidates(sheet) {
+  if (!sheet || sheet.manualStudentId || isDummyAnswerKey(sheet) ||
+      rosterCandidates(sheet).length || partialIdCandidates(sheet).length) return [];
+  return rosterCandidatesNearId(sheet.bubbleIdRaw || sheet.studentId || sheet.bubbleStudentId, courseRoster);
+}
+
+function suggestedRosterCandidates(sheet) {
+  const partial = partialIdCandidates(sheet);
+  return partial.length ? partial : nearIdCandidates(sheet);
+}
+
 function manuallyMatchedLearner(sheet) {
-  if (!sheet?.manualStudentId) return null;
-  return courseRoster.find((learner) => learner.student_id === sheet.manualStudentId) || null;
+  const savedMatch = sheet && manualStudentMatches[sheet.id];
+  const studentId = sheet?.manualStudentId || savedMatch?.student_id;
+  if (!studentId) return null;
+  return courseRoster.find((learner) => learner.student_id === studentId) || savedMatch || null;
+}
+
+function saveManualStudentMatch(sheet, learner) {
+  if (!sheet || !learner?.student_id) return;
+  sheet.manualStudentId = learner.student_id;
+  sheet.manualStudentName = learner.name || "";
+  sheet.manualStudentSisLoginId = learner.sis_login_id || "";
+  manualStudentMatches[sheet.id] = {
+    student_id: learner.student_id,
+    name: learner.name || "",
+    sis_login_id: learner.sis_login_id || "",
+  };
 }
 
 function matchedLearner(sheet) {
   const manualMatch = manuallyMatchedLearner(sheet);
   if (manualMatch) return manualMatch;
   const matches = rosterCandidates(sheet);
-  return matches.length === 1 ? matches[0] : null;
+  if (matches.length === 1) return matches[0];
+  return matches.length ? null : inferredRosterLearner(sheet);
 }
 
 function rosterNameParts(learner) {
@@ -3101,13 +3310,22 @@ function isDummyAnswerKey(sheet) {
 function identitySummary(sheet) {
   const learner = matchedLearner(sheet);
   const manuallyMatched = manuallyMatchedLearner(sheet);
+  const inferred = inferredRosterLearner(sheet);
+  const partialCandidates = learner ? [] : partialIdCandidates(sheet);
+  const nearCandidates = learner ? [] : nearIdCandidates(sheet);
   const recognizedStudentId = sheet.studentId || sheet.bubbleStudentId || sheet.writtenStudentId;
   const parts = [
-    learner ? `${manuallyMatched ? "Roster identity assigned manually" : "Roster identity confirmed"}: ${learner.name}` : `Printed name: ${sheet.printedName || "not read"}`,
-    `Student number: ${recognizedStudentId || "not read"}`,
+    learner ? `${manuallyMatched ? "Roster identity assigned manually" : inferred ? "Roster identity inferred automatically from eight matching ID digits" : "Roster identity confirmed"}: ${learner.name}` : `Printed name: ${sheet.printedName || "not read"}`,
+    inferred ? `ID bubbles read: ${sheet.bubbleIdRaw || recognizedStudentId || "not read"}` : `Student number: ${recognizedStudentId || "not read"}`,
     sheet.idMatchStatus || "",
   ];
   if (learner) parts.push(`Matched SIS number: ${learner.student_id}`);
+  if (partialCandidates.length === 1) {
+    parts.push(`Possible roster match (not assigned): ${rosterSearchLabel(partialCandidates[0])}`);
+  } else if (partialCandidates.length > 1) {
+    parts.push(`${partialCandidates.length} roster students fit partial ID ${sheet.bubbleIdRaw}`);
+  }
+  if (nearCandidates.length) parts.push(`${nearCandidates.length} roster ID${nearCandidates.length === 1 ? "" : "s"} differ by one read digit; confirm against the scan`);
   if (!learner) parts.push("Review the raw annotated scan if manual identification is needed");
   return parts.filter(Boolean).join(" · ");
 }
@@ -3119,6 +3337,10 @@ function renderGradeWorkspace() {
   }
   csvButton.disabled = true;
   csvButton.hidden = true;
+  if (annotatedSheetsButton) {
+    annotatedSheetsButton.disabled = true;
+    annotatedSheetsButton.hidden = true;
+  }
   if (!selectedGradeFormId) {
     const scannedFormCount = (gradeDashboardData?.forms || []).filter((form) =>
       sheetResults.some((sheet) => sheet.formId === form.form_id)).length;
@@ -3139,6 +3361,12 @@ function renderGradeWorkspace() {
   const studentSheets = formSheets.filter((sheet) => !isDummyAnswerKey(sheet));
   csvButton.disabled = studentSheets.length === 0;
   csvButton.hidden = studentSheets.length === 0;
+  if (annotatedSheetsButton) {
+    const exportableSheets = studentSheets.filter((sheet) => sheet.annotatedPage instanceof Blob ||
+      (sheet.rawScanVersion === RAW_SCAN_VERSION && sheet.rawPage instanceof Blob && !isStaleStandaloneScan(sheet)));
+    annotatedSheetsButton.disabled = exportableSheets.length === 0;
+    annotatedSheetsButton.hidden = exportableSheets.length === 0;
+  }
   const issueNote = pageIssues.length ? ` · ${pageIssues.length} page/file issue(s) reported during scan` : "";
   if (!formSheets.length) {
     gradeSummary.textContent = `${scanSet.sourceName || "Scan set"}: no student scans.${issueNote}`;
@@ -3375,7 +3603,11 @@ function exportAnalysisPdf() {
   report.querySelector(".analysis-thresholds")?.remove();
   report.querySelectorAll(".analysis-card-heading label").forEach((label) => label.remove());
   const scanSet = scanSets.find((item) => item.id === selectedScanSetId);
-  const title = `${scanSet?.sourceName || "Analysis"} · Analysis`;
+  const workspaceTitle = courseKeyData.course_title || "Workspace";
+  const reportTitle = `${workspaceTitle} · Analysis`;
+  // Browser print dialogs use the document title as the suggested PDF name.
+  const pdfDocumentTitle = gradingExportFilename("analysis", "pdf");
+  const workspaceLink = workspaceUrl();
   const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[character]));
   const brandLogo = document.querySelector(".brand img")?.src || new URL("/static/logo.svg", window.location.href).href;
   const courseTitle = document.querySelector(".course-badge")?.textContent?.trim() || "";
@@ -3392,6 +3624,7 @@ function exportAnalysisPdf() {
     .report-header > div:last-child { min-width: 0; flex: 1; text-align: right; }
     .report-header h1 { margin: 0; max-width: 100%; font-size: 24pt; line-height: 1.08; letter-spacing: -.02em; overflow-wrap: anywhere; }
     .report-header > div:last-child p { margin: 1mm 0 0; color: #526474; font-size: 9pt; }
+    .report-workspace-url { overflow-wrap: anywhere; }
     .analysis-toolbar { display: none !important; }
     .analysis-summary-cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4mm; margin-bottom: 7mm; }
     .analysis-summary-card { background: #f5f8fa; border: 1px solid #8da1af; border-radius: 3mm; padding: 4mm; min-height: 20mm; }
@@ -3439,7 +3672,7 @@ function exportAnalysisPdf() {
   printWindow.addEventListener("afterprint", cleanup, { once: true });
   printFrame.addEventListener("load", () => window.setTimeout(startPrint, 300), { once: true });
   printWindow.document.open();
-  printWindow.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>${styles}</style></head><body><header class="report-header"><div class="report-brand"><img src="${escapeHtml(brandLogo)}" alt=""><div><strong>Print Scan Grade</strong><p>${escapeHtml(courseTitle)}</p></div></div><div><h1>${escapeHtml(title)}</h1><p>Landscape analysis report</p></div></header>${report.innerHTML}</body></html>`);
+  printWindow.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(pdfDocumentTitle)}</title><style>${styles}</style></head><body><header class="report-header"><div class="report-brand"><img src="${escapeHtml(brandLogo)}" alt=""><div><strong>Print Scan Grade</strong><p>${escapeHtml(courseTitle)}</p></div></div><div><h1>${escapeHtml(reportTitle)}</h1><p>Landscape analysis report${scanSet?.sourceName ? ` · ${escapeHtml(scanSet.sourceName)}` : ""}</p><p class="report-workspace-url">Workspace: ${escapeHtml(workspaceLink)}</p></div></header>${report.innerHTML}</body></html>`);
   printWindow.document.close();
   // Some browsers do not dispatch iframe load after document.write; retain a
   // short fallback while keeping the export within the user click gesture.
@@ -3538,14 +3771,20 @@ updateRosterSortIndicators();
 function renderRosterTable() {
   rosterRows.replaceChildren();
   const learnerScans = new Map(courseRoster.map((learner) => [learner.student_id, []]));
-  const unidentified = [];
+  const unidentified = unidentifiedSheetsForSelectedScanSet();
+  const inferredCount = sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId &&
+    inferredRosterLearner(sheet)).length;
   for (const sheet of sheetResults) {
     if (sheet.scanSetId !== selectedScanSetId) continue;
     if (isDummyAnswerKey(sheet)) continue;
     const learner = matchedLearner(sheet);
-    if (learner) learnerScans.get(learner.student_id).push(sheet);
-    else unidentified.push(sheet);
+    if (learner) {
+      if (!learnerScans.has(learner.student_id)) learnerScans.set(learner.student_id, []);
+      learnerScans.get(learner.student_id).push(sheet);
+    }
   }
+  if (matchingSummary) matchingSummary.textContent = `${courseRoster.length} roster students · ${unidentified.length} unidentified scan${unidentified.length === 1 ? "" : "s"} remaining${inferredCount ? ` · ${inferredCount} automatically matched from ID` : ""}`;
+  if (resolveStudentsButton) resolveStudentsButton.disabled = unidentified.length === 0;
   if (!courseRoster.length && !unidentified.length) {
     appendRosterMessage("No active students are available from the course roster.");
     return;
@@ -3554,14 +3793,29 @@ function renderRosterTable() {
     const scans = learnerScans.get(learner.student_id) || [];
     return { name: rosterDisplayName(learner), learner, sheetRecords: scans, unidentified: false };
   });
+  for (const [studentId, scans] of learnerScans) {
+    if (courseRoster.some((learner) => learner.student_id === studentId) || !scans.length) continue;
+    const learner = manuallyMatchedLearner(scans[0]);
+    if (learner) rows.push({ name: rosterDisplayName(learner), learner, sheetRecords: scans, unidentified: false });
+  }
   for (const [index, sheet] of unidentified.entries()) {
     const candidates = rosterCandidates(sheet);
+    const partialCandidates = partialIdCandidates(sheet);
+    const nearCandidates = nearIdCandidates(sheet);
     const rosterNote = candidates.length > 1
       ? `IDs match multiple roster students: ${candidates.map((learner) => learner.name).join(", ")}`
       : !courseRoster.length ? "Course roster unavailable for cross-reference"
-        : sheet.studentId ? `ID ${sheet.studentId} not on course roster` : "No confirmed roster ID";
+        : partialCandidates.length === 1
+            ? `Possible roster match for ${sheet.bubbleIdRaw}: ${rosterSearchLabel(partialCandidates[0])} — confirm before assigning`
+            : partialCandidates.length > 1
+              ? `${partialCandidates.length} roster IDs match ${sheet.bubbleIdRaw}; review before assigning`
+              : nearCandidates.length
+                ? `${nearCandidates.length} possible roster ID${nearCandidates.length === 1 ? "" : "s"} differ by one digit; confirm against the scan`
+                : sheet.studentId ? `ID ${sheet.studentId} not on course roster` : "No confirmed roster ID";
     const idNote = [sheet.idMatchStatus,
-      sheet.bubbleStudentId ? `ID bubbles ${sheet.bubbleStudentId}` : sheet.writtenStudentId ? `ID boxes ${sheet.writtenStudentId}` : "ID unreadable",
+      sheet.bubbleStudentId ? `ID bubbles ${sheet.bubbleStudentId}`
+        : sheet.bubbleIdRaw ? `ID bubbles ${sheet.bubbleIdRaw}`
+          : sheet.writtenStudentId ? `ID boxes ${sheet.writtenStudentId}` : "ID unreadable",
       rosterNote]
       .filter(Boolean).join(" · ");
     rows.push({ name: "Student not identified", sheet, sheetRecords: [sheet], idNote,
@@ -3602,6 +3856,21 @@ function appendRosterRow(name, score, percentage, sheetRecords = []) {
       openStudentScans(name, sheetRecords);
     });
     nameCell.append(nameLink);
+    const inferredSheet = sheetRecords.find((sheet) => inferredRosterLearner(sheet));
+    if (inferredSheet) {
+      const note = document.createElement("small");
+      note.className = "roster-identity-note";
+      note.textContent = `Automatically matched from eight ID digits (${inferredSheet.bubbleIdRaw}); change if incorrect.`;
+      const confirmLink = document.createElement("a");
+      confirmLink.href = "#roster-assignment";
+      confirmLink.className = "unidentified-preview-link";
+      confirmLink.textContent = "Change match";
+      confirmLink.addEventListener("click", (event) => {
+        event.preventDefault();
+        openUnidentifiedDialog(inferredSheet);
+      });
+      nameCell.append(note, confirmLink);
+    }
   } else {
     nameCell.textContent = name;
   }
@@ -3620,9 +3889,20 @@ function rosterSearchLabel(learner) {
 
 let unidentifiedDialogMatches = [];
 
+function unidentifiedSheetsForSelectedScanSet() {
+  return sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId &&
+    !isDummyAnswerKey(sheet) && !matchedLearner(sheet));
+}
+
+resolveStudentsButton?.addEventListener("click", () => {
+  const unidentified = unidentifiedSheetsForSelectedScanSet();
+  if (unidentified.length) openUnidentifiedDialog(unidentified[0], unidentified[1]?.id || "");
+});
+
 function updateUnidentifiedDialogMatches() {
   const query = unidentifiedSearch.value.trim().toLocaleLowerCase();
-  unidentifiedDialogMatches = courseRoster.filter((learner) =>
+  const narrowed = query ? [] : suggestedRosterCandidates(unidentifiedDialogSheet);
+  unidentifiedDialogMatches = (narrowed.length ? narrowed : courseRoster).filter((learner) =>
     rosterSearchLabel(learner).toLocaleLowerCase().includes(query));
   unidentifiedMatch.replaceChildren(new Option(
     unidentifiedDialogMatches.length ? "Choose student" : "No matching students", ""));
@@ -3634,30 +3914,39 @@ function updateUnidentifiedDialogMatches() {
   unidentifiedAssign.disabled = !unidentifiedMatch.value;
 }
 
-async function createNameAreaPreview(sheet) {
+async function createIdentityAreaPreviews(sheet) {
   if (!(sheet?.rawPage instanceof Blob)) return null;
   const bitmap = await createImageBitmap(sheet.rawPage);
   const scale = bitmap.width / A4.width;
-  // The printed name box is x=287, y=620, w≈281, h=36 in A4 points.
-  const sourceX = Math.max(0, Math.round((287 - 14) * scale));
-  const sourceY = Math.max(0, Math.round((A4.height - 620 - 36 - 20) * scale));
-  const sourceWidth = Math.min(bitmap.width - sourceX, Math.round((281 + 28) * scale));
-  const sourceHeight = Math.min(bitmap.height - sourceY, Math.round((36 + 34) * scale));
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, sourceWidth);
-  canvas.height = Math.max(1, sourceHeight);
-  canvas.getContext("2d").drawImage(bitmap, sourceX, sourceY, sourceWidth, sourceHeight,
-    0, 0, canvas.width, canvas.height);
-  bitmap.close();
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("The name area preview could not be created.")), "image/png");
-  });
+  const crop = (left, top, width, height) => {
+    const sourceX = Math.max(0, Math.round(left * scale));
+    const sourceY = Math.max(0, Math.round(top * scale));
+    const sourceWidth = Math.max(1, Math.min(bitmap.width - sourceX, Math.round(width * scale)));
+    const sourceHeight = Math.max(1, Math.min(bitmap.height - sourceY, Math.round(height * scale)));
+    const canvas = document.createElement("canvas");
+    canvas.width = sourceWidth;
+    canvas.height = sourceHeight;
+    canvas.getContext("2d").drawImage(bitmap, sourceX, sourceY, sourceWidth, sourceHeight,
+      0, 0, sourceWidth, sourceHeight);
+    return new Promise((resolve, reject) => {
+      canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("The identity preview could not be created.")), "image/png");
+    });
+  };
+  try {
+    return {
+      writtenId: await crop(48, 119, 230, 70),
+      name: await crop(287 - 14, A4.height - 620 - 36 - 20, 281 + 28, 36 + 34),
+    };
+  } finally { bitmap.close(); }
 }
 
 function closeUnidentifiedDialog() {
   if (unidentifiedNameObjectUrl) URL.revokeObjectURL(unidentifiedNameObjectUrl);
+  if (unidentifiedIdObjectUrl) URL.revokeObjectURL(unidentifiedIdObjectUrl);
   unidentifiedNameObjectUrl = "";
+  unidentifiedIdObjectUrl = "";
   unidentifiedNameImage.removeAttribute("src");
+  unidentifiedIdImage?.removeAttribute("src");
   unidentifiedDialogSheet = null;
   unidentifiedDialog.close();
 }
@@ -3665,26 +3954,46 @@ function closeUnidentifiedDialog() {
 async function openUnidentifiedDialog(sheet, nextSheetId = "") {
   unidentifiedDialogSheet = sheet;
   unidentifiedDialogNextId = nextSheetId;
-  unidentifiedDialogTitle.textContent = "Student not identified";
-  unidentifiedDialogMeta.textContent = `${sheet.sourceFile} · page ${sheet.pageNo}`;
+  const inferred = inferredRosterLearner(sheet);
+  unidentifiedDialogTitle.textContent = inferred ? "Change inferred student match" : "Student not identified";
+  const unidentified = unidentifiedSheetsForSelectedScanSet();
+  const position = unidentified.findIndex((item) => item.id === sheet.id);
+  if (unidentifiedRemaining) unidentifiedRemaining.textContent =
+    inferred ? `${unidentified.length} unidentified scans remain · This match was accepted automatically`
+      : `Reviewing ${position < 0 ? 1 : position + 1} of ${unidentified.length} unidentified scans · ${unidentified.length} remain`;
+  const partialCandidates = partialIdCandidates(sheet);
+  const nearCandidates = nearIdCandidates(sheet);
+  const suggestion = partialCandidates.length === 1
+    ? ` · Eight ID digits match ${rosterSearchLabel(partialCandidates[0])}`
+    : partialCandidates.length > 1
+      ? ` · ${partialCandidates.length} roster IDs fit ${sheet.bubbleIdRaw}; review the scan`
+      : nearCandidates.length
+        ? ` · ${nearCandidates.length} roster ID${nearCandidates.length === 1 ? "" : "s"} differ by one digit from ${sheet.bubbleIdRaw || sheet.studentId}`
+      : "";
+  unidentifiedDialogMeta.textContent = `${sheet.sourceFile} · page ${sheet.pageNo}${suggestion}`;
   unidentifiedSearch.value = "";
   updateUnidentifiedDialogMatches();
   unidentifiedNameStatus.hidden = true;
   unidentifiedNameImage.alt = "Name area from unidentified scanned sheet";
   if (unidentifiedNameObjectUrl) URL.revokeObjectURL(unidentifiedNameObjectUrl);
+  if (unidentifiedIdObjectUrl) URL.revokeObjectURL(unidentifiedIdObjectUrl);
   unidentifiedNameObjectUrl = "";
+  unidentifiedIdObjectUrl = "";
   unidentifiedNameImage.removeAttribute("src");
+  unidentifiedIdImage?.removeAttribute("src");
   unidentifiedDialog.showModal();
   queueMicrotask(() => unidentifiedSearch.focus());
   try {
-    const preview = await createNameAreaPreview(sheet);
+    const preview = await createIdentityAreaPreviews(sheet);
     if (unidentifiedDialogSheet !== sheet) return;
     if (!preview) {
-      unidentifiedNameStatus.textContent = "Name-area preview is unavailable; use Review scan for the full page.";
+      unidentifiedNameStatus.textContent = "Identity preview is unavailable; use Review scan for the full page.";
       unidentifiedNameStatus.hidden = false;
       return;
     }
-    unidentifiedNameObjectUrl = URL.createObjectURL(preview);
+    unidentifiedIdObjectUrl = URL.createObjectURL(preview.writtenId);
+    if (unidentifiedIdImage) unidentifiedIdImage.src = unidentifiedIdObjectUrl;
+    unidentifiedNameObjectUrl = URL.createObjectURL(preview.name);
     unidentifiedNameImage.src = unidentifiedNameObjectUrl;
   } catch (error) {
     if (unidentifiedDialogSheet !== sheet) return;
@@ -3698,7 +4007,7 @@ async function assignUnidentifiedDialogStudent() {
   if (!learner || !unidentifiedDialogSheet) return;
   const assignedSheet = unidentifiedDialogSheet;
   const nextSheet = sheetResults.find((sheet) => sheet.id === unidentifiedDialogNextId);
-  assignedSheet.manualStudentId = learner.student_id;
+  saveManualStudentMatch(assignedSheet, learner);
   await persistScanState();
   closeUnidentifiedDialog();
   renderRosterTable();
@@ -3706,8 +4015,7 @@ async function assignUnidentifiedDialogStudent() {
 }
 
 function findNextUnidentifiedSheetId(currentId) {
-  const unidentified = sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId &&
-    !isDummyAnswerKey(sheet) && !matchedLearner(sheet));
+  const unidentified = unidentifiedSheetsForSelectedScanSet();
   const index = unidentified.findIndex((sheet) => sheet.id === currentId);
   return index >= 0 ? unidentified[index + 1]?.id || "" : "";
 }
@@ -3739,7 +4047,11 @@ $("#unidentified-skip")?.addEventListener("click", () => {
 $("#unidentified-dialog-close")?.addEventListener("click", closeUnidentifiedDialog);
 unidentifiedDialog?.addEventListener("cancel", () => {
   if (unidentifiedNameObjectUrl) URL.revokeObjectURL(unidentifiedNameObjectUrl);
+  if (unidentifiedIdObjectUrl) URL.revokeObjectURL(unidentifiedIdObjectUrl);
   unidentifiedNameObjectUrl = "";
+  unidentifiedIdObjectUrl = "";
+  unidentifiedNameImage.removeAttribute("src");
+  unidentifiedIdImage?.removeAttribute("src");
   unidentifiedDialogSheet = null;
 });
 
@@ -3794,7 +4106,9 @@ function appendUnidentifiedRosterRow(sheet, idNote, nextSheetId = "") {
   let matches = [];
   const updateMatches = () => {
     const query = search.value.trim().toLocaleLowerCase();
-    matches = courseRoster.filter((learner) => rosterSearchLabel(learner).toLocaleLowerCase().includes(query));
+    const narrowed = query ? [] : suggestedRosterCandidates(sheet);
+    matches = (narrowed.length ? narrowed : courseRoster).filter((learner) =>
+      rosterSearchLabel(learner).toLocaleLowerCase().includes(query));
     select.replaceChildren(new Option(matches.length ? "Choose student" : "No matching students", ""));
     for (const learner of matches) select.add(new Option(rosterSearchLabel(learner), learner.student_id));
     select.disabled = matches.length === 0;
@@ -3806,7 +4120,7 @@ function appendUnidentifiedRosterRow(sheet, idNote, nextSheetId = "") {
   const assignSelectedStudent = async () => {
     const learner = courseRoster.find((candidate) => candidate.student_id === select.value);
     if (!learner) return false;
-    sheet.manualStudentId = learner.student_id;
+    saveManualStudentMatch(sheet, learner);
     pendingUnidentifiedFocusId = nextSheetId;
     await persistScanState();
     renderRosterTable();
@@ -4189,27 +4503,432 @@ function statusPill(status) {
   return pill;
 }
 
-function downloadCsv() {
-  const formSheets = sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId && !isDummyAnswerKey(sheet));
-  const rows = [["student_id", "student_name", "score", "percentage (%)"]];
-  for (const sheet of formSheets) {
-    const learner = matchedLearner(sheet);
-    const key = getGradeKeyForScan(sheet);
-    const grade = key && key.id !== sheet.id && sheet.rawScanVersion === RAW_SCAN_VERSION
-      ? gradeForSheet(sheet, key) : null;
-    const studentId = learner?.student_id || sheet.studentId || sheet.bubbleStudentId || sheet.writtenStudentId || "";
-    const studentName = learner ? rosterDisplayName(learner) : studentNameFor(sheet);
-    const score = grade ? grade.correct : "";
-    const percentage = grade && grade.total ? ((grade.correct / grade.total) * 100).toFixed(1) : "";
-    rows.push([studentId, studentName, score, percentage]);
+function xlsxEscape(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[character]));
+}
+
+function xlsxColumn(index) {
+  let value = "";
+  for (let current = index + 1; current; current = Math.floor((current - 1) / 26)) value = String.fromCharCode(65 + (current - 1) % 26) + value;
+  return value;
+}
+
+function xlsxCell(value, style = 0) { return { value, style }; }
+function xlsxFormula(formula, style = 0) { return { formula, style }; }
+
+function xlsxSheet(rows, { freeze = "A2", filter = "" } = {}) {
+  const columnCount = Math.max(1, ...rows.map((row) => row.length));
+  const rowXml = rows.map((row, rowIndex) => {
+    const cells = row.map((item, columnIndex) => {
+      if (item === null || item === undefined || item === "") return "";
+      const cell = item && typeof item === "object" && ("value" in item || "formula" in item) ? item : { value: item, style: 0 };
+      const ref = `${xlsxColumn(columnIndex)}${rowIndex + 1}`;
+      const style = cell.style ? ` s="${cell.style}"` : "";
+      if (cell.formula) return `<c r="${ref}"${style}><f>${xlsxEscape(cell.formula)}</f></c>`;
+      if (typeof cell.value === "number" && Number.isFinite(cell.value)) return `<c r="${ref}"${style}><v>${cell.value}</v></c>`;
+      return `<c r="${ref}" t="inlineStr"${style}><is><t>${xlsxEscape(cell.value)}</t></is></c>`;
+    }).join("");
+    return `<row r="${rowIndex + 1}">${cells}</row>`;
+  }).join("");
+  const dimension = `A1:${xlsxColumn(columnCount - 1)}${Math.max(1, rows.length)}`;
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="${dimension}"/><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="${freeze}" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><sheetData>${rowXml}</sheetData>${filter ? `<autoFilter ref="${filter}"/>` : ""}</worksheet>`;
+}
+
+async function createXlsxWorkbook(sheets) {
+  if (typeof JSZip === "undefined") throw new Error("The workbook export library is unavailable. Reload and try again.");
+  const zip = new JSZip();
+  const sheetEntries = sheets.map((sheet, index) => `<sheet name="${xlsxEscape(sheet.name)}" sheetId="${index + 1}" r:id="rId${index + 1}"/>`).join("");
+  zip.file("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${sheets.map((_, index) => `<Override PartName="/xl/worksheets/sheet${index + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}</Types>`);
+  zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`);
+  zip.file("xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheetEntries}</sheets><calcPr calcId="191029" fullCalcOnLoad="1" forceFullCalc="1"/></workbook>`);
+  zip.file("xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((_, index) => `<Relationship Id="rId${index + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${index + 1}.xml"/>`).join("")}<Relationship Id="rId${sheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`);
+  zip.file("xl/styles.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="0.0%"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFDAF0EE"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="4"><xf xfId="0"/><xf xfId="0" fontId="1" fillId="1" applyFont="1" applyFill="1"/><xf xfId="0" numFmtId="164" applyNumberFormat="1"/><xf xfId="0" fontId="1" applyFont="1"/></cellXfs></styleSheet>`);
+  sheets.forEach((sheet, index) => zip.file(`xl/worksheets/sheet${index + 1}.xml`, xlsxSheet(sheet.rows, sheet.options)));
+  return zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 }, mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+}
+
+function sampleVariance(values) {
+  if (values.length < 2) return null;
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  return values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (values.length - 1);
+}
+
+function medianValue(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function exportStudentName(sheet) {
+  const matchedName = matchedLearner(sheet)?.name || studentNameFor(sheet);
+  if (matchedName === "Student not identified") return matchedName;
+  return rosterDisplayName({ name: matchedName });
+}
+
+async function downloadCsv() {
+  const data = analysisRecords();
+  if (!data.key || !data.records.length) {
+    window.alert("Select a complete answer key and scan at least one student sheet before exporting an XLSX workbook.");
+    return;
   }
-  const csv = rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
-  const blobUrl = URL.createObjectURL(new Blob(["\ufeff", csv], { type: "text/csv;charset=utf-8" }));
-  const link = document.createElement("a");
-  link.href = blobUrl;
-  link.download = "print-scan-grade-grades.csv";
-  link.click();
-  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+  const originalLabel = csvButton.textContent;
+  csvButton.disabled = true;
+  csvButton.textContent = "Building XLSX…";
+  try {
+    const items = analysisItems(data);
+    const questions = items.map((item) => item.question);
+    const matrixRows = data.records.map((record) => {
+      const byQuestion = new Map(record.grade.gradedAnswers.map((item) => [item.response.question, item]));
+      return {
+        studentId: matchedLearner(record.sheet)?.student_id || record.sheet.studentId || record.sheet.bubbleStudentId || record.sheet.writtenStudentId || "",
+        name: exportStudentName(record.sheet),
+        marks: questions.map((question) => {
+          const item = byQuestion.get(question);
+          if (!item || item.status === "discounted_student" || item.status === "discounted_all") return null;
+          return item.status === "correct" ? 1 : 0;
+        }),
+      };
+    });
+    const rawHeader = [xlsxCell("Student ID", 1), xlsxCell("Student name", 1), ...questions.map((question) => xlsxCell(`Q${question}`, 1)), xlsxCell("Total", 1), xlsxCell("Percentage", 1)];
+    const totalColumn = xlsxColumn(questions.length + 2);
+    const percentageColumn = xlsxColumn(questions.length + 3);
+    const firstQuestionColumn = xlsxColumn(2);
+    const lastQuestionColumn = xlsxColumn(questions.length + 1);
+    const rawRows = [rawHeader, ...matrixRows.map((row, index) => {
+      const excelRow = index + 2;
+      return [row.studentId, row.name, ...row.marks, xlsxFormula(`SUM(${firstQuestionColumn}${excelRow}:${lastQuestionColumn}${excelRow})`), xlsxFormula(`IF(COUNT(${firstQuestionColumn}${excelRow}:${lastQuestionColumn}${excelRow})=0,\"\",${totalColumn}${excelRow}/COUNT(${firstQuestionColumn}${excelRow}:${lastQuestionColumn}${excelRow})`, 2)];
+    })];
+    const gradesRows = [
+      [xlsxCell("Student ID", 1), xlsxCell("Student name", 1), xlsxCell("Total", 1), xlsxCell("Percentage", 1)],
+      ...matrixRows.map((_, index) => {
+      const row = index + 2;
+      return [xlsxFormula(`'Raw matrix'!A${row}`), xlsxFormula(`'Raw matrix'!B${row}`), xlsxFormula(`'Raw matrix'!${totalColumn}${row}`), xlsxFormula(`'Raw matrix'!${percentageColumn}${row}`, 2)];
+      }),
+    ];
+    const completeRows = matrixRows.filter((row) => row.marks.every((mark) => Number.isFinite(mark)));
+    const totalScores = completeRows.map((row) => row.marks.reduce((sum, mark) => sum + mark, 0));
+    const itemVariances = questions.map((_, index) => sampleVariance(completeRows.map((row) => row.marks[index])) || 0);
+    const totalVariance = sampleVariance(totalScores);
+    const cronbach = questions.length > 1 && totalVariance > 0 && completeRows.length > 1
+      ? questions.length / (questions.length - 1) * (1 - itemVariances.reduce((sum, value) => sum + value, 0) / totalVariance) : null;
+    const questionRows = [[xlsxCell("Cronbach's alpha", 3), cronbach ?? "Not available"], ["Complete student records used", completeRows.length], [], [xlsxCell("Question", 1), xlsxCell("Mark scheme", 1), xlsxCell("Rule", 1), xlsxCell("Valid n", 1), xlsxCell("Correct n", 1), xlsxCell("Difficulty", 1), xlsxCell("Kelley discrimination", 1), xlsxCell("Upper 27%", 1), xlsxCell("Lower 27%", 1)]];
+    for (const item of items) questionRows.push([item.question, item.keyedAnswers.join(" + "), item.rule === "any" ? "Any keyed answer" : "All keyed answers", item.validCount, item.correctCount, item.percentage === null ? "" : item.percentage / 100, item.discrimination ?? "", item.upperRate?.rate ?? "", item.lowerRate?.rate ?? ""]);
+    const rawPercentageRange = `'Raw matrix'!$${percentageColumn}$2:$${percentageColumn}$${rawRows.length}`;
+    const descriptiveRows = [[xlsxCell("Student grade descriptive statistics", 3), ""],
+      ["Students", xlsxFormula(`COUNT(${rawPercentageRange})`)],
+      ["Mean", xlsxFormula(`IFERROR(AVERAGE(${rawPercentageRange}),\"\")`, 2)],
+      ["Median", xlsxFormula(`IFERROR(MEDIAN(${rawPercentageRange}),\"\")`, 2)],
+      ["Sample SD", xlsxFormula(`IF(COUNT(${rawPercentageRange})>1,STDEV(${rawPercentageRange}),\"\")`, 2)],
+      ["Minimum", xlsxFormula(`IF(COUNT(${rawPercentageRange}),MIN(${rawPercentageRange}),\"\")`, 2)],
+      ["Maximum", xlsxFormula(`IF(COUNT(${rawPercentageRange}),MAX(${rawPercentageRange}),\"\")`, 2)],
+      ["Questions included", xlsxFormula(`COUNTA('Raw matrix'!${firstQuestionColumn}$1:${lastQuestionColumn}$1)`)],
+      [], [xlsxCell("Grade band", 1), xlsxCell("Students", 1)]];
+    const config = analysisConfigForForm(data.key.formId);
+    const definitions = analysisClassDefinitions(config);
+    for (const [index, [threshold, label]] of definitions.entries()) {
+      const criteria = `\">=${threshold / 100}\"`;
+      const upperThreshold = definitions[index - 1]?.[0];
+      const formula = upperThreshold === undefined
+        ? `COUNTIF(${rawPercentageRange},${criteria})`
+        : `COUNTIFS(${rawPercentageRange},${criteria},${rawPercentageRange},\"<${upperThreshold / 100}\")`;
+      descriptiveRows.push([label, xlsxFormula(formula)]);
+    }
+    descriptiveRows.push(["Fail", xlsxFormula(`COUNTIF(${rawPercentageRange},\"<${definitions.at(-1)[0] / 100}\")`)]);
+    const workbook = await createXlsxWorkbook([
+      { name: "Grades", rows: gradesRows, options: { filter: `A1:D${gradesRows.length}` } },
+      { name: "Raw matrix", rows: rawRows, options: { filter: `A1:${percentageColumn}${rawRows.length}` } },
+      { name: "Question analysis", rows: questionRows, options: { freeze: "A5", filter: `A4:I${questionRows.length}` } },
+      { name: "Grade statistics", rows: descriptiveRows, options: { freeze: "A11", filter: `A10:B${descriptiveRows.length}` } },
+    ]);
+    const url = URL.createObjectURL(workbook);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = gradingExportFilename("grades", "xlsx");
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    console.error("Could not export XLSX workbook", error);
+    window.alert(`XLSX export failed: ${error.message || "please try again."}`);
+  } finally {
+    csvButton.textContent = originalLabel;
+    csvButton.disabled = false;
+  }
+}
+
+function exportFilenamePart(value, fallback) {
+  const cleaned = String(value || "").trim()
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/^-+|-+$/g, "");
+  return cleaned || fallback;
+}
+
+function exportTimestamp(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function gradingExportFilename(kind, extension, date = new Date()) {
+  const workspace = exportFilenamePart(courseKeyData.course_title, "workspace");
+  return `${workspace}-${kind}-${exportTimestamp(date)}.${extension}`;
+}
+
+function workspaceUrl() {
+  try {
+    return new URL(scanRuntime.grade_path || window.location.href, window.location.origin).href;
+  } catch (_) {
+    return window.location.href;
+  }
+}
+
+function studentExportIdentity(sheet) {
+  const learner = matchedLearner(sheet);
+  const extractedId = sheet.studentId || sheet.bubbleStudentId || sheet.writtenStudentId || "";
+  return {
+    name: learner?.name || studentNameFor(sheet),
+    id: learner?.student_id || extractedId || "student-id-not-read",
+    extractedId,
+    matched: Boolean(learner),
+  };
+}
+
+function canvasBlob(canvas, type, quality) {
+  return new Promise((resolve, reject) => canvas.toBlob(
+    (blob) => blob ? resolve(blob) : reject(new Error("The export page could not be created.")), type, quality));
+}
+
+async function blobToJpegPage(blob) {
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    canvas.getContext("2d").drawImage(bitmap, 0, 0);
+    const jpeg = await canvasBlob(canvas, "image/jpeg", 0.92);
+    return { bytes: new Uint8Array(await jpeg.arrayBuffer()), width: canvas.width, height: canvas.height };
+  } finally {
+    bitmap.close();
+  }
+}
+
+function summaryAnswerRows(sheet, grade) {
+  if (grade) return grade.gradedAnswers.map((item) => ({
+    question: item.response.question,
+    extracted: (item.selectedAnswers || selectedLabelsForAnswer(item.response)).join(", ") || "—",
+    correct: item.keyedAnswers.join(", ") || "—",
+    status: gradeResultLabel(item.status),
+  }));
+  return sheet.answers.map((response) => ({
+    question: response.question,
+    extracted: selectedLabelsForAnswer(response).join(", ") || "—",
+    correct: "No answer key",
+    status: "Not graded",
+  }));
+}
+
+function abbreviatedText(context, value, width) {
+  const text = String(value || "—");
+  if (context.measureText(text).width <= width) return text;
+  let shortened = text;
+  while (shortened.length > 1 && context.measureText(`${shortened}…`).width > width) shortened = shortened.slice(0, -1);
+  return `${shortened}…`;
+}
+
+async function createAnnotationSummaryPage(sheet) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 1684;
+  canvas.height = 1190;
+  const context = canvas.getContext("2d");
+  const identity = studentExportIdentity(sheet);
+  const key = getGradeKeyForScan(sheet);
+  const grade = key && key.id !== sheet.id ? gradeForSheet(sheet, key) : null;
+  const rows = summaryAnswerRows(sheet, grade);
+  const score = grade ? `${grade.correct}/${grade.total} (${grade.total ? (grade.correct / grade.total * 100).toFixed(1) : "0.0"}%)` : "Not graded — no complete answer key selected";
+  const workspaceLink = workspaceUrl();
+
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = "#08786f";
+  context.fillRect(0, 0, canvas.width, 18);
+  context.fillStyle = "#172532";
+  context.font = "700 42px Inter, Arial, sans-serif";
+  context.fillText("Print Scan Grade · annotated-sheet summary", 64, 84);
+  context.fillStyle = "#526474";
+  context.font = "28px Inter, Arial, sans-serif";
+  context.fillText(`Workspace: ${abbreviatedText(context, courseKeyData.course_title || "Workspace", 1120)}`, 64, 130);
+
+  const info = [
+    ["Matched student", identity.matched ? identity.name : "No roster match"],
+    ["Matched student ID", identity.matched ? identity.id : "—"],
+    ["Extracted student ID", identity.extractedId || "Not read"],
+    ["Source", `${sheet.sourceFile || "Scanned sheet"} · page ${sheet.pageNo || "—"}`],
+    ["Score", score],
+    ["Review flags", grade ? String(grade.review) : "—"],
+  ];
+  context.fillStyle = "#f2f6f8";
+  context.fillRect(64, 158, canvas.width - 128, 172);
+  for (const [index, [label, value]] of info.entries()) {
+    const column = index % 2;
+    const row = Math.floor(index / 2);
+    const x = 88 + column * 785;
+    const y = 202 + row * 52;
+    context.fillStyle = "#526474";
+    context.font = "600 20px Inter, Arial, sans-serif";
+    context.fillText(label.toUpperCase(), x, y);
+    context.fillStyle = "#172532";
+    context.font = "27px Inter, Arial, sans-serif";
+    context.fillText(abbreviatedText(context, value, 670), x, y + 29);
+  }
+
+  context.fillStyle = "#172532";
+  context.font = "700 30px Inter, Arial, sans-serif";
+  context.fillText("Extracted answers and mark scheme", 64, 382);
+  context.font = "22px Inter, Arial, sans-serif";
+  context.fillStyle = "#526474";
+  context.fillText(grade ? "Result compares each extracted response against the selected marking rule." : "Select a complete answer key in Grade to include correct answers and scores.", 64, 416);
+
+  const columns = Math.max(3, Math.ceil(rows.length / 40));
+  const tableGap = 28;
+  const tableWidth = (canvas.width - 128 - tableGap * (columns - 1)) / columns;
+  const tableTop = 458;
+  const rowsPerColumn = Math.max(1, Math.ceil(rows.length / columns));
+  const rowHeight = Math.max(16, Math.min(28, Math.floor((canvas.height - tableTop - 82) / (rowsPerColumn + 1))));
+  for (let column = 0; column < columns; column += 1) {
+    const x = 64 + column * (tableWidth + tableGap);
+    context.fillStyle = "#e4edf1";
+    context.fillRect(x, tableTop, tableWidth, rowHeight);
+    context.fillStyle = "#263b4a";
+    context.font = `${Math.min(17, rowHeight - 7)}px Inter, Arial, sans-serif`;
+    const headerBaseline = tableTop + Math.min(rowHeight - 5, 19);
+    context.fillText("Q", x + 10, headerBaseline);
+    context.fillText("EXTRACTED", x + tableWidth * 0.10, headerBaseline);
+    context.fillText("MARK SCHEME", x + tableWidth * 0.39, headerBaseline);
+    context.fillText("RESULT", x + tableWidth * 0.72, headerBaseline);
+    const start = column * rowsPerColumn;
+    for (let index = 0; index < rowsPerColumn && start + index < rows.length; index += 1) {
+      const item = rows[start + index];
+      const y = tableTop + rowHeight * (index + 1);
+      context.fillStyle = index % 2 ? "#f7fafb" : "#ffffff";
+      context.fillRect(x, y, tableWidth, rowHeight);
+      context.fillStyle = "#263b4a";
+      context.font = `${Math.min(16, rowHeight - 7)}px Inter, Arial, sans-serif`;
+      const baseline = y + Math.min(rowHeight - 5, 19);
+      context.fillText(String(item.question), x + 10, baseline);
+      context.fillText(abbreviatedText(context, item.extracted, tableWidth * 0.26), x + tableWidth * 0.10, baseline);
+      context.fillText(abbreviatedText(context, item.correct, tableWidth * 0.29), x + tableWidth * 0.39, baseline);
+      context.fillText(abbreviatedText(context, item.status, tableWidth * 0.25), x + tableWidth * 0.72, baseline);
+    }
+  }
+  context.fillStyle = "#526474";
+  context.font = "18px Inter, Arial, sans-serif";
+  context.fillText(`Workspace: ${abbreviatedText(context, workspaceLink, canvas.width - 128)}`, 64, canvas.height - 28);
+  return blobToJpegPage(await canvasBlob(canvas, "image/jpeg", 0.9));
+}
+
+function createImagePdf(pages) {
+  const encoder = new TextEncoder();
+  const parts = [];
+  const offsets = [];
+  let offset = 0;
+  const append = (part) => {
+    const bytes = typeof part === "string" ? encoder.encode(part) : part;
+    parts.push(bytes);
+    offset += bytes.length;
+  };
+  const imageIds = pages.map((_, index) => 3 + index * 3);
+  const contentIds = pages.map((_, index) => 4 + index * 3);
+  const pageIds = pages.map((_, index) => 5 + index * 3);
+  const writeObject = (id, body) => {
+    offsets[id] = offset;
+    append(`${id} 0 obj\n`);
+    for (const part of body) append(part);
+    append("\nendobj\n");
+  };
+  append("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+  writeObject(1, ["<< /Type /Catalog /Pages 2 0 R >>"]);
+  writeObject(2, [`<< /Type /Pages /Count ${pages.length} /Kids [${pageIds.map((id) => `${id} 0 R`).join(" ")}] >>`]);
+  pages.forEach((page, index) => {
+    const imageId = imageIds[index];
+    const contentId = contentIds[index];
+    const pageId = pageIds[index];
+    const margin = 18;
+    const scale = Math.min((page.pageWidth - margin * 2) / page.width, (page.pageHeight - margin * 2) / page.height);
+    const width = page.width * scale;
+    const height = page.height * scale;
+    const x = (page.pageWidth - width) / 2;
+    const y = (page.pageHeight - height) / 2;
+    writeObject(imageId, [
+      `<< /Type /XObject /Subtype /Image /Width ${page.width} /Height ${page.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${page.bytes.length} >>\nstream\n`,
+      page.bytes,
+      "\nendstream",
+    ]);
+    const commands = `q\n${width.toFixed(2)} 0 0 ${height.toFixed(2)} ${x.toFixed(2)} ${y.toFixed(2)} cm\n/Im0 Do\nQ\n`;
+    writeObject(contentId, [`<< /Length ${encoder.encode(commands).length} >>\nstream\n${commands}endstream`]);
+    writeObject(pageId, [`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${page.pageWidth} ${page.pageHeight}] /Resources << /XObject << /Im0 ${imageId} 0 R >> >> /Contents ${contentId} 0 R >>`]);
+  });
+  const xrefOffset = offset;
+  append(`xref\n0 ${pageIds.at(-1) + 1}\n0000000000 65535 f \n`);
+  for (let id = 1; id <= pageIds.at(-1); id += 1) append(`${String(offsets[id]).padStart(10, "0")} 00000 n \n`);
+  append(`trailer\n<< /Size ${pageIds.at(-1) + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`);
+  return new Blob(parts, { type: "application/pdf" });
+}
+
+async function createAnnotatedStudentPdf(sheet) {
+  const annotated = await blobToJpegPage(sheet.annotatedPage);
+  const summary = await createAnnotationSummaryPage(sheet);
+  return createImagePdf([
+    { ...annotated, pageWidth: 595.28, pageHeight: 841.89 },
+    { ...summary, pageWidth: 841.89, pageHeight: 595.28 },
+  ]);
+}
+
+async function downloadAnnotatedSheets() {
+  const studentSheets = sheetResults.filter((sheet) => sheet.scanSetId === selectedScanSetId && !isDummyAnswerKey(sheet));
+  const refreshableIds = new Set(studentSheets
+    .filter((sheet) => sheet.rawScanVersion === RAW_SCAN_VERSION && sheet.rawPage instanceof Blob && !isStaleStandaloneScan(sheet))
+    .map((sheet) => sheet.id));
+  if (!studentSheets.length) return;
+  if (typeof JSZip === "undefined") {
+    window.alert("The ZIP export library is unavailable. Reload the page and try again.");
+    return;
+  }
+  const originalLabel = annotatedSheetsButton?.textContent || "Export annotated sheets";
+  if (annotatedSheetsButton) {
+    annotatedSheetsButton.disabled = true;
+    annotatedSheetsButton.textContent = "Preparing annotated sheets…";
+  }
+  try {
+    if (refreshableIds.size) await refreshSavedAnnotations(refreshableIds);
+    const exportableSheets = studentSheets.filter((sheet) => sheet.annotatedPage instanceof Blob);
+    if (!exportableSheets.length) {
+      window.alert("No annotated scans are available. Re-scan the original PDF to create exportable annotated sheets.");
+      return;
+    }
+    const zip = new JSZip();
+    for (const [index, sheet] of exportableSheets.entries()) {
+      const identity = studentExportIdentity(sheet);
+      const page = String(sheet.pageNo || index + 1).padStart(2, "0");
+      const name = `${exportFilenamePart(identity.name, "student")}-${exportFilenamePart(identity.id, "student-id")}-page-${page}.pdf`;
+      zip.file(name, await createAnnotatedStudentPdf(sheet));
+    }
+    const archive = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+    const archiveUrl = URL.createObjectURL(archive);
+    const link = document.createElement("a");
+    link.href = archiveUrl;
+    link.download = gradingExportFilename("annotated-sheets", "zip");
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(archiveUrl), 1000);
+  } catch (error) {
+    console.error("Could not export annotated sheets", error);
+    window.alert(`Annotated-sheet export failed: ${error.message || "please try again."}`);
+  } finally {
+    if (annotatedSheetsButton) {
+      annotatedSheetsButton.textContent = originalLabel;
+      const stillExportable = sheetResults.some((sheet) => sheet.scanSetId === selectedScanSetId && !isDummyAnswerKey(sheet) &&
+        (sheet.annotatedPage instanceof Blob || (sheet.rawScanVersion === RAW_SCAN_VERSION && sheet.rawPage instanceof Blob && !isStaleStandaloneScan(sheet))));
+      annotatedSheetsButton.disabled = !stillExportable;
+    }
+  }
 }
 
 function csvCell(value) {

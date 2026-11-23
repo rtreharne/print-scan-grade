@@ -1,6 +1,7 @@
 services:
   print-scan-grade:
     build: .
+    restart: unless-stopped
     ports:
       - "8004:8004"
     env_file:

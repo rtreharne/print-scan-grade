@@ -115,7 +115,13 @@ class EntryFlowsTest(unittest.TestCase):
         })
         scan_workspace = self.client.get(path + "?view=scan")
         self.assertEqual(scan_workspace.headers["Cache-Control"], "no-store")
-        self.assertIn(b"scan.js?v=107", scan_workspace.data)
+        self.assertIn(b"scan.js?v=128", scan_workspace.data)
+        self.assertIn(b'<label class="file-drop" for="standalone-roster-file">', scan_workspace.data)
+        self.assertIn(b'<footer class="standalone-footer">', scan_workspace.data)
+        self.assertIn(b'id="resolve-students"', scan_workspace.data)
+        self.assertIn(b'id="download-annotated-sheets"', scan_workspace.data)
+        self.assertIn(b'id="matching-summary"', scan_workspace.data)
+        self.assertIn(b'id="unidentified-remaining"', scan_workspace.data)
         pdf = self.client.get(path + "/answer-sheet.pdf").data
         for height in (1400, 1600):
             response = self.client.post(path + f"/render-pages?first=1&last=1&height={height}",

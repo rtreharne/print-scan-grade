@@ -278,6 +278,122 @@ async function readStudentPage(pdf, pageNo, sourceFile) {
 
 function csvCell(value) { return `"${String(value ?? "").replaceAll('"', '""')}"`; }
 
+function xlsxEscape(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" }[character]));
+}
+
+function xlsxColumn(index) {
+  let value = "";
+  for (let current = index + 1; current; current = Math.floor((current - 1) / 26)) value = String.fromCharCode(65 + (current - 1) % 26) + value;
+  return value;
+}
+
+function xlsxCell(value, style = 0) { return { value, style }; }
+function xlsxFormula(formula, style = 0) { return { formula, style }; }
+
+function xlsxSheet(rows, { freeze = "A2", filter = "" } = {}) {
+  const columnCount = Math.max(1, ...rows.map((row) => row.length));
+  const rowXml = rows.map((row, rowIndex) => {
+    const cells = row.map((item, columnIndex) => {
+      if (item === null || item === undefined || item === "") return "";
+      const cell = item && typeof item === "object" && ("value" in item || "formula" in item) ? item : { value: item, style: 0 };
+      const ref = `${xlsxColumn(columnIndex)}${rowIndex + 1}`;
+      const style = cell.style ? ` s="${cell.style}"` : "";
+      if (cell.formula) return `<c r="${ref}"${style}><f>${xlsxEscape(cell.formula)}</f></c>`;
+      if (typeof cell.value === "number" && Number.isFinite(cell.value)) return `<c r="${ref}"${style}><v>${cell.value}</v></c>`;
+      return `<c r="${ref}" t="inlineStr"${style}><is><t>${xlsxEscape(cell.value)}</t></is></c>`;
+    }).join("");
+    return `<row r="${rowIndex + 1}">${cells}</row>`;
+  }).join("");
+  const dimension = `A1:${xlsxColumn(columnCount - 1)}${Math.max(1, rows.length)}`;
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="${dimension}"/><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="${freeze}" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><sheetData>${rowXml}</sheetData>${filter ? `<autoFilter ref="${filter}"/>` : ""}</worksheet>`;
+}
+
+async function createXlsxWorkbook(sheets) {
+  if (typeof JSZip === "undefined") throw new Error("The workbook export library is unavailable. Reload and try again.");
+  const zip = new JSZip();
+  const sheetEntries = sheets.map((sheet, index) => `<sheet name="${xlsxEscape(sheet.name)}" sheetId="${index + 1}" r:id="rId${index + 1}"/>`).join("");
+  zip.file("[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${sheets.map((_, index) => `<Override PartName="/xl/worksheets/sheet${index + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}</Types>`);
+  zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`);
+  zip.file("xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheetEntries}</sheets><calcPr calcId="191029" fullCalcOnLoad="1" forceFullCalc="1"/></workbook>`);
+  zip.file("xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((_, index) => `<Relationship Id="rId${index + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${index + 1}.xml"/>`).join("")}<Relationship Id="rId${sheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`);
+  zip.file("xl/styles.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="0.0%"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFDAF0EE"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="4"><xf xfId="0"/><xf xfId="0" fontId="1" fillId="1" applyFont="1" applyFill="1"/><xf xfId="0" numFmtId="164" applyNumberFormat="1"/><xf xfId="0" fontId="1" applyFont="1"/></cellXfs></styleSheet>`);
+  sheets.forEach((sheet, index) => zip.file(`xl/worksheets/sheet${index + 1}.xml`, xlsxSheet(sheet.rows, sheet.options)));
+  return zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 }, mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+}
+
+function legacyGradeDefinitions() {
+  return analysisScheme === "masters"
+    ? [[70, "Distinction"], [60, "Merit"], [50, "Pass"]]
+    : [[70, "1st"], [60, "II.1"], [50, "II.2"], [40, "3rd"], [35, "Compensatory pass"]];
+}
+
+async function downloadXlsx(students, key) {
+  const button = $("#uol-download-xlsx");
+  if (!button || !completeKey(key)) return;
+  const originalLabel = button.textContent;
+  button.disabled = true; button.textContent = "Building XLSX…";
+  try {
+    const questions = Array.from({ length: 70 }, (_, index) => index + 1);
+    const firstQuestionColumn = xlsxColumn(2), lastQuestionColumn = xlsxColumn(71);
+    const totalColumn = xlsxColumn(72), percentageColumn = xlsxColumn(73);
+    const matrixRows = students.map((student) => {
+      const person = studentFor(student);
+      return {
+        studentId: confirmedId(student) || student.partialId || "",
+        name: person?.name || student.name || "Student not identified",
+        marks: questions.map((_, index) => student.answers?.[index] === key.answers[index] ? 1 : 0),
+      };
+    });
+    const rawRows = [[xlsxCell("Student ID", 1), xlsxCell("Student name", 1), ...questions.map((question) => xlsxCell(`Q${question}`, 1)), xlsxCell("Total", 1), xlsxCell("Percentage", 1)],
+      ...matrixRows.map((row, index) => {
+        const excelRow = index + 2;
+        return [row.studentId, row.name, ...row.marks, xlsxFormula(`SUM(${firstQuestionColumn}${excelRow}:${lastQuestionColumn}${excelRow})`), xlsxFormula(`${totalColumn}${excelRow}/70`, 2)];
+      })];
+    const gradesRows = [[xlsxCell("Student ID", 1), xlsxCell("Student name", 1), xlsxCell("Total", 1), xlsxCell("Percentage", 1)],
+      ...matrixRows.map((_, index) => {
+        const row = index + 2;
+        return [xlsxFormula(`'Raw matrix'!A${row}`), xlsxFormula(`'Raw matrix'!B${row}`), xlsxFormula(`'Raw matrix'!${totalColumn}${row}`), xlsxFormula(`'Raw matrix'!${percentageColumn}${row}`, 2)];
+      })];
+    const data = analysisData(results, key);
+    const items = analysisItems(data);
+    const questionRows = [[xlsxCell("Question", 1), xlsxCell("Mark scheme", 1), xlsxCell("Valid n", 1), xlsxCell("Correct n", 1), xlsxCell("Difficulty", 1), xlsxCell("Kelley discrimination", 1), xlsxCell("Upper 27%", 1), xlsxCell("Lower 27%", 1)]];
+    for (const item of items) questionRows.push([item.question, item.keyedAnswers.join(" + "), item.validCount, item.correctCount, item.percentage === null ? "" : item.percentage / 100, item.discrimination ?? "", item.upperRate?.rate ?? "", item.lowerRate?.rate ?? ""]);
+    const rawPercentageRange = `'Raw matrix'!$${percentageColumn}$2:$${percentageColumn}$${rawRows.length}`;
+    const statisticsRows = [[xlsxCell("Student grade descriptive statistics", 3), ""],
+      ["Students", xlsxFormula(`COUNT(${rawPercentageRange})`)],
+      ["Mean", xlsxFormula(`IFERROR(AVERAGE(${rawPercentageRange}),\"\")`, 2)],
+      ["Median", xlsxFormula(`IFERROR(MEDIAN(${rawPercentageRange}),\"\")`, 2)],
+      ["Sample SD", xlsxFormula(`IF(COUNT(${rawPercentageRange})>1,STDEV(${rawPercentageRange}),\"\")`, 2)],
+      ["Minimum", xlsxFormula(`IF(COUNT(${rawPercentageRange}),MIN(${rawPercentageRange}),\"\")`, 2)],
+      ["Maximum", xlsxFormula(`IF(COUNT(${rawPercentageRange}),MAX(${rawPercentageRange}),\"\")`, 2)],
+      ["Questions included", 70], [], [xlsxCell("Grade band", 1), xlsxCell("Students", 1)]];
+    const definitions = legacyGradeDefinitions();
+    for (const [index, [threshold, label]] of definitions.entries()) {
+      const upperThreshold = definitions[index - 1]?.[0];
+      const formula = upperThreshold === undefined
+        ? `COUNTIF(${rawPercentageRange},\">=${threshold / 100}\")`
+        : `COUNTIFS(${rawPercentageRange},\">=${threshold / 100}\",${rawPercentageRange},\"<${upperThreshold / 100}\")`;
+      statisticsRows.push([label, xlsxFormula(formula)]);
+    }
+    statisticsRows.push(["Fail", xlsxFormula(`COUNTIF(${rawPercentageRange},\"<${definitions.at(-1)[0] / 100}\")`)]);
+    const workbook = await createXlsxWorkbook([
+      { name: "Grades", rows: gradesRows, options: { filter: `A1:D${gradesRows.length}` } },
+      { name: "Raw matrix", rows: rawRows, options: { filter: `A1:${percentageColumn}${rawRows.length}` } },
+      { name: "Question analysis", rows: questionRows, options: { filter: `A1:H${questionRows.length}` } },
+      { name: "Grade statistics", rows: statisticsRows, options: { freeze: "A11", filter: `A10:B${statisticsRows.length}` } },
+    ]);
+    const url = URL.createObjectURL(workbook);
+    const link = document.createElement("a"); link.href = url; link.download = "uol-legacy-scan-results.xlsx"; link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    console.error("Could not export UoL XLSX workbook", error);
+    window.alert(`XLSX export failed: ${error.message || "please try again."}`);
+  } finally {
+    button.textContent = originalLabel; button.disabled = false;
+  }
+}
+
 function selectedKey() { return results.find((result) => result.id === keyPageId) || null; }
 
 function scoreResult(result, key) {
@@ -495,7 +611,7 @@ $("#students-tab")?.addEventListener("click", () => setGradeTab("students"));
 $("#analysis-tab")?.addEventListener("click", () => setGradeTab("analysis"));
 
 function renderResults() {
-  const summary = $("#uol-results-summary"), rows = $("#uol-result-rows"), download = $("#uol-download-csv");
+  const summary = $("#uol-results-summary"), rows = $("#uol-result-rows"), download = $("#uol-download-xlsx");
   if (!summary || !rows || !download) return;
   summary.textContent = results.length ? `${results.length} page${results.length === 1 ? "" : "s"} read` : "No pages scanned yet.";
   rows.replaceChildren();
@@ -522,17 +638,7 @@ function renderResults() {
   renderRoster();
   if (!$("#analysis-panel").hidden) analysisDashboard?.render();
   download.disabled = !completeKey(key);
-  download.onclick = () => {
-    const header = ["File", "Page", "Student", "Student ID", "Score", "Total", "Percentage", ...Array.from({ length: 70 }, (_, i) => `Q${i + 1}`)];
-    const lines = [header, ...students.map((result) => {
-      const score = scoreResult(result, key), person = studentFor(result);
-      return [result.sourceFile, result.pageNo, person?.name || "", confirmedId(result) || result.partialId || "", score, 70, (score / 70 * 100).toFixed(1), ...(result.answers || [])];
-    })]
-      .map((line) => line.map(csvCell).join(",")).join("\r\n");
-    const url = URL.createObjectURL(new Blob([lines], { type: "text/csv;charset=utf-8" }));
-    const link = document.createElement("a"); link.href = url; link.download = "uol-legacy-scan-results.csv"; link.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-  };
+  download.onclick = () => downloadXlsx(students, key);
 }
 
 async function openPreview(id) {

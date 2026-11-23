@@ -86,7 +86,7 @@ The Compose service is named `print-scan-grade`; the application's name is **Pri
 4. Complete an answer-key sheet using student number `000000000`.
 5. Open Scan. Import a roster CSV if you want student matching, then upload a PDF or ZIP containing PDFs. Multi-page documents are supported, and generated student-guide pages are skipped.
 6. Open Grade, choose the scan set and confirm its answer key. Use student review to compare extracted answers with the annotated page.
-7. Resolve unidentified students, inspect Analysis, and download the results CSV.
+7. Resolve unidentified students, inspect Analysis, and export the results workbook.
 
 The roster importer lets you map the name and student-number fields. A nine-digit number can appear within a longer source value, such as a SIS login ID.
 
@@ -114,7 +114,9 @@ The UoL reader supports up to 120 questions with choices A–E and assumes one a
 
 The roster lists every imported or enrolled student. Students without scans show “—”; unidentified pages appear separately. Sort by student, score or percentage.
 
-Click **Student not identified**, or use **Resolve unidentified students** in UoL legacy, to open the matching dialog. Inspect the scanned name area, search the roster, choose a student and press Enter to assign. The dialog advances to the next unidentified page.
+Click **Student not identified**, or use **Resolve unidentified students** above the roster in standalone or UoL legacy, to open the matching dialog. Inspect the scanned name and handwritten number, search the roster, choose a student and press Enter to assign. The dialog advances to the next unidentified page. Standalone shows how many scans remain unidentified; skipping a scan leaves that count unchanged.
+
+In standalone, a unique roster ID is accepted automatically when eight of nine bubble digits agree (one unread or one differing digit). These rows are labelled as inferred and can be changed. Ambiguous matches stay unidentified; the review dialog shows crops of both the handwritten number and name.
 
 In UoL legacy, **Change student match** in the review dialog also lets you correct a page that was assigned to the wrong student.
 
@@ -133,7 +135,16 @@ Both grading workspaces include:
 
 Analysis uses the selected answer key and scanned pages. Roster students without scans do not enter the analysis. Item statistics exclude unresolved responses, while those responses remain unearned in total scores. UoL legacy treats duplicate student scans as separate observations.
 
-Results can be downloaded as CSV. Automatic gradebook passback to the learning platform is not implemented.
+The regular standalone and LTI workspace exports an XLSX workbook with these sheets:
+
+- **Grades**: student ID, name, total and percentage.
+- **Raw matrix**: the per-question marks used by the workbook.
+- **Question analysis**: item-level analysis at the time of export.
+- **Grade statistics**: descriptive statistics and grade-band totals.
+
+The descriptive statistics and grade-band totals are Excel formulas based on the **Raw matrix**. Editing or deleting a student's raw-data row updates those results when the workbook recalculates. The UoL legacy workspace exports the same XLSX workbook structure for its fixed 70-question form. Automatic gradebook passback to the learning platform is not implemented.
+
+See [USER_GUIDE.md](USER_GUIDE.md) for a task-focused guide for instructors and administrators.
 
 ## LTI setup
 
