@@ -195,7 +195,7 @@ Browser libraries are bundled with the application; scanning does not load those
 
 ## Limits
 
-- Generated sheets: 1–60 questions and 2–8 choices.
+- Generated sheets: 1–60 questions and 2–8 choices. New sheets can use custom mixed ranges, such as A–E for questions 1–30 and A–H for questions 31–40.
 - UoL legacy sheets: up to 120 questions and five choices.
 - Scan inputs: PDFs up to 64 MB each; ZIP files up to 256 MB.
 - Logos: PNG or JPEG, up to 3 MB.

@@ -114,7 +114,7 @@ const MARK_MARGIN = 16;
 const CURRENT_MARK_MARGIN = 21;
 const ANSWER_READER_VERSION = 5;
 const RAW_SCAN_VERSION = 2;
-const ANNOTATION_VERSION = 16;
+const ANNOTATION_VERSION = 17;
 const CURRENT_SHEET_LAYOUT_VERSION = 7;
 const REGISTRATION_MARK_THRESHOLD = 160;
 const MAX_PDF_BYTES = 64 * 1024 * 1024;
@@ -408,7 +408,8 @@ dummyZipForm?.addEventListener("submit", (event) => {
       `&scanner_layout_version=${CURRENT_SHEET_LAYOUT_VERSION}`;
     if (formId === "generic") {
       const layout = JSON.parse(localStorage.getItem("print-scan-grade-generic-layout") || "null");
-      url += `&question_count=${encodeURIComponent(layout.question_count)}&choice_count=${encodeURIComponent(layout.choice_count)}`;
+      url += `&question_count=${encodeURIComponent(layout.question_count)}&choice_count=${encodeURIComponent(layout.choice_count)}` +
+        `&choice_ranges=${encodeURIComponent(layout.choice_ranges || "")}`;
     }
     const link = document.createElement("a");
     link.href = url;
@@ -1621,7 +1622,8 @@ async function scanPage(pdf, pageNo, sourceFile, qrCache = null, renderedPage = 
         singleFormFallbackCanvas.height = 0;
         throw new Error("No QR code was found. Open Print in this browser to set up a generic sheet, or scan a saved answer sheet.");
       }
-      const formId = `generic-${q}-${c}`;
+      const rangeKey = Array.isArray(layout.choice_counts) ? layout.choice_counts.join("") : "uniform";
+      const formId = `generic-${q}-${c}-${rangeKey}`;
       design = formsById.get(formId);
       if (!design) {
         genericScanTitle = window.prompt("This generic sheet is not linked to a saved answer sheet. Enter a title for these grades:", genericScanTitle || "");
@@ -1632,6 +1634,7 @@ async function scanPage(pdf, pageNo, sourceFile, qrCache = null, renderedPage = 
         }
         genericScanTitle = genericScanTitle.trim();
         design = { form_id: formId, title: genericScanTitle, question_count: q, choice_count: c,
+          choice_counts: Array.isArray(layout.choice_counts) ? layout.choice_counts : null,
           generic: true, legacy_layout_version: 7 };
         formsById.set(formId, design);
       }
@@ -1801,7 +1804,6 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
   const columnGutterLayout = layoutVersion >= 6;
   const adaptiveBubbleLayout = layoutVersion >= 7;
   const questionCount = Number(design.question_count);
-  const choiceCount = Number(design.choice_count);
   const questionTop = layoutVersion === 1 ? 589 : currentLayout ? 460 : 507;
   const columns = Math.min(4, Math.max(1, Math.ceil(questionCount / (currentLayout ? 15 : 20))));
   const rowsPerColumn = currentLayout ? 15 : Math.ceil(questionCount / columns);
@@ -1812,22 +1814,24 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
   const rowOffset = (questionTop - 38 - (rowsPerColumn - 1) * rowPitch) / 2;
   const answerStart = currentLayout ? (spaciousChoiceLayout ? 35 : 30) : 33;
   const standardAnswerRadius = currentLayout ? 6.8 : Math.min(5, Math.max(3.6, rowPitch * 0.28));
-  const maxAnswerRadius = (columnWidth - 35 - 8 - Math.max(0, choiceCount - 1) * 0.75) /
-    (2 * choiceCount - 1);
+  const maxChoiceCount = Math.max(...Array.from({ length: questionCount }, (_, i) => questionChoiceCount(design, i + 1)));
+  const maxAnswerRadius = (columnWidth - 35 - 8 - Math.max(0, maxChoiceCount - 1) * 0.75) /
+    (2 * maxChoiceCount - 1);
   const answerRadius = adaptiveBubbleLayout
     ? Math.max(5.5, Math.min(standardAnswerRadius, maxAnswerRadius))
     : standardAnswerRadius;
   const requestedTrailingGap = columnGutterLayout ? 8 : 0;
   const minimumPitch = answerRadius * 2 + 0.75;
   const trailingGap = spaciousChoiceLayout ? Math.max(0, Math.min(requestedTrailingGap,
-    columnWidth - answerStart - answerRadius - Math.max(0, choiceCount - 1) * minimumPitch)) : 0;
+    columnWidth - answerStart - answerRadius - Math.max(0, maxChoiceCount - 1) * minimumPitch)) : 0;
   const answerPitch = spaciousChoiceLayout
     ? Math.min(20.5, (columnWidth - answerStart - answerRadius - trailingGap) /
-      Math.max(1, choiceCount - 1))
-    : Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, choiceCount - 1));
+      Math.max(1, maxChoiceCount - 1))
+    : Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, maxChoiceCount - 1));
   const annotations = [];
   const idSignals = [];
-  const inspect = (kind, label, question, templateX, templateY, templateRadius, offset = null) => {
+  const inspect = (kind, label, question, templateX, templateY, templateRadius, offset = null,
+    answerChoiceCount = 0) => {
     const [x, y, radius] = rawBubbleGeometry(mapping, templateX * scale, templateY * scale, templateRadius * scale, sourceCanvas.width / A4.width);
     // Registration marks correct page-level rotation and perspective. A wider
     // local search then absorbs small residual print/scan distortions at each
@@ -1856,24 +1860,31 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
       ? "filled" : "blank";
     const crossDarkThreshold = standaloneMode && kind === "answer"
       ? Math.min(analysis.darkThreshold, 140) : analysis.darkThreshold;
+    const denseAnswerRow = kind === "answer" && answerChoiceCount >= 6;
+    const crossLineHalfWidth = denseAnswerRow ? 2 : 3;
+    const crossAngleTolerance = denseAnswerRow ? 6 : (standaloneMode && kind === "answer" ? 12 : 0);
+    const crossEndScale = denseAnswerRow ? 1.55 : 1.8;
     const crossScore = status === "filled"
       ? relativeDiagonalCoverage(image, sourceCanvas.width, sourceCanvas.height,
         analysis.cx, analysis.cy, radius, crossDarkThreshold)
       : 0;
     const crossExtensionStats = status === "filled"
       ? diagonalCoverageStats(image, sourceCanvas.width, sourceCanvas.height,
-        analysis.cx, analysis.cy, radius, crossDarkThreshold, 0.8, 1.8, 3,
-        standaloneMode && kind === "answer" ? 12 : 0)
+        analysis.cx, analysis.cy, radius, crossDarkThreshold, 0.8, crossEndScale,
+        crossLineHalfWidth, crossAngleTolerance)
       : { min: 0, max: 0, average: 0 };
     const crossOuterStats = status === "filled"
       ? diagonalCoverageStats(image, sourceCanvas.width, sourceCanvas.height,
-        analysis.cx, analysis.cy, radius, crossDarkThreshold, 1.0, 1.8, 3,
-        standaloneMode && kind === "answer" ? 12 : 0)
+        analysis.cx, analysis.cy, radius, crossDarkThreshold, 1.0, crossEndScale,
+        crossLineHalfWidth, crossAngleTolerance)
       : { min: 0, max: 0, average: 0 };
     // An imperfect X can have unequal, slightly skewed strokes. Both
     // diagonals still need ink beyond the printed ring; one long slash or
     // dark shading alone must not cancel an answer.
-    const crossed = status === "filled" && (standaloneMode && kind === "answer"
+    const crossed = status === "filled" && (denseAnswerRow
+      ? crossExtensionStats.min >= 0.58 && crossOuterStats.min >= 0.46 &&
+        crossExtensionStats.max >= 0.68 && crossOuterStats.max >= 0.58
+      : standaloneMode && kind === "answer"
       ? crossExtensionStats.min >= 0.42 && crossOuterStats.min >= 0.3 &&
         crossExtensionStats.max >= 0.52 && crossOuterStats.max >= 0.42
       : crossExtensionStats.max >= 0.5 &&
@@ -1890,15 +1901,24 @@ function detectRawBubbleAnnotations(sourceCanvas, design, layoutVersion, mapping
       confidence: Math.min(1, analysis.score / 35) });
   };
   for (let column = 0; column < columns; column += 1) {
-    const x = 27 + column * columnWidth + answerStart;
+    const columnFirstQuestion = column * rowsPerColumn + 1;
+    const columnChoiceCount = Math.max(...Array.from({ length: Math.min(rowsPerColumn, questionCount - column * rowsPerColumn) }, (_, i) => questionChoiceCount(design, columnFirstQuestion + i)));
+    const columnAnswerStart = currentLayout ? (spaciousChoiceLayout ? 35 : 30) : 33;
+    const columnTrailingGap = spaciousChoiceLayout ? Math.max(0, Math.min(requestedTrailingGap,
+      columnWidth - columnAnswerStart - answerRadius - Math.max(0, columnChoiceCount - 1) * minimumPitch)) : 0;
+    const columnAnswerPitch = spaciousChoiceLayout
+      ? Math.min(20.5, (columnWidth - columnAnswerStart - answerRadius - columnTrailingGap) / Math.max(1, columnChoiceCount - 1))
+      : Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, columnChoiceCount - 1));
+    const x = 27 + column * columnWidth + columnAnswerStart;
     for (let row = 0; row < rowsPerColumn; row += 1) {
       const question = column * rowsPerColumn + row + 1;
       if (question > questionCount) break;
       const y = questionTop - rowOffset - row * rowPitch;
       const radius = answerRadius;
+      const choiceCount = questionChoiceCount(design, question);
       for (let choice = 0; choice < choiceCount; choice += 1) {
         inspect("answer", String.fromCharCode(65 + choice), question,
-          x + choice * answerPitch, A4.height - y, radius);
+          x + choice * columnAnswerPitch, A4.height - y, radius, null, choiceCount);
       }
     }
   }
@@ -2545,10 +2565,15 @@ function identifyForm(payload) {
   return { ok: true, design, layoutVersion, sampleSeed };
 }
 
+function questionChoiceCount(design, question) {
+  const counts = Array.isArray(design.choice_counts) ? design.choice_counts : null;
+  const value = counts && Number(counts[question - 1]);
+  return Number.isInteger(value) && value >= 2 && value <= 8 ? value : Number(design.choice_count);
+}
+
 function readAnswers(canvas, design, layoutVersion, coordinateMap = null) {
   const questionBottom = 38;
   const questionCount = Number(design.question_count);
-  const choiceCount = Number(design.choice_count);
   const currentLayout = [3, 4, 5, 6, 7].includes(layoutVersion);
   const spaciousChoiceLayout = layoutVersion >= 5;
   const columnGutterLayout = layoutVersion >= 6;
@@ -2563,36 +2588,46 @@ function readAnswers(canvas, design, layoutVersion, coordinateMap = null) {
   const rowOffset = (questionTop - questionBottom - (rowsPerColumn - 1) * rowPitch) / 2;
   const answerStart = currentLayout ? (spaciousChoiceLayout ? 35 : 30) : 33;
   const standardAnswerRadius = currentLayout ? 6.8 : Math.min(5, Math.max(3.6, rowPitch * 0.28));
-  const maxAnswerRadius = (columnWidth - 35 - 8 - Math.max(0, choiceCount - 1) * 0.75) /
-    (2 * choiceCount - 1);
+  const maxChoiceCount = Math.max(...Array.from({ length: questionCount }, (_, i) => questionChoiceCount(design, i + 1)));
+  const maxAnswerRadius = (columnWidth - 35 - 8 - Math.max(0, maxChoiceCount - 1) * 0.75) /
+    (2 * maxChoiceCount - 1);
   const answerRadius = adaptiveBubbleLayout
     ? Math.max(5.5, Math.min(standardAnswerRadius, maxAnswerRadius))
     : standardAnswerRadius;
   const requestedTrailingGap = columnGutterLayout ? 8 : 0;
   const minimumPitch = answerRadius * 2 + 0.75;
   const trailingGap = spaciousChoiceLayout ? Math.max(0, Math.min(requestedTrailingGap,
-    columnWidth - answerStart - answerRadius - Math.max(0, choiceCount - 1) * minimumPitch)) : 0;
+    columnWidth - answerStart - answerRadius - Math.max(0, maxChoiceCount - 1) * minimumPitch)) : 0;
   const answerPitch = spaciousChoiceLayout
     ? Math.min(20.5, (columnWidth - answerStart - answerRadius - trailingGap) /
-      Math.max(1, choiceCount - 1))
-    : Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, choiceCount - 1));
+      Math.max(1, maxChoiceCount - 1))
+    : Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, maxChoiceCount - 1));
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const scale = canvas.width / A4.width;
   const templateScale = coordinateMap ? 1500 / A4.width : scale;
   const answers = [];
   for (let column = 0; column < columns; column += 1) {
+    const columnFirstQuestion = column * rowsPerColumn + 1;
+    const columnChoiceCount = Math.max(...Array.from({ length: Math.min(rowsPerColumn, questionCount - column * rowsPerColumn) }, (_, i) => questionChoiceCount(design, columnFirstQuestion + i)));
+    const columnAnswerStart = currentLayout ? (spaciousChoiceLayout ? 35 : 30) : 33;
+    const columnTrailingGap = spaciousChoiceLayout ? Math.max(0, Math.min(requestedTrailingGap,
+      columnWidth - columnAnswerStart - answerRadius - Math.max(0, columnChoiceCount - 1) * minimumPitch)) : 0;
+    const columnAnswerPitch = spaciousChoiceLayout
+      ? Math.min(20.5, (columnWidth - columnAnswerStart - answerRadius - columnTrailingGap) / Math.max(1, columnChoiceCount - 1))
+      : Math.min(20.5, (columnWidth - (currentLayout ? 34 : 37)) / Math.max(1, columnChoiceCount - 1));
     // Sample the bubble interior, clear of its outline and faint guide letter.
     // Keep sampling centered on the printed bubble so its outline does not
     // leak into the interior sample and look like a faint student mark.
-    const x = 27 + column * columnWidth + answerStart;
+    const x = 27 + column * columnWidth + columnAnswerStart;
     for (let row = 0; row < rowsPerColumn; row += 1) {
       const question = column * rowsPerColumn + row + 1;
       if (question > questionCount) break;
       const y = questionTop - rowOffset - row * rowPitch;
       const bubbles = [];
+      const choiceCount = questionChoiceCount(design, question);
       for (let choice = 0; choice < choiceCount; choice += 1) {
-        const templateX = (x + choice * answerPitch) * templateScale;
+        const templateX = (x + choice * columnAnswerPitch) * templateScale;
         const templateY = (A4.height - y) * templateScale;
         const radiusPoints = answerRadius;
         const center = coordinateMap ? mapTemplatePoint(coordinateMap, templateX, templateY)

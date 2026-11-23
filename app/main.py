@@ -64,6 +64,52 @@ REGISTRATION_MARK_SIZE = 10
 STANDALONE_USAGE_POLICY_VERSION = "2026-11-19"
 
 
+def choice_counts_for_design(design):
+    """Return one valid choice count per question, preserving old designs."""
+    question_count = int(design["question_count"])
+    raw = design.get("choice_counts") if hasattr(design, "get") else (
+        design["choice_counts"] if "choice_counts" in design.keys() else None
+    )
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            raw = None
+    if isinstance(raw, (list, tuple)) and len(raw) == question_count:
+        counts = [int(value) for value in raw]
+        if all(2 <= value <= 8 for value in counts):
+            return counts
+    return [int(design["choice_count"])] * question_count
+
+
+def choice_counts_from_ranges(question_count, raw_ranges):
+    """Parse custom ranges such as ``1-30: A-E, 31-40: A-H``."""
+    raw_ranges = str(raw_ranges or "").strip()
+    if not raw_ranges:
+        return None
+    counts = [None] * question_count
+    for segment in re.split(r"[,;\n]+", raw_ranges):
+        match = re.fullmatch(
+            r"\s*(\d+)(?:\s*-\s*(\d+))?\s*[:=]\s*(?:([2-8])|A\s*-\s*([A-H]))\s*",
+            segment,
+            re.IGNORECASE,
+        )
+        if not match:
+            raise ValueError("Use ranges such as 1-30: A-E, 31-40: A-H.")
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        choice_count = int(match.group(3) or (ord(match.group(4).upper()) - ord("A") + 1))
+        if start < 1 or end < start or end > question_count:
+            raise ValueError(f"Choice ranges must stay between questions 1 and {question_count}.")
+        for question in range(start, end + 1):
+            if counts[question - 1] is not None:
+                raise ValueError("Choice ranges must not overlap.")
+            counts[question - 1] = choice_count
+    if any(count is None for count in counts):
+        raise ValueError("Choice ranges must cover every question exactly once.")
+    return counts
+
+
 class MinimumFontCanvas(canvas.Canvas):
     """Canvas that enforces the minimum size on the answer-sheet page only."""
 
@@ -187,6 +233,7 @@ def connect():
             title TEXT NOT NULL,
             question_count INTEGER NOT NULL CHECK(question_count BETWEEN 1 AND 60),
             choice_count INTEGER NOT NULL CHECK(choice_count BETWEEN 2 AND 8),
+            choice_counts TEXT,
             created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS exam_designs_course_idx
@@ -207,6 +254,7 @@ def connect():
             title TEXT NOT NULL,
             question_count INTEGER NOT NULL CHECK(question_count BETWEEN 1 AND 60),
             choice_count INTEGER NOT NULL CHECK(choice_count BETWEEN 2 AND 8),
+            choice_counts TEXT,
             logo BLOB,
             logo_type TEXT CHECK(logo_type IN ('image/png', 'image/jpeg')),
             created_at INTEGER NOT NULL
@@ -223,6 +271,11 @@ def connect():
     standalone_columns = {
         row["name"] for row in db.execute("PRAGMA table_info(standalone_designs)")
     }
+    exam_columns = {row["name"] for row in db.execute("PRAGMA table_info(exam_designs)")}
+    if "choice_counts" not in exam_columns:
+        db.execute("ALTER TABLE exam_designs ADD COLUMN choice_counts TEXT")
+    if "choice_counts" not in standalone_columns:
+        db.execute("ALTER TABLE standalone_designs ADD COLUMN choice_counts TEXT")
     if "source_form_id" not in standalone_columns:
         db.execute("ALTER TABLE standalone_designs ADD COLUMN source_form_id TEXT")
     if "agreement_required" not in standalone_columns:
@@ -782,8 +835,11 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
     if title_text:
         pdf.drawString(left, height - 51, title_text)
     pdf.setFont("Helvetica", 9)
-    choice_labels = ", ".join(chr(ord("A") + i) for i in range(design["choice_count"]))
+    choice_counts = choice_counts_for_design(design)
+    choice_labels = ", ".join(chr(ord("A") + i) for i in range(max(choice_counts)))
     subtitle = f"{design['question_count']} questions  |  Choices {choice_labels}"
+    if len(set(choice_counts)) > 1:
+        subtitle = f"{design['question_count']} questions  |  Mixed choices (A–E then A–H)"
     if generic:
         qr_payload = None
     elif sample_response:
@@ -890,14 +946,16 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
     # bubble preserves a real gap between columns. ID bubbles stay full size.
     if layout_version >= 7:
         max_answer_radius = (
-            column_width - 35 - 8 - max(0, design["choice_count"] - 1) * 0.75
-        ) / (2 * design["choice_count"] - 1)
+            column_width - 35 - 8 - max(0, max(choice_counts) - 1) * 0.75
+        ) / (2 * max(choice_counts) - 1)
         bubble_radius = max(5.5, min(FORM_BUBBLE_RADIUS, max_answer_radius))
     else:
         bubble_radius = FORM_BUBBLE_RADIUS
     row_offset = (question_grid_top - question_bottom - (rows_per_column - 1) * row_pitch) / 2
     for column in range(columns):
         x = left + column * column_width
+        column_start = column * rows_per_column
+        column_choice_count = max(choice_counts[column_start:min(len(choice_counts), column_start + rows_per_column)])
         pdf.setFillColorRGB(0, 0, 0)
         pdf.setFont("Helvetica-Bold", 6)
         # Layout 5 moves the first choice bubble right, giving the question
@@ -916,17 +974,17 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
             trailing_gap = max(0, min(
                 requested_trailing_gap,
                 column_width - (answer_start - x) - bubble_radius -
-                max(0, design["choice_count"] - 1) * minimum_pitch,
+                max(0, column_choice_count - 1) * minimum_pitch,
             ))
             answer_pitch = min(
                 20.5,
                 (column_width - (answer_start - x) - bubble_radius - trailing_gap) /
-                max(1, design["choice_count"] - 1),
+                max(1, column_choice_count - 1),
             )
         else:
             answer_start = x + 30
-            answer_pitch = min(20.5, (column_width - 34) / max(1, design["choice_count"] - 1))
-        for choice in range(design["choice_count"]):
+            answer_pitch = min(20.5, (column_width - 34) / max(1, column_choice_count - 1))
+        for choice in range(column_choice_count):
             pdf.drawCentredString(answer_start + choice * answer_pitch, question_top - 16,
                                   chr(ord("A") + choice))
 
@@ -935,17 +993,18 @@ def make_answer_sheet(design, logo=None, sample_response=None, include_guide=Tru
             if question_number > design["question_count"]:
                 break
             y = question_grid_top - row_offset - row * row_pitch
+            question_choice_count = choice_counts[question_number - 1]
             pdf.setFillColorRGB(0, 0, 0)
             pdf.setFont("Helvetica-Bold", 7)
             pdf.drawRightString(x + 18, y - 3.5, f"{question_number}.")
             pdf.setLineWidth(0.75)
             pdf.setStrokeColorRGB(0, 0, 0)
-            for choice in range(design["choice_count"]):
+            for choice in range(question_choice_count):
                 if sample_response:
                     answer_key = sample_response.get("answers")
                     selected_choice = answer_key[question_number - 1] if answer_key else (
                         question_number + sample_response["seed"]
-                    ) % design["choice_count"]
+                    ) % question_choice_count
                     selected_choices = (selected_choice if isinstance(selected_choice, (list, tuple, set))
                                         else [selected_choice])
                     crossed_choice = sample_response.get("crossed_answers", {}).get(question_number)
@@ -1064,6 +1123,18 @@ def dummy_score_counts(student_count, question_count, rng):
         counts[-1] = min(question_count, math.ceil(question_count * rng.uniform(0.91, 0.98)))
     rng.shuffle(counts)
     return counts
+
+
+def dummy_answer_key(design, answer_seed=1):
+    """Create a valid dummy key for every per-question choice range."""
+    question_count = int(design["question_count"])
+    choice_counts = choice_counts_for_design(design)
+    answers = [
+        (question_number + answer_seed) % choice_counts[question_number - 1]
+        for question_number in range(1, question_count + 1)
+    ]
+    answers[0] = [answers[0], (answers[0] + 1) % choice_counts[0]]
+    return choice_counts, answers
 
 
 def score_distribution(counts, question_count):
@@ -1335,7 +1406,7 @@ def create_app():
         context = active_course_context()
         with connect() as db:
             rows = db.execute(
-                "SELECT form_id, title, question_count, choice_count "
+                "SELECT form_id, title, question_count, choice_count, choice_counts "
                 "FROM exam_designs WHERE issuer=? AND context_id=? ORDER BY created_at DESC",
                 (context["issuer"], context["context_id"]),
             ).fetchall()
@@ -1345,6 +1416,7 @@ def create_app():
                 "title": row["title"],
                 "question_count": row["question_count"],
                 "choice_count": row["choice_count"],
+                "choice_counts": json.loads(row["choice_counts"]) if row["choice_counts"] else None,
                 "legacy_layout_version": LEGACY_SHEET_LAYOUT_VERSION,
             }
             for row in rows
@@ -1476,12 +1548,14 @@ def create_app():
             try:
                 question_count = int(request.args.get("question_count", ""))
                 choice_count = int(request.args.get("choice_count", ""))
+                choice_counts = choice_counts_from_ranges(question_count, request.args.get("choice_ranges", ""))
                 if not 1 <= question_count <= MAX_QUESTIONS or not 2 <= choice_count <= 8:
                     raise ValueError
             except (TypeError, ValueError):
                 abort(400, f"Choose 1–{MAX_QUESTIONS} questions and 2–8 choices.")
             design = {"title": "Generic answer sheet", "form_id": "", "question_count": question_count,
-                      "choice_count": choice_count}
+                      "choice_count": choice_count,
+                      "choice_counts": choice_counts}
         elif not design:
             abort(404)
         try:
@@ -1496,18 +1570,12 @@ def create_app():
         filename = secure_filename(design["title"]) or "answer-sheet"
         output = BytesIO()
         question_count = int(design["question_count"])
-        choice_count = int(design["choice_count"])
         answer_seed = 1
-        correct_answers = [
-            (question_number + answer_seed) % choice_count
-            for question_number in range(1, question_count + 1)
-        ]
+        choice_counts, correct_answers = dummy_answer_key(design, answer_seed)
         # Include a deterministic multi-answer key item in every dummy set so
         # the Grade workspace exposes its all-keyed/any-keyed rule selector.
         multi_answer_question = 1
-        multi_answer_choices = [correct_answers[0], (correct_answers[0] + 1) % choice_count]
-        answer_key_answers = list(correct_answers)
-        answer_key_answers[multi_answer_question - 1] = multi_answer_choices
+        answer_key_answers = correct_answers
         rng = random.SystemRandom()
         score_counts = dummy_score_counts(count, question_count, rng)
         correct_question_sets, item_qualities = dummy_correct_question_sets(
@@ -1615,7 +1683,7 @@ def create_app():
                     elif question_index + 1 in correct_questions:
                         student_answers.append(keyed_choices if len(keyed_choices) > 1 else keyed_choices[0])
                     else:
-                        alternatives = [choice for choice in range(choice_count)
+                        alternatives = [choice for choice in range(choice_counts[question_index])
                                         if choice not in keyed_choices]
                         student_answers.append(rng.choice(alternatives))
                 crossed_answers = {}
@@ -1623,12 +1691,12 @@ def create_app():
                 for question_number in corrections_by_student[index]:
                     answer = student_answers[question_number - 1]
                     answer_choices = answer if isinstance(answer, (list, tuple, set)) else [answer]
-                    alternatives = [choice for choice in range(choice_count) if choice not in answer_choices]
+                    alternatives = [choice for choice in range(choice_counts[question_number - 1]) if choice not in answer_choices]
                     crossed_answers[question_number] = rng.choice(alternatives)
                 for question_number in multiples_by_student[index]:
                     answer = student_answers[question_number - 1]
                     answer_choices = answer if isinstance(answer, (list, tuple, set)) else [answer]
-                    alternatives = [choice for choice in range(choice_count) if choice not in answer_choices]
+                    alternatives = [choice for choice in range(choice_counts[question_number - 1]) if choice not in answer_choices]
                     additional_answers[question_number] = [rng.choice(alternatives)]
                 if index == missing_name_index:
                     learner["name"] = ""
@@ -1722,7 +1790,9 @@ def create_app():
         title = request.form.get("title", "").strip()
         raw_questions = request.form.get("question_count", "")
         raw_choices = request.form.get("choice_count", "")
-        values = {"title": title, "question_count": raw_questions, "choice_count": raw_choices}
+        raw_choice_ranges = request.form.get("choice_ranges", "")
+        values = {"title": title, "question_count": raw_questions, "choice_count": raw_choices,
+                  "choice_ranges": raw_choice_ranges}
         errors = []
         if not title:
             errors.append("Enter a name for this answer sheet.")
@@ -1743,6 +1813,14 @@ def create_app():
             errors.append("Choose between 2 and 8 answer choices.")
             choice_count = 4
         values["question_count"], values["choice_count"] = question_count, choice_count
+        try:
+            choice_counts = choice_counts_from_ranges(question_count, raw_choice_ranges)
+            if choice_counts:
+                choice_count = max(choice_counts)
+                values["choice_count"] = choice_count
+        except ValueError as error:
+            errors.append(str(error))
+            choice_counts = None
         if errors:
             return render_print_workspace(context, values, errors, 400)
 
@@ -1752,10 +1830,10 @@ def create_app():
             db.execute(
                 "INSERT INTO exam_designs "
                 "(form_id, issuer, context_id, deployment_id, course_title, created_by, title, "
-                "question_count, choice_count, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "question_count, choice_count, choice_counts, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (form_id, context["issuer"], context["context_id"], context["deployment_id"],
                  context["course_title"], context["user_id"], title, question_count,
-                 choice_count, created_at),
+                 choice_count, json.dumps(choice_counts) if choice_counts else None, created_at),
             )
         flash(f"Saved “{title}”. Download the PDF when you are ready to print.", "success")
         return redirect(url_for("print_workspace"))
@@ -1773,8 +1851,14 @@ def create_app():
                 raise ValueError
         except (TypeError, ValueError):
             abort(400, f"Choose 1–{MAX_QUESTIONS} questions and 2–8 choices.")
+        raw_choice_ranges = request.form.get("choice_ranges", "")
+        try:
+            choice_counts = choice_counts_from_ranges(question_count, raw_choice_ranges)
+        except ValueError as error:
+            abort(400, str(error))
         design = {"title": "", "form_id": "", "question_count": question_count,
-                  "choice_count": choice_count}
+                  "choice_count": choice_count,
+                  "choice_counts": choice_counts}
         with connect() as db:
             branding = db.execute(
                 "SELECT logo FROM course_branding WHERE issuer=? AND context_id=?",
@@ -1849,6 +1933,7 @@ def create_app():
             "title": design["title"],
             "question_count": design["question_count"],
             "choice_count": design["choice_count"],
+            "choice_counts": json.loads(design["choice_counts"]) if design["choice_counts"] else None,
             "legacy_layout_version": LEGACY_SHEET_LAYOUT_VERSION,
         }
 
@@ -1864,12 +1949,14 @@ def create_app():
     @app.route("/standalone", methods=["GET", "POST"])
     def standalone_home():
         errors = []
-        values = {"title": "", "question_count": 20, "choice_count": 4, "existing_form_code": ""}
+        values = {"title": "", "question_count": 20, "choice_count": 4,
+                  "choice_ranges": "", "existing_form_code": ""}
         if request.method == "POST":
             values = {
                 "title": request.form.get("title", "").strip(),
                 "question_count": request.form.get("question_count", ""),
                 "choice_count": request.form.get("choice_count", ""),
+                "choice_ranges": request.form.get("choice_ranges", ""),
                 "existing_form_code": request.form.get("existing_form_code", "").strip(),
             }
             if not values["title"] or len(values["title"]) > 120:
@@ -1886,6 +1973,14 @@ def create_app():
             except (TypeError, ValueError):
                 errors.append("Choose between 2 and 8 answer choices.")
                 choice_count = 4
+            try:
+                choice_counts = choice_counts_from_ranges(question_count, values["choice_ranges"])
+                if choice_counts:
+                    choice_count = max(choice_counts)
+                    values["choice_count"] = choice_count
+            except ValueError as error:
+                errors.append(str(error))
+                choice_counts = None
             source_form_id = None
             if values["existing_form_code"]:
                 source_form_id = standalone_form_code(values["existing_form_code"])
@@ -1908,8 +2003,9 @@ def create_app():
                 slug = secrets.token_urlsafe(18).replace("_", "").replace("-", "")
                 form_id = str(uuid.uuid4())
                 with connect() as db:
-                    db.execute("INSERT INTO standalone_designs (slug, form_id, source_form_id, agreement_required, title, question_count, choice_count, logo, logo_type, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                               (slug, form_id, source_form_id, 1, values["title"], question_count, choice_count, logo, logo_type, int(time.time())))
+                    db.execute("INSERT INTO standalone_designs (slug, form_id, source_form_id, agreement_required, title, question_count, choice_count, choice_counts, logo, logo_type, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                               (slug, form_id, source_form_id, 1, values["title"], question_count, choice_count,
+                                json.dumps(choice_counts) if choice_counts else None, logo, logo_type, int(time.time())))
                 return redirect(url_for("standalone_agreement", slug=slug))
             values["question_count"], values["choice_count"] = question_count, choice_count
         return render_template("standalone.html", errors=errors, values=values,
@@ -2075,9 +2171,8 @@ def create_app():
                 abort(400, "The imported roster contains an invalid or duplicate student number.")
             seen.add(student_id)
             learners.append({"student_id": student_id, "name": name or student_id, "sis_login_id": ""})
-        question_count, choice_count = int(design["question_count"]), int(design["choice_count"])
-        correct_answers = [(question + 1) % choice_count for question in range(question_count)]
-        correct_answers[0] = [correct_answers[0], (correct_answers[0] + 1) % choice_count]
+        question_count = int(design["question_count"])
+        choice_counts, correct_answers = dummy_answer_key(design)
         rng = random.SystemRandom()
         score_counts = dummy_score_counts(len(learners), question_count, rng)
         correct_question_sets, item_qualities = dummy_correct_question_sets(
@@ -2117,15 +2212,16 @@ def create_app():
                     if question + 1 in correct_question_sets[index]:
                         answers.append(options if question == 0 else options[0])
                     else:
-                        answers.append(rng.choice([choice for choice in range(choice_count) if choice not in options]))
+                        answers.append(rng.choice([choice for choice in range(choice_counts[question]) if choice not in options]))
                 crossed_answers = {}
                 for question_number in range(1, question_count + 1):
                     if (index, question_number) not in correction_slots:
                         continue
                     answer = answers[question_number - 1]
                     answer_choices = answer if isinstance(answer, (list, tuple, set)) else [answer]
-                    alternatives = [choice for choice in range(choice_count) if choice not in answer_choices]
-                    crossed_answers[question_number] = rng.choice(alternatives)
+                    alternatives = [choice for choice in range(choice_counts[question_number - 1]) if choice not in answer_choices]
+                    if alternatives:
+                        crossed_answers[question_number] = rng.choice(alternatives)
                 if index in incomplete_id_indices:
                     learner["student_id"] = learner["student_id"][:-1]
                 filename = secure_filename(learner["name"]) or f"student-{index + 1}"

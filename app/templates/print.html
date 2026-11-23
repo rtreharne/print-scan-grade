@@ -56,15 +56,18 @@
               <small id="question-help">Enter a number from 1 to 60. The answer sheet uses 15 rows per column.</small>
             </div>
             <div>
-              <label for="choice_count">Answer choices per question</label>
+              <label for="choice_count">Uniform answer choices</label>
               <select id="choice_count" name="choice_count" aria-describedby="choice-help">
                 {% for count in range(2, 9) %}
                 <option value="{{ count }}" {% if form_values.choice_count|int == count %}selected{% endif %}>{{ count }} choices (A–{{ "ABCDEFGH"[count - 1] }})</option>
                 {% endfor %}
               </select>
-              <small id="choice-help">The bubbles will be labelled A through the selected letter.</small>
+              <small id="choice-help">Used for every question unless you add custom choice ranges below.</small>
             </div>
           </div>
+          <label for="choice_ranges">Custom choice ranges <small>(optional)</small></label>
+          <input id="choice_ranges" name="choice_ranges" type="text" value="{{ form_values.choice_ranges|default('') }}" placeholder="e.g. 1-30: A-E, 31-40: A-H" aria-describedby="choice-ranges-help">
+          <small id="choice-ranges-help">Use comma-separated ranges to override the uniform setting. Every question must be covered once; use A–B through A–H, or 2 through 8.</small>
           <div class="sheet-preview" aria-live="polite">
             <span class="preview-icon" aria-hidden="true">▦</span>
             <span id="sheet-summary">20 questions · choices A–D · answer sheet plus student guide</span>
@@ -76,6 +79,7 @@
           <input type="hidden" name="csrf_token" value="{{ session['print_csrf'] }}">
           <input type="hidden" name="question_count" id="generic-question-count" value="20">
           <input type="hidden" name="choice_count" id="generic-choice-count" value="4">
+          <input type="hidden" name="choice_ranges" id="generic-choice-ranges" value="">
           <button class="secondary-button" type="submit">Download generic sheet (no title or QR)</button>
           <small>This sheet is not saved as a design. When scanning it in this browser, you’ll be asked for a title.</small>
         </form>
@@ -146,19 +150,50 @@
     const questionInput = document.getElementById("question_count");
     const choiceInput = document.getElementById("choice_count");
     const summary = document.getElementById("sheet-summary");
+    function choiceCountsFromRanges(questionCount, rawRanges) {
+      if (!rawRanges.trim()) return null;
+      const counts = Array(questionCount).fill(null);
+      for (const segment of rawRanges.split(/[,;\n]+/)) {
+        const match = segment.match(/^\s*(\d+)(?:\s*-\s*(\d+))?\s*[:=]\s*(?:([2-8])|A\s*-\s*([A-H]))\s*$/i);
+        if (!match) throw new Error("Use ranges such as 1-30: A-E, 31-40: A-H.");
+        const start = Number(match[1]); const end = Number(match[2] || start);
+        const count = Number(match[3] || (match[4].toUpperCase().charCodeAt(0) - 64));
+        if (start < 1 || end < start || end > questionCount) throw new Error(`Choice ranges must stay between questions 1 and ${questionCount}.`);
+        for (let question = start; question <= end; question += 1) {
+          if (counts[question - 1] !== null) throw new Error("Choice ranges must not overlap.");
+          counts[question - 1] = count;
+        }
+      }
+      if (counts.some((count) => count === null)) throw new Error("Choice ranges must cover every question exactly once.");
+      return counts;
+    }
     function updateSheetSummary() {
       const questions = questionInput.value || "0";
       const lastChoice = "ABCDEFGH"[Number(choiceInput.value) - 1] || "D";
       summary.textContent = `${questions} ${questions === "1" ? "question" : "questions"} · choices A–${lastChoice} · answer sheet plus student guide`;
+      if (document.getElementById("choice_ranges").value.trim()) {
+        summary.textContent = `${questions} ${questions === "1" ? "question" : "questions"} · custom mixed choices · answer sheet plus student guide`;
+      }
       document.getElementById("generic-question-count").value = questions;
       document.getElementById("generic-choice-count").value = choiceInput.value;
+      document.getElementById("generic-choice-ranges").value = document.getElementById("choice_ranges").value;
     }
     questionInput.addEventListener("input", updateSheetSummary);
     choiceInput.addEventListener("change", updateSheetSummary);
+    document.getElementById("choice_ranges").addEventListener("input", updateSheetSummary);
     updateSheetSummary();
-    document.getElementById("generic-sheet-form").addEventListener("submit", () => {
+    document.getElementById("generic-sheet-form").addEventListener("submit", (event) => {
+      let choiceCounts;
+      try {
+        choiceCounts = choiceCountsFromRanges(Number(questionInput.value), document.getElementById("choice_ranges").value);
+      } catch (error) {
+        event.preventDefault();
+        window.alert(error.message);
+        return;
+      }
       localStorage.setItem("print-scan-grade-generic-layout", JSON.stringify({
-        question_count: Number(questionInput.value), choice_count: Number(choiceInput.value)
+        question_count: Number(questionInput.value), choice_count: Number(choiceInput.value),
+        choice_ranges: document.getElementById("choice_ranges").value, choice_counts: choiceCounts
       }));
     });
   </script>

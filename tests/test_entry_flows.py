@@ -185,6 +185,18 @@ class EntryFlowsTest(unittest.TestCase):
                 fetch.assert_called()
         self.assertEqual(main.normalize_nrps_url("https://institution.instructure.com/roster", issuer), "https://institution.instructure.com/roster")
 
+    def test_dummy_answer_key_respects_custom_choice_ranges(self):
+        design = {
+            "question_count": 40,
+            "choice_count": 8,
+            "choice_counts": json.dumps([5] * 30 + [8] * 10),
+        }
+        choice_counts, answers = main.dummy_answer_key(design)
+        self.assertEqual(choice_counts, [5] * 30 + [8] * 10)
+        for question, answer in enumerate(answers):
+            selected = answer if isinstance(answer, list) else [answer]
+            self.assertTrue(all(0 <= choice < choice_counts[question] for choice in selected))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
