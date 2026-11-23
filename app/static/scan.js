@@ -33,6 +33,7 @@ const backToTopButton = $("#back-to-top");
 const courseRoster = [];
 const setKeyField = $("#set-key-field");
 const setKeySelect = $("#set-key-select");
+const editAnswerKeyButton = $("#edit-answer-key");
 const answerKeyRules = $("#answer-key-rules");
 const answerKeyRuleList = $("#answer-key-rule-list");
 const rosterRows = $("#roster-rows");
@@ -3085,20 +3086,19 @@ function renderSetAnswerKeyOptions() {
     option.value = candidate.id;
     const otherSet = candidate.scanSetId !== scanSet.id ? " · another scan set" : "";
     const complete = completeAnswerKeyAnswers(candidate);
-    option.disabled = !complete;
     option.textContent = `${studentNameFor(candidate)} · ${candidate.sourceFile} · page ${candidate.pageNo}${otherSet}` +
       (complete ? "" : " · incomplete answers");
     setKeySelect.append(option);
   }
   const selectedKey = candidates.find((candidate) => candidate.id === answerKeyByScanSet[scanSet.id]);
-  if (selectedKey && !completeAnswerKeyAnswers(selectedKey)) {
-    delete answerKeyByScanSet[scanSet.id];
-    persistScanState();
-  }
   setKeySelect.value = answerKeyByScanSet[scanSet.id] || "";
+  if (editAnswerKeyButton) {
+    editAnswerKeyButton.hidden = !selectedKey;
+    editAnswerKeyButton.disabled = !selectedKey;
+  }
   setKeySelect.onchange = async () => {
     const candidate = candidates.find((item) => item.id === setKeySelect.value);
-    if (candidate && completeAnswerKeyAnswers(candidate)) {
+    if (candidate) {
       answerKeyByScanSet[scanSet.id] = candidate.id;
     } else {
       delete answerKeyByScanSet[scanSet.id];
@@ -3109,6 +3109,13 @@ function renderSetAnswerKeyOptions() {
   };
   renderAnswerKeyRules(scanSet, selectedKey);
 }
+
+editAnswerKeyButton?.addEventListener("click", () => {
+  const scanSet = scanSets.find((item) => item.id === selectedScanSetId);
+  const keyId = scanSet && answerKeyByScanSet[scanSet.id];
+  const key = sheetResults.find((sheet) => sheet.id === keyId && sheet.formId === scanSet?.formId);
+  if (key) openScanPreview(key);
+});
 
 function selectedLabelsForAnswer(answer) {
   const labels = Array.isArray(answer?.selectedLabels)
