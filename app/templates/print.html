@@ -67,7 +67,7 @@
           </div>
           <label for="choice_ranges">Custom choice ranges <small>(optional)</small></label>
           <input id="choice_ranges" name="choice_ranges" type="text" value="{{ form_values.choice_ranges|default('') }}" placeholder="e.g. 1-30: A-E, 31-40: A-H" aria-describedby="choice-ranges-help">
-          <small id="choice-ranges-help">Use comma-separated ranges to override the uniform setting. Every question must be covered once; use A–B through A–H, or 2 through 8.</small>
+          <small id="choice-ranges-help">Leave blank to use the uniform choice count above. For mixed choices, enter every question range, for example: 1-30: A-E, 31-40: A-H. Separate ranges with commas; ranges cannot overlap.</small>
           <div class="sheet-preview" aria-live="polite">
             <span class="preview-icon" aria-hidden="true">▦</span>
             <span id="sheet-summary">20 questions · choices A–D · answer sheet plus student guide</span>

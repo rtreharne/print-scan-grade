@@ -4641,6 +4641,28 @@ async function downloadCsv() {
       return [xlsxFormula(`'Raw matrix'!A${row}`), xlsxFormula(`'Raw matrix'!B${row}`), xlsxFormula(`'Raw matrix'!${totalColumn}${row}`), xlsxFormula(`'Raw matrix'!${percentageColumn}${row}`, 2)];
       }),
     ];
+    const answerQuestions = [...data.key.answers]
+      .map((answer) => Number(answer.question))
+      .filter((question) => Number.isInteger(question) && question > 0)
+      .sort((left, right) => left - right);
+    const studentAnswerRows = [
+      [xlsxCell("Student ID", 1), xlsxCell("Student name", 1),
+        ...answerQuestions.map((question) => xlsxCell(`Q${question}`, 1))],
+      ...data.records.map((record) => {
+        const answersByQuestion = new Map((record.sheet.answers || [])
+          .map((answer) => [Number(answer.question), answer]));
+        return [
+          matchedLearner(record.sheet)?.student_id || record.sheet.studentId || record.sheet.bubbleStudentId || record.sheet.writtenStudentId || "",
+          exportStudentName(record.sheet),
+          ...answerQuestions.map((question) => {
+            const answer = answersByQuestion.get(question);
+            const selected = selectedLabelsForAnswer(answer);
+            if (selected.length) return selected.join(" + ");
+            return answer?.status === "review" ? "Review" : "No answer";
+          }),
+        ];
+      }),
+    ];
     const completeRows = matrixRows.filter((row) => row.marks.every((mark) => Number.isFinite(mark)));
     const totalScores = completeRows.map((row) => row.marks.reduce((sum, mark) => sum + mark, 0));
     const itemVariances = questions.map((_, index) => sampleVariance(completeRows.map((row) => row.marks[index])) || 0);
@@ -4672,6 +4694,7 @@ async function downloadCsv() {
     descriptiveRows.push(["Fail", xlsxFormula(`COUNTIF(${rawPercentageRange},\"<${definitions.at(-1)[0] / 100}\")`)]);
     const workbook = await createXlsxWorkbook([
       { name: "Grades", rows: gradesRows, options: { filter: `A1:D${gradesRows.length}` } },
+      { name: "Student answers", rows: studentAnswerRows, options: { filter: `A1:${xlsxColumn(studentAnswerRows[0].length - 1)}${studentAnswerRows.length}` } },
       { name: "Raw matrix", rows: rawRows, options: { filter: `A1:${percentageColumn}${rawRows.length}` } },
       { name: "Question analysis", rows: questionRows, options: { freeze: "A5", filter: `A4:I${questionRows.length}` } },
       { name: "Grade statistics", rows: descriptiveRows, options: { freeze: "A11", filter: `A10:B${descriptiveRows.length}` } },
